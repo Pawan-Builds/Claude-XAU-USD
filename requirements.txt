@@ -1,0 +1,36 @@
+# Core Trading
+MetaTrader5==5.0.6180
+pandas==2.3.3
+numpy==2.4.6
+
+# Web Framework
+fastapi==0.165.0
+uvicorn==0.54.0
+pydantic==2.14.4
+
+# Database
+SQLAlchemy==2.1.9
+
+# Configuration
+PyYAML==6.0.3
+python-dotenv==1.2.3
+
+# Telegram
+python-telegram-bot==22.8
+
+# Async HTTP
+aiohttp==3.14.5
+
+# Plotting
+plotly==7.1.0
+
+# Testing
+pytest==9.1.1
+pytest-asyncio==0.23.0
+pytest-mock==3.14.0
+
+# Technical Analysis (optional - we implement our own)
+# pandas-ta==0.3.14b0
+
+# Utilities
+typing-extensions==4.16.0

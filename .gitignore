@@ -1,0 +1,63 @@
+# Environment & Secrets
+.env
+.env.local
+.env.*.local
+
+# Database
+database/*.db
+database/*.db-journal
+database/trading.db
+
+# Logs
+logs/*.log
+logs/*.log.*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dashboard
+dashboard/frontend/node_modules/
+dashboard/frontend/dist/
+dashboard/frontend/.vite/
+
+# Data
+data/historical/*.csv
+data/historical/*.parquet
+data/historical/reports/*.json
+data/historical/reports/*.csv
+data/historical/reports/*.pdf
+
+# Backups
+*.bak
+*.backup
+
+# MT5
+*.log
+*.ini
+
+# Test outputs
+test_output/
+.coverage.*

@@ -1,0 +1,12 @@
+{
+  "events": [
+    {
+      "timestamp": "2026-11-25T13:30:00Z",
+      "currency": "USD",
+      "event": "US Core PCE Price Index",
+      "impact": "high",
+      "forecast": "0.2%",
+      "previous": "0.2%"
+    }
+  ]
+}
