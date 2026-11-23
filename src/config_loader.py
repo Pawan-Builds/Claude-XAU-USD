@@ -152,6 +152,9 @@ class TradingConfig:
     max_drawdown_percent: float
     max_consecutive_losses: int
     max_holding_hours: int
+    entry_order_type: str
+    pending_expiry_hours: int
+    max_pending_orders: int
 
 
 @dataclass
@@ -583,6 +586,15 @@ class Config:
             max_holding_hours=_safe_int(
                 c.get("max_holding_hours"), 48
             ),
+            entry_order_type=_safe_str(
+                c.get("entry_order_type"), "limit"
+            ).lower(),
+            pending_expiry_hours=_safe_int(
+                c.get("pending_expiry_hours"), 4
+            ),
+            max_pending_orders=_safe_int(
+                c.get("max_pending_orders"), 5
+            ),
         )
 
     @property
@@ -859,7 +871,7 @@ class Config:
         c = self._raw_config.get("safety", {})
 
         return SafetyConfig(
-            demo_only=False,
+            demo_only=_safe_bool(c.get("demo_only"), True),
             verify_demo_on_startup=_safe_bool(
                 c.get("verify_demo_on_startup"), True
             ),

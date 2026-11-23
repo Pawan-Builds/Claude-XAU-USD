@@ -1,4 +1,3 @@
-
 """SMC strategy engine.
 
 Detects multi-timeframe SMC setups and creates validated trade candidates.
@@ -94,20 +93,26 @@ class SMCEngine:
             h1_bias = market_structure.get_structure_tf_bias()
 
             if h4_bias not in ("bullish", "bearish"):
-                logger.debug("No trade candidate: H4 bias is neutral or unavailable.")
+                logger.debug(
+                    "No trade candidate: H4 bias is neutral or unavailable."
+                )
                 return signals
 
             for strategy_name in self.strategies:
                 try:
                     strategy = StrategyType(strategy_name)
                 except ValueError:
-                    logger.warning("Unknown SMC strategy configured: %s", strategy_name)
+                    logger.warning(
+                        "Unknown SMC strategy configured: %s", strategy_name
+                    )
                     continue
 
                 try:
                     signal = self._check_strategy(strategy, h4_bias, h1_bias)
                 except Exception:
-                    logger.exception("Strategy evaluation failed: %s", strategy.value)
+                    logger.exception(
+                        "Strategy evaluation failed: %s", strategy.value
+                    )
                     continue
 
                 if signal is not None:
@@ -122,9 +127,7 @@ class SMCEngine:
                 )
             else:
                 logger.debug(
-                    "No valid SMC candidate. H4=%s H1=%s",
-                    h4_bias,
-                    h1_bias,
+                    "No valid SMC candidate. H4=%s H1=%s", h4_bias, h1_bias
                 )
 
             return signals
@@ -162,6 +165,20 @@ class SMCEngine:
             return None
 
         value = float(candle.close)
+        return value if np.isfinite(value) and value > 0 else None
+
+    def _latest_closed_close(self, timeframe: str) -> Optional[float]:
+        """Return the close of the last CONFIRMED (closed) candle.
+
+        Using the forming candle's close causes repainting: the signal
+        would be calculated against a bar that continues to change
+        until it closes.
+        """
+        candles = market_data.get_candles(timeframe, 2)
+        if not candles or len(candles) < 2:
+            return None
+
+        value = float(candles[-2].close)
         return value if np.isfinite(value) and value > 0 else None
 
     def _get_level(self, levels: Any, key: str) -> Optional[float]:
@@ -241,7 +258,9 @@ class SMCEngine:
             stop = float(sl_price)
             target = float(tp_price)
         except (TypeError, ValueError):
-            logger.debug("%s rejected: non-numeric entry/SL/TP.", strategy.value)
+            logger.debug(
+                "%s rejected: non-numeric entry/SL/TP.", strategy.value
+            )
             return None
 
         if not all(np.isfinite(v) and v > 0 for v in (entry, stop, target)):
@@ -257,7 +276,8 @@ class SMCEngine:
 
         if risk <= 0 or reward <= 0:
             logger.debug(
-                "%s rejected: incorrect price geometry. direction=%s entry=%.3f SL=%.3f TP=%.3f",
+                "%s rejected: incorrect price geometry. direction=%s "
+                "entry=%.3f SL=%.3f TP=%.3f",
                 strategy.value,
                 direction.value,
                 entry,
@@ -277,8 +297,11 @@ class SMCEngine:
             )
             return None
 
-        if not confirmations or not all(item.passed for item in confirmations):
-            logger.debug("%s rejected: one or more confirmations failed.", strategy.value)
+        if not confirmations or not all(c.passed for c in confirmations):
+            logger.debug(
+                "%s rejected: one or more confirmations failed.",
+                strategy.value,
+            )
             return None
 
         risk_percent = float(config.risk.default_risk_percent)
@@ -324,14 +347,23 @@ class SMCEngine:
             return None
 
         if h4_bias == "bullish":
-            # Bullish reversal: sell-side liquidity is swept first.
             swept = liquidity.was_sell_side_swept("m15")
             fvgs = fair_value_gaps.get_active_bullish_fvgs("m5")
 
             confirmations = self._make_confirmations([
                 ("H4 bullish bias", True, "H4 bias is bullish."),
-                ("M15 sell-side sweep", swept, "Sell-side liquidity swept." if swept else "No sell-side sweep."),
-                ("M5 bullish FVG", bool(fvgs), f"{len(fvgs)} active bullish FVG(s)."),
+                (
+                    "M15 sell-side sweep",
+                    swept,
+                    "Sell-side liquidity swept."
+                    if swept
+                    else "No sell-side sweep.",
+                ),
+                (
+                    "M5 bullish FVG",
+                    bool(fvgs),
+                    f"{len(fvgs)} active bullish FVG(s).",
+                ),
             ])
 
             if not swept or not fvgs:
@@ -343,25 +375,39 @@ class SMCEngine:
             target = self._select_target(
                 SignalDirection.BUY,
                 entry,
-                liquidity.get_sell_side_liquidity("h1"),
+                liquidity.get_buy_side_liquidity("h1"),   # FIX: buy-side above
                 50 * self.point_value,
             )
 
             return self._create_signal(
-                SignalDirection.BUY, entry, stop, target,
+                SignalDirection.BUY,
+                entry,
+                stop,
+                target,
                 StrategyType.LIQUIDITY_SWEEP_FVG,
-                confirmations, "m5", "m15",
+                confirmations,
+                "m5",
+                "m15",
             )
 
         if h4_bias == "bearish":
-            # Bearish reversal: buy-side liquidity is swept first.
             swept = liquidity.was_buy_side_swept("m15")
             fvgs = fair_value_gaps.get_active_bearish_fvgs("m5")
 
             confirmations = self._make_confirmations([
                 ("H4 bearish bias", True, "H4 bias is bearish."),
-                ("M15 buy-side sweep", swept, "Buy-side liquidity swept." if swept else "No buy-side sweep."),
-                ("M5 bearish FVG", bool(fvgs), f"{len(fvgs)} active bearish FVG(s)."),
+                (
+                    "M15 buy-side sweep",
+                    swept,
+                    "Buy-side liquidity swept."
+                    if swept
+                    else "No buy-side sweep.",
+                ),
+                (
+                    "M5 bearish FVG",
+                    bool(fvgs),
+                    f"{len(fvgs)} active bearish FVG(s).",
+                ),
             ])
 
             if not swept or not fvgs:
@@ -373,14 +419,19 @@ class SMCEngine:
             target = self._select_target(
                 SignalDirection.SELL,
                 entry,
-                liquidity.get_buy_side_liquidity("h1"),
+                liquidity.get_sell_side_liquidity("h1"),  # FIX: sell-side below
                 50 * self.point_value,
             )
 
             return self._create_signal(
-                SignalDirection.SELL, entry, stop, target,
+                SignalDirection.SELL,
+                entry,
+                stop,
+                target,
                 StrategyType.LIQUIDITY_SWEEP_FVG,
-                confirmations, "m5", "m15",
+                confirmations,
+                "m5",
+                "m15",
             )
 
         return None
@@ -410,14 +461,27 @@ class SMCEngine:
 
             confirmations = self._make_confirmations([
                 ("H4 bullish bias", True, "H4 bias is bullish."),
-                ("M15 sell-side sweep", swept, "Sell-side liquidity swept." if swept else "No sell-side sweep."),
-                ("M15 bullish CHoCH", choch, "Bullish CHoCH confirmed." if choch else "No bullish CHoCH."),
+                (
+                    "M15 sell-side sweep",
+                    swept,
+                    "Sell-side liquidity swept."
+                    if swept
+                    else "No sell-side sweep.",
+                ),
+                (
+                    "M15 bullish CHoCH",
+                    choch,
+                    "Bullish CHoCH confirmed."
+                    if choch
+                    else "No bullish CHoCH.",
+                ),
             ])
 
             if not swept or not choch:
                 return None
 
-            entry = self._latest_close("m5")
+            # Use the last CLOSED m5 candle — not the forming one.
+            entry = self._latest_closed_close("m5")
             if entry is None:
                 return None
 
@@ -429,14 +493,19 @@ class SMCEngine:
             target = self._select_target(
                 SignalDirection.BUY,
                 entry,
-                liquidity.get_sell_side_liquidity("h1"),
+                liquidity.get_buy_side_liquidity("h1"),   # FIX
                 60 * self.point_value,
             )
 
             return self._create_signal(
-                SignalDirection.BUY, entry, stop, target,
+                SignalDirection.BUY,
+                entry,
+                stop,
+                target,
                 StrategyType.LIQUIDITY_SWEEP_CHOCH,
-                confirmations, "m5", "m15",
+                confirmations,
+                "m5",
+                "m15",
             )
 
         if h4_bias == "bearish":
@@ -445,14 +514,26 @@ class SMCEngine:
 
             confirmations = self._make_confirmations([
                 ("H4 bearish bias", True, "H4 bias is bearish."),
-                ("M15 buy-side sweep", swept, "Buy-side liquidity swept." if swept else "No buy-side sweep."),
-                ("M15 bearish CHoCH", choch, "Bearish CHoCH confirmed." if choch else "No bearish CHoCH."),
+                (
+                    "M15 buy-side sweep",
+                    swept,
+                    "Buy-side liquidity swept."
+                    if swept
+                    else "No buy-side sweep.",
+                ),
+                (
+                    "M15 bearish CHoCH",
+                    choch,
+                    "Bearish CHoCH confirmed."
+                    if choch
+                    else "No bearish CHoCH.",
+                ),
             ])
 
             if not swept or not choch:
                 return None
 
-            entry = self._latest_close("m5")
+            entry = self._latest_closed_close("m5")
             if entry is None:
                 return None
 
@@ -464,14 +545,19 @@ class SMCEngine:
             target = self._select_target(
                 SignalDirection.SELL,
                 entry,
-                liquidity.get_buy_side_liquidity("h1"),
+                liquidity.get_sell_side_liquidity("h1"),  # FIX
                 60 * self.point_value,
             )
 
             return self._create_signal(
-                SignalDirection.SELL, entry, stop, target,
+                SignalDirection.SELL,
+                entry,
+                stop,
+                target,
                 StrategyType.LIQUIDITY_SWEEP_CHOCH,
-                confirmations, "m5", "m15",
+                confirmations,
+                "m5",
+                "m15",
             )
 
         return None
@@ -500,8 +586,16 @@ class SMCEngine:
             confirmations = self._make_confirmations([
                 ("H4 bullish bias", True, "H4 bias is bullish."),
                 ("H1 bullish bias", True, "H1 bias is bullish."),
-                ("H1 bullish BOS", bos, "Bullish BOS confirmed." if bos else "No bullish BOS."),
-                ("M15 bullish OB", bool(bullish_obs), f"{len(bullish_obs)} active bullish OB(s)."),
+                (
+                    "H1 bullish BOS",
+                    bos,
+                    "Bullish BOS confirmed." if bos else "No bullish BOS.",
+                ),
+                (
+                    "M15 bullish OB",
+                    bool(bullish_obs),
+                    f"{len(bullish_obs)} active bullish OB(s).",
+                ),
             ])
 
             if not bos or not bullish_obs:
@@ -513,14 +607,19 @@ class SMCEngine:
             target = self._select_target(
                 SignalDirection.BUY,
                 entry,
-                liquidity.get_sell_side_liquidity("h1"),
+                liquidity.get_buy_side_liquidity("h1"),   # FIX
                 60 * self.point_value,
             )
 
             return self._create_signal(
-                SignalDirection.BUY, entry, stop, target,
+                SignalDirection.BUY,
+                entry,
+                stop,
+                target,
                 StrategyType.BOS_ORDER_BLOCK,
-                confirmations, "m15", "h1",
+                confirmations,
+                "m15",
+                "h1",
             )
 
         if h4_bias == "bearish" and h1_bias == "bearish":
@@ -530,8 +629,16 @@ class SMCEngine:
             confirmations = self._make_confirmations([
                 ("H4 bearish bias", True, "H4 bias is bearish."),
                 ("H1 bearish bias", True, "H1 bias is bearish."),
-                ("H1 bearish BOS", bos, "Bearish BOS confirmed." if bos else "No bearish BOS."),
-                ("M15 bearish OB", bool(bearish_obs), f"{len(bearish_obs)} active bearish OB(s)."),
+                (
+                    "H1 bearish BOS",
+                    bos,
+                    "Bearish BOS confirmed." if bos else "No bearish BOS.",
+                ),
+                (
+                    "M15 bearish OB",
+                    bool(bearish_obs),
+                    f"{len(bearish_obs)} active bearish OB(s).",
+                ),
             ])
 
             if not bos or not bearish_obs:
@@ -543,14 +650,19 @@ class SMCEngine:
             target = self._select_target(
                 SignalDirection.SELL,
                 entry,
-                liquidity.get_buy_side_liquidity("h1"),
+                liquidity.get_sell_side_liquidity("h1"),  # FIX
                 60 * self.point_value,
             )
 
             return self._create_signal(
-                SignalDirection.SELL, entry, stop, target,
+                SignalDirection.SELL,
+                entry,
+                stop,
+                target,
                 StrategyType.BOS_ORDER_BLOCK,
-                confirmations, "m15", "h1",
+                confirmations,
+                "m15",
+                "h1",
             )
 
         return None
@@ -578,8 +690,18 @@ class SMCEngine:
 
             confirmations = self._make_confirmations([
                 ("H4 bullish bias", True, "H4 bias is bullish."),
-                ("M15 bullish CHoCH", choch, "Bullish CHoCH confirmed." if choch else "No bullish CHoCH."),
-                ("M5 bullish OB", bool(bullish_obs), f"{len(bullish_obs)} active bullish OB(s)."),
+                (
+                    "M15 bullish CHoCH",
+                    choch,
+                    "Bullish CHoCH confirmed."
+                    if choch
+                    else "No bullish CHoCH.",
+                ),
+                (
+                    "M5 bullish OB",
+                    bool(bullish_obs),
+                    f"{len(bullish_obs)} active bullish OB(s).",
+                ),
             ])
 
             if not choch or not bullish_obs:
@@ -591,14 +713,19 @@ class SMCEngine:
             target = self._select_target(
                 SignalDirection.BUY,
                 entry,
-                liquidity.get_sell_side_liquidity("m15"),
+                liquidity.get_buy_side_liquidity("m15"),  # FIX
                 40 * self.point_value,
             )
 
             return self._create_signal(
-                SignalDirection.BUY, entry, stop, target,
+                SignalDirection.BUY,
+                entry,
+                stop,
+                target,
                 StrategyType.CHOCH_ORDER_BLOCK,
-                confirmations, "m5", "m15",
+                confirmations,
+                "m5",
+                "m15",
             )
 
         if h4_bias == "bearish":
@@ -607,8 +734,18 @@ class SMCEngine:
 
             confirmations = self._make_confirmations([
                 ("H4 bearish bias", True, "H4 bias is bearish."),
-                ("M15 bearish CHoCH", choch, "Bearish CHoCH confirmed." if choch else "No bearish CHoCH."),
-                ("M5 bearish OB", bool(bearish_obs), f"{len(bearish_obs)} active bearish OB(s)."),
+                (
+                    "M15 bearish CHoCH",
+                    choch,
+                    "Bearish CHoCH confirmed."
+                    if choch
+                    else "No bearish CHoCH.",
+                ),
+                (
+                    "M5 bearish OB",
+                    bool(bearish_obs),
+                    f"{len(bearish_obs)} active bearish OB(s).",
+                ),
             ])
 
             if not choch or not bearish_obs:
@@ -620,14 +757,19 @@ class SMCEngine:
             target = self._select_target(
                 SignalDirection.SELL,
                 entry,
-                liquidity.get_buy_side_liquidity("m15"),
+                liquidity.get_sell_side_liquidity("m15"), # FIX
                 40 * self.point_value,
             )
 
             return self._create_signal(
-                SignalDirection.SELL, entry, stop, target,
+                SignalDirection.SELL,
+                entry,
+                stop,
+                target,
                 StrategyType.CHOCH_ORDER_BLOCK,
-                confirmations, "m5", "m15",
+                confirmations,
+                "m5",
+                "m15",
             )
 
         return None
@@ -655,10 +797,7 @@ class SMCEngine:
             return None
 
         displacements = detect_displacement(
-            opens,
-            closes,
-            lookback=10,
-            threshold=1.5,
+            opens, closes, lookback=10, threshold=1.5
         )
 
         if not displacements:
@@ -680,8 +819,16 @@ class SMCEngine:
 
             confirmations = self._make_confirmations([
                 ("H4 bullish bias", True, "H4 bias is bullish."),
-                ("M5 bullish displacement", True, f"Displacement ratio: {ratio:.2f}."),
-                ("M5 bullish FVG", bool(bullish_fvgs), f"{len(bullish_fvgs)} active bullish FVG(s)."),
+                (
+                    "M5 bullish displacement",
+                    True,
+                    f"Displacement ratio: {ratio:.2f}.",
+                ),
+                (
+                    "M5 bullish FVG",
+                    bool(bullish_fvgs),
+                    f"{len(bullish_fvgs)} active bullish FVG(s).",
+                ),
             ])
 
             if not bullish_fvgs:
@@ -693,14 +840,19 @@ class SMCEngine:
             target = self._select_target(
                 SignalDirection.BUY,
                 entry,
-                liquidity.get_sell_side_liquidity("h1"),
+                liquidity.get_buy_side_liquidity("h1"),   # FIX
                 30 * self.point_value,
             )
 
             return self._create_signal(
-                SignalDirection.BUY, entry, stop, target,
+                SignalDirection.BUY,
+                entry,
+                stop,
+                target,
                 StrategyType.DISPLACEMENT_FVG,
-                confirmations, "m5", "m5",
+                confirmations,
+                "m5",
+                "m5",
             )
 
         if h4_bias == "bearish" and displacement_direction == "bearish":
@@ -708,8 +860,16 @@ class SMCEngine:
 
             confirmations = self._make_confirmations([
                 ("H4 bearish bias", True, "H4 bias is bearish."),
-                ("M5 bearish displacement", True, f"Displacement ratio: {ratio:.2f}."),
-                ("M5 bearish FVG", bool(bearish_fvgs), f"{len(bearish_fvgs)} active bearish FVG(s)."),
+                (
+                    "M5 bearish displacement",
+                    True,
+                    f"Displacement ratio: {ratio:.2f}.",
+                ),
+                (
+                    "M5 bearish FVG",
+                    bool(bearish_fvgs),
+                    f"{len(bearish_fvgs)} active bearish FVG(s).",
+                ),
             ])
 
             if not bearish_fvgs:
@@ -721,14 +881,19 @@ class SMCEngine:
             target = self._select_target(
                 SignalDirection.SELL,
                 entry,
-                liquidity.get_buy_side_liquidity("h1"),
+                liquidity.get_sell_side_liquidity("h1"),  # FIX
                 30 * self.point_value,
             )
 
             return self._create_signal(
-                SignalDirection.SELL, entry, stop, target,
+                SignalDirection.SELL,
+                entry,
+                stop,
+                target,
                 StrategyType.DISPLACEMENT_FVG,
-                confirmations, "m5", "m5",
+                confirmations,
+                "m5",
+                "m5",
             )
 
         return None
@@ -761,9 +926,23 @@ class SMCEngine:
 
             confirmations = self._make_confirmations([
                 ("H4 bullish bias", True, "H4 bias is bullish."),
-                ("M15 sell-side sweep", swept, "Sell-side liquidity swept." if swept else "No sell-side sweep."),
-                ("M15 bullish OB", bool(bullish_obs), f"{len(bullish_obs)} active bullish OB(s)."),
-                ("M5 bullish FVG", bool(bullish_fvgs), f"{len(bullish_fvgs)} active bullish FVG(s)."),
+                (
+                    "M15 sell-side sweep",
+                    swept,
+                    "Sell-side liquidity swept."
+                    if swept
+                    else "No sell-side sweep.",
+                ),
+                (
+                    "M15 bullish OB",
+                    bool(bullish_obs),
+                    f"{len(bullish_obs)} active bullish OB(s).",
+                ),
+                (
+                    "M5 bullish FVG",
+                    bool(bullish_fvgs),
+                    f"{len(bullish_fvgs)} active bullish FVG(s).",
+                ),
             ])
 
             if not swept or not bullish_obs or not bullish_fvgs:
@@ -776,18 +955,26 @@ class SMCEngine:
 
                     if abs(ob_bottom - fvg_bottom) <= alignment_tolerance:
                         entry = fvg_bottom
-                        stop = min(ob_bottom, fvg_bottom) - 10 * self.point_value
+                        stop = (
+                            min(ob_bottom, fvg_bottom)
+                            - 10 * self.point_value
+                        )
                         target = self._select_target(
                             SignalDirection.BUY,
                             entry,
-                            liquidity.get_sell_side_liquidity("h1"),
+                            liquidity.get_buy_side_liquidity("h1"),   # FIX
                             60 * self.point_value,
                         )
 
                         signal = self._create_signal(
-                            SignalDirection.BUY, entry, stop, target,
+                            SignalDirection.BUY,
+                            entry,
+                            stop,
+                            target,
                             StrategyType.LIQUIDITY_SWEEP_OB_FVG,
-                            confirmations, "m5", "m15",
+                            confirmations,
+                            "m5",
+                            "m15",
                         )
                         if signal:
                             return signal
@@ -799,9 +986,23 @@ class SMCEngine:
 
             confirmations = self._make_confirmations([
                 ("H4 bearish bias", True, "H4 bias is bearish."),
-                ("M15 buy-side sweep", swept, "Buy-side liquidity swept." if swept else "No buy-side sweep."),
-                ("M15 bearish OB", bool(bearish_obs), f"{len(bearish_obs)} active bearish OB(s)."),
-                ("M5 bearish FVG", bool(bearish_fvgs), f"{len(bearish_fvgs)} active bearish FVG(s)."),
+                (
+                    "M15 buy-side sweep",
+                    swept,
+                    "Buy-side liquidity swept."
+                    if swept
+                    else "No buy-side sweep.",
+                ),
+                (
+                    "M15 bearish OB",
+                    bool(bearish_obs),
+                    f"{len(bearish_obs)} active bearish OB(s).",
+                ),
+                (
+                    "M5 bearish FVG",
+                    bool(bearish_fvgs),
+                    f"{len(bearish_fvgs)} active bearish FVG(s).",
+                ),
             ])
 
             if not swept or not bearish_obs or not bearish_fvgs:
@@ -814,18 +1015,26 @@ class SMCEngine:
 
                     if abs(ob_top - fvg_top) <= alignment_tolerance:
                         entry = fvg_top
-                        stop = max(ob_top, fvg_top) + 10 * self.point_value
+                        stop = (
+                            max(ob_top, fvg_top)
+                            + 10 * self.point_value
+                        )
                         target = self._select_target(
                             SignalDirection.SELL,
                             entry,
-                            liquidity.get_buy_side_liquidity("h1"),
+                            liquidity.get_sell_side_liquidity("h1"),  # FIX
                             60 * self.point_value,
                         )
 
                         signal = self._create_signal(
-                            SignalDirection.SELL, entry, stop, target,
+                            SignalDirection.SELL,
+                            entry,
+                            stop,
+                            target,
                             StrategyType.LIQUIDITY_SWEEP_OB_FVG,
-                            confirmations, "m5", "m15",
+                            confirmations,
+                            "m5",
+                            "m15",
                         )
                         if signal:
                             return signal

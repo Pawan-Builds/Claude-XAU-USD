@@ -405,6 +405,18 @@ class TradingAgent:
             self._market_data_started = True
 
             logger.info("Market data engine started.")
+            # Reconcile any pending orders from a previous run BEFORE
+            # trade_manager.sync_with_mt5() runs. If a pending order filled
+            # while the bot was offline, reconciliation creates the
+            # ExecutedOrder / OpenPosition rows that sync_with_mt5 needs.
+            try:
+                order_executor.reconcile_pending_orders()
+            except Exception:
+                logger.exception(
+                    "Startup pending-order reconciliation failed."
+                )
+
+            self._recover_state()
 
             self._recover_state()
 
@@ -512,6 +524,19 @@ class TradingAgent:
                     continue
 
                 market_data.update_live_data()
+                market_data.update_live_data()
+
+                # Reconcile pending order state BEFORE position management.
+                # This promotes filled orders to open positions and marks
+                # expired/cancelled orders as gone.
+                try:
+                    order_executor.reconcile_pending_orders()
+                except Exception:
+                    logger.exception(
+                        "Pending-order reconciliation failed."
+                    )
+
+                today = datetime.now(timezone.utc).date()
 
                 today = datetime.now(timezone.utc).date()
 
@@ -630,28 +655,48 @@ class TradingAgent:
                         "ORDER RECONCILIATION ERROR | %s",
                         result.error
                     )
-
                     self._pause_trading()
-
                     if self._telegram_ready:
-                        await telegram_bot.notify_error(
-                            result.error
-                        )
-
+                        await telegram_bot.notify_error(result.error)
                     return
 
-                logger.info(
-                    "ORDER EXECUTION | Successful | Signal ID: %s",
-                    result.signal_id
-                )
-
-                if self._telegram_ready:
-                    await telegram_bot.notify_new_trade(
-                        trading_signal,
-                        result
+                if result.pending:
+                    logger.info(
+                        "ORDER PLACED (PENDING LIMIT) | ticket=%s | "
+                        "Signal ID: %s | waiting for price to return.",
+                        result.pending_order_ticket,
+                        result.signal_id,
                     )
+                    if self._telegram_ready:
+                        try:
+                            notifier = getattr(
+                                telegram_bot,
+                                "notify_order_pending",
+                                None,
+                            )
+                            if notifier is not None:
+                                await notifier(trading_signal, result)
+                            else:
+                                logger.debug(
+                                    "telegram_bot has no notify_order_pending; "
+                                    "skipping notification"
+                                )
+                        except Exception:
+                            logger.exception(
+                                "Pending-order Telegram notification failed."
+                            )
+                else:
+                    # Immediate fill (rare for limit orders).
+                    logger.info(
+                        "ORDER FILLED IMMEDIATELY | Signal ID: %s",
+                        result.signal_id,
+                    )
+                    if self._telegram_ready:
+                        await telegram_bot.notify_new_trade(
+                            trading_signal, result
+                        )
 
-                # One successful entry per analysis cycle.
+                # One order placement per analysis cycle.
                 break
 
             logger.warning(

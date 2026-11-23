@@ -1,4 +1,3 @@
-
 """Fair Value Gap analysis module.
 
 Detects bullish and bearish FVGs, tracks mitigation, and provides
@@ -129,6 +128,21 @@ class FVGAnalyzer:
             ):
                 logger.warning(
                     "Inconsistent OHLC data in %s FVG analysis.",
+                    timeframe
+                )
+                return None
+
+            # Analyze only confirmed candles — a gap that only exists on
+            # the forming candle must not produce a signal.
+            candles = candles[:-1]
+            opens = opens[:-1]
+            highs = highs[:-1]
+            lows = lows[:-1]
+            closes = closes[:-1]
+
+            if len(candles) < 10:
+                logger.debug(
+                    "Insufficient confirmed candles for FVG: %s",
                     timeframe
                 )
                 return None

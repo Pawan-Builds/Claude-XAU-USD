@@ -1,4 +1,3 @@
-
 """Technical indicators for SMC analysis.
 
 Conventions used throughout this module:
@@ -56,7 +55,7 @@ def _validate_ohlc(
         len(open_array),
         len(high_array),
         len(low_array),
-        len(close_array)
+        len(close_array),
     }
 
     if len(lengths) != 1:
@@ -133,14 +132,9 @@ def find_swing_highs(
         window = high_array[i - lookback:i + lookback + 1]
         center = high_array[i]
 
-        # Require the center to be the unique highest point in the window.
         if center == np.max(window) and np.count_nonzero(window == center) == 1:
             swings.append(
-                SwingPoint(
-                    index=i,
-                    price=float(center),
-                    type="high"
-                )
+                SwingPoint(index=i, price=float(center), type="high")
             )
 
     return swings
@@ -164,14 +158,9 @@ def find_swing_lows(
         window = low_array[i - lookback:i + lookback + 1]
         center = low_array[i]
 
-        # Require the center to be the unique lowest point in the window.
         if center == np.min(window) and np.count_nonzero(window == center) == 1:
             swings.append(
-                SwingPoint(
-                    index=i,
-                    price=float(center),
-                    type="low"
-                )
+                SwingPoint(index=i, price=float(center), type="low")
             )
 
     return swings
@@ -185,7 +174,7 @@ def find_swing_points(
     """Find both swing highs and swing lows."""
     return (
         find_swing_highs(highs, lookback),
-        find_swing_lows(lows, lookback)
+        find_swing_lows(lows, lookback),
     )
 
 
@@ -232,24 +221,14 @@ def analyze_market_structure(
         raise ValueError("A candle has a high below its low")
 
     all_highs, all_lows = find_swing_points(
-        high_array,
-        low_array,
-        swing_lookback
+        high_array, low_array, swing_lookback
     )
 
     start_index = max(0, len(close_array) - lookback)
 
-    recent_highs = [
-        swing for swing in all_highs
-        if swing.index >= start_index
-    ]
-    recent_lows = [
-        swing for swing in all_lows
-        if swing.index >= start_index
-    ]
+    recent_highs = [s for s in all_highs if s.index >= start_index]
+    recent_lows = [s for s in all_lows if s.index >= start_index]
 
-    # Swing lists are chronological because the detection functions scan
-    # from the oldest candle to the newest candle.
     if len(recent_highs) < 2 or len(recent_lows) < 2:
         return MarketStructure(
             trend="ranging",
@@ -261,41 +240,39 @@ def analyze_market_structure(
             last_choch_direction=None,
             swing_highs=recent_highs,
             swing_lows=recent_lows,
-            structure_levels={}
+            structure_levels={},
         )
 
-    higher_highs = 0
-    lower_highs = 0
-    higher_lows = 0
-    lower_lows = 0
+    # Trend = direction of the LAST TWO swing pivots on each side.
+    # This is more robust than counting older pivots because the most
+    # recent two are the ones the market is currently respecting.
+    def _last_direction(swings: List[SwingPoint]) -> int:
+        if len(swings) < 2:
+            return 0
+        diff = swings[-1].price - swings[-2].price
+        if diff > 0:
+            return 1
+        if diff < 0:
+            return -1
+        return 0
 
-    for previous, current in zip(recent_highs, recent_highs[1:]):
-        if current.price > previous.price:
-            higher_highs += 1
-        elif current.price < previous.price:
-            lower_highs += 1
+    high_dir = _last_direction(recent_highs)
+    low_dir = _last_direction(recent_lows)
 
-    for previous, current in zip(recent_lows, recent_lows[1:]):
-        if current.price > previous.price:
-            higher_lows += 1
-        elif current.price < previous.price:
-            lower_lows += 1
-
-    bullish_structure = (
-        higher_highs > lower_highs
-        and higher_lows > lower_lows
-    )
-    bearish_structure = (
-        lower_highs > higher_highs
-        and lower_lows > higher_lows
-    )
-
-    if bullish_structure:
+    if high_dir > 0 and low_dir > 0:
         trend = "bullish"
-    elif bearish_structure:
+    elif high_dir < 0 and low_dir < 0:
         trend = "bearish"
-    else:
+    elif high_dir == 0 and low_dir == 0:
         trend = "ranging"
+    else:
+        combined = high_dir + low_dir
+        if combined > 0:
+            trend = "bullish"
+        elif combined < 0:
+            trend = "bearish"
+        else:
+            trend = "ranging"
 
     bos_detected = False
     choch_detected = False
@@ -304,13 +281,9 @@ def analyze_market_structure(
     last_bos_direction: Optional[str] = None
     last_choch_direction: Optional[str] = None
 
-    # Use the latest confirmed swing, not the highest/lowest price from
-    # the entire lookback window.
     latest_swing_high = recent_highs[-1]
     latest_swing_low = recent_lows[-1]
 
-    # Only inspect candles after the relevant swing was formed. This avoids
-    # treating a close that occurred before the swing as a break of it.
     check_start = max(0, len(close_array) - 10)
 
     if trend == "bullish":
@@ -347,13 +320,11 @@ def analyze_market_structure(
 
     if recent_highs:
         structure_levels["recent_high"] = float(recent_highs[-1].price)
-
         if len(recent_highs) >= 2:
             structure_levels["previous_high"] = float(recent_highs[-2].price)
 
     if recent_lows:
         structure_levels["recent_low"] = float(recent_lows[-1].price)
-
         if len(recent_lows) >= 2:
             structure_levels["previous_low"] = float(recent_lows[-2].price)
 
@@ -367,7 +338,7 @@ def analyze_market_structure(
         last_choch_direction=last_choch_direction,
         swing_highs=recent_highs,
         swing_lows=recent_lows,
-        structure_levels=structure_levels
+        structure_levels=structure_levels,
     )
 
 
@@ -409,37 +380,33 @@ def detect_fvgs(
     fvgs: List[FVG] = []
 
     for i in range(2, len(open_array)):
-        # Bullish FVG: current candle's low is above the high two candles ago.
         bullish_bottom = high_array[i - 2]
         bullish_top = low_array[i]
 
         if bullish_top > bullish_bottom:
             gap_size = bullish_top - bullish_bottom
-
             if gap_size >= min_size:
                 fvgs.append(
                     FVG(
                         index=i,
                         type="bullish",
                         top=float(bullish_top),
-                        bottom=float(bullish_bottom)
+                        bottom=float(bullish_bottom),
                     )
                 )
 
-        # Bearish FVG: current candle's high is below the low two candles ago.
         bearish_bottom = high_array[i]
         bearish_top = low_array[i - 2]
 
         if bearish_top > bearish_bottom:
             gap_size = bearish_top - bearish_bottom
-
             if gap_size >= min_size:
                 fvgs.append(
                     FVG(
                         index=i,
                         type="bearish",
                         top=float(bearish_top),
-                        bottom=float(bearish_bottom)
+                        bottom=float(bearish_bottom),
                     )
                 )
 
@@ -452,12 +419,7 @@ def check_fvg_mitigation(
     lows: np.ndarray,
     current_index: int
 ) -> List[FVG]:
-    """Update FVGs when a later candle completely fills the gap.
-
-    A simple touch or partial retracement does not mark an FVG as fully
-    mitigated. The function scans all candles after formation up to
-    current_index so an earlier fill is not missed.
-    """
+    """Update FVGs when a later candle completely fills the gap."""
     high_array = _as_float_array(highs, "highs")
     low_array = _as_float_array(lows, "lows")
 
@@ -472,10 +434,8 @@ def check_fvg_mitigation(
     for fvg in fvgs:
         if fvg.mitigated:
             continue
-
         if fvg.type not in ("bullish", "bearish"):
             continue
-
         if fvg.bottom >= fvg.top:
             continue
 
@@ -488,7 +448,6 @@ def check_fvg_mitigation(
                 fvg.mitigated = True
                 fvg.mitigation_index = i
                 break
-
             if fvg.type == "bearish" and high_array[i] >= fvg.top:
                 fvg.mitigated = True
                 fvg.mitigation_index = i
@@ -521,12 +480,8 @@ def detect_order_blocks(
     lookback: int = 20,
     displacement_threshold: float = 1.5
 ) -> List[OrderBlock]:
-    """Detect candidate order blocks before strong directional moves.
+    """Detect candidate order blocks before strong directional moves."""
 
-    The order block zone uses the full high-low range of the opposing
-    candle. Strength is measured against the average body size of the
-    five preceding candles.
-    """
     open_array, high_array, low_array, close_array = _validate_ohlc(
         opens, highs, lows, closes
     )
@@ -539,16 +494,21 @@ def detect_order_blocks(
     obs: List[OrderBlock] = []
     n = len(open_array)
 
-    # Need five prior candles for the baseline and at least one later
-    # candle to confirm displacement.
-    start_index = max(lookback, 5)
+    if lookback < 1:
+        raise ValueError("lookback must be at least 1")
+
+    start_index = lookback
 
     for i in range(start_index, n - 1):
+        baseline_start = max(0, i - lookback)
         previous_bodies = np.abs(
-            close_array[i - 5:i] - open_array[i - 5:i]
+            close_array[baseline_start:i]
+            - open_array[baseline_start:i]
         )
-        avg_size = float(np.mean(previous_bodies))
+        if len(previous_bodies) == 0:
+            continue
 
+        avg_size = float(np.mean(previous_bodies))
         if avg_size <= 0:
             continue
 
@@ -558,14 +518,11 @@ def detect_order_blocks(
         if len(future_closes) == 0:
             continue
 
-        # Bullish OB: bearish candle followed by meaningful upward displacement.
         if close_array[i] < open_array[i]:
             upward_displacement = float(
                 np.max(future_closes) - open_array[i]
             )
-
             strength = upward_displacement / avg_size
-
             if strength >= displacement_threshold:
                 obs.append(
                     OrderBlock(
@@ -573,18 +530,15 @@ def detect_order_blocks(
                         type="bullish",
                         top=float(high_array[i]),
                         bottom=float(low_array[i]),
-                        strength=float(strength)
+                        strength=float(strength),
                     )
                 )
 
-        # Bearish OB: bullish candle followed by meaningful downward displacement.
         elif close_array[i] > open_array[i]:
             downward_displacement = float(
                 open_array[i] - np.min(future_closes)
             )
-
             strength = downward_displacement / avg_size
-
             if strength >= displacement_threshold:
                 obs.append(
                     OrderBlock(
@@ -592,7 +546,7 @@ def detect_order_blocks(
                         type="bearish",
                         top=float(high_array[i]),
                         bottom=float(low_array[i]),
-                        strength=float(strength)
+                        strength=float(strength),
                     )
                 )
 
@@ -605,12 +559,7 @@ def check_ob_mitigation(
     lows: np.ndarray,
     current_index: int
 ) -> List[OrderBlock]:
-    """Mark order blocks fully mitigated by a later candle.
-
-    Entering an order block is not considered full mitigation. A bullish
-    block is fully mitigated at/below its bottom; a bearish block is fully
-    mitigated at/above its top.
-    """
+    """Mark order blocks fully mitigated by a later candle."""
     high_array = _as_float_array(highs, "highs")
     low_array = _as_float_array(lows, "lows")
 
@@ -625,10 +574,8 @@ def check_ob_mitigation(
     for ob in obs:
         if ob.tested:
             continue
-
         if ob.type not in ("bullish", "bearish"):
             continue
-
         if ob.bottom >= ob.top:
             continue
 
@@ -641,7 +588,6 @@ def check_ob_mitigation(
                 ob.tested = True
                 ob.mitigation_index = i
                 break
-
             if ob.type == "bearish" and high_array[i] >= ob.top:
                 ob.tested = True
                 ob.mitigation_index = i
@@ -658,7 +604,7 @@ def check_ob_mitigation(
 class LiquidityLevel:
     price: float
     type: str  # "buy_side" or "sell_side"
-    strength: int  # number of touches
+    strength: int
     indices: List[int]
     timestamp: Any = None
     swept: bool = False
@@ -672,8 +618,7 @@ def _cluster_price_levels(
 ) -> List[Tuple[float, List[int]]]:
     """Cluster nearby prices and return average price plus candle indices."""
     indexed_values = [
-        (float(values[i]), i)
-        for i in range(start_index, len(values))
+        (float(values[i]), i) for i in range(start_index, len(values))
     ]
     indexed_values.sort(key=lambda item: item[0])
 
@@ -685,9 +630,7 @@ def _cluster_price_levels(
             continue
 
         current_cluster = clusters[-1]
-        cluster_mean = float(
-            np.mean([item[0] for item in current_cluster])
-        )
+        cluster_mean = float(np.mean([item[0] for item in current_cluster]))
 
         if abs(price - cluster_mean) <= tolerance:
             current_cluster.append((price, index))
@@ -697,9 +640,7 @@ def _cluster_price_levels(
     result: List[Tuple[float, List[int]]] = []
 
     for cluster in clusters:
-        average_price = float(
-            np.mean([item[0] for item in cluster])
-        )
+        average_price = float(np.mean([item[0] for item in cluster]))
         indices = sorted(item[1] for item in cluster)
         result.append((average_price, indices))
 
@@ -713,17 +654,8 @@ def detect_liquidity_levels(
     tolerance_pips: float = 2.0,
     point_value: float = 0.01
 ) -> Tuple[List[LiquidityLevel], List[LiquidityLevel]]:
-    """Detect buy-side and sell-side liquidity from equal highs/lows.
+    """Detect buy-side and sell-side liquidity from equal highs/lows."""
 
-    Buy-side liquidity:
-        Equal highs where buy stops are likely resting.
-
-    Sell-side liquidity:
-        Equal lows where sell stops are likely resting.
-
-    Returns:
-        (buy_side_levels, sell_side_levels)
-    """
     high_array = _as_float_array(highs, "highs")
     low_array = _as_float_array(lows, "lows")
 
@@ -744,18 +676,11 @@ def detect_liquidity_levels(
     tolerance = float(tolerance_pips) * float(point_value)
     start_index = max(0, len(high_array) - lookback)
 
-    # Equal highs are BUY-SIDE liquidity.
     high_clusters = _cluster_price_levels(
-        high_array,
-        start_index,
-        tolerance
+        high_array, start_index, tolerance
     )
-
-    # Equal lows are SELL-SIDE liquidity.
     low_clusters = _cluster_price_levels(
-        low_array,
-        start_index,
-        tolerance
+        low_array, start_index, tolerance
     )
 
     buy_side: List[LiquidityLevel] = []
@@ -768,7 +693,7 @@ def detect_liquidity_levels(
                     price=price,
                     type="buy_side",
                     strength=len(indices),
-                    indices=indices
+                    indices=indices,
                 )
             )
 
@@ -779,7 +704,7 @@ def detect_liquidity_levels(
                     price=price,
                     type="sell_side",
                     strength=len(indices),
-                    indices=indices
+                    indices=indices,
                 )
             )
 
@@ -793,14 +718,8 @@ def check_liquidity_sweep(
     lows: np.ndarray,
     current_index: int
 ) -> Tuple[List[LiquidityLevel], List[LiquidityLevel]]:
-    """Mark liquidity levels swept by the specified candle.
+    """Mark liquidity levels swept by the specified candle."""
 
-    A buy-side sweep occurs when price trades at/above equal highs.
-    A sell-side sweep occurs when price trades at/below equal lows.
-
-    This detects a wick through a level. It does not confirm a reversal:
-    rejection/close confirmation must be handled by the strategy layer.
-    """
     high_array = _as_float_array(highs, "highs")
     low_array = _as_float_array(lows, "lows")
 
@@ -818,7 +737,6 @@ def check_liquidity_sweep(
     for level in buy_side:
         if level.type != "buy_side" or level.swept:
             continue
-
         if current_high >= level.price:
             level.swept = True
             level.sweep_index = current_index
@@ -826,7 +744,6 @@ def check_liquidity_sweep(
     for level in sell_side:
         if level.type != "sell_side" or level.swept:
             continue
-
         if current_low <= level.price:
             level.swept = True
             level.sweep_index = current_index
@@ -879,7 +796,7 @@ def calculate_premium_discount(
         "low": low,
         "midpoint": midpoint,
         "current_price": current_price,
-        "distance_from_equilibrium": float(distance_from_eq)
+        "distance_from_equilibrium": float(distance_from_eq),
     }
 
 
@@ -910,8 +827,6 @@ def detect_displacement(
     for i in range(max(0, len(open_array) - lookback), len(open_array)):
         body_size = abs(float(close_array[i] - open_array[i]))
 
-        # Compare the current candle against preceding candles only.
-        # This avoids including the candle being evaluated in its baseline.
         baseline_start = max(0, i - 10)
         previous_bodies = np.abs(
             close_array[baseline_start:i] - open_array[baseline_start:i]
@@ -921,7 +836,6 @@ def detect_displacement(
             continue
 
         avg_body = float(np.mean(previous_bodies))
-
         if avg_body <= 0:
             continue
 
@@ -933,8 +847,6 @@ def detect_displacement(
                 if close_array[i] > open_array[i]
                 else "bearish"
             )
-
-            # Ignore doji candles; they have no directional displacement.
             if close_array[i] == open_array[i]:
                 continue
 
@@ -943,7 +855,7 @@ def detect_displacement(
                 "direction": direction,
                 "body_size": body_size,
                 "avg_body": avg_body,
-                "ratio": float(ratio)
+                "ratio": float(ratio),
             })
 
     return displacements

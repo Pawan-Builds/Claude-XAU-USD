@@ -32,7 +32,7 @@ class MarketDataEngine:
     def __init__(self):
         self.timeframes = config.timeframes
         self.smc_config = config.smc
-        self._candle_cache: Dict[str, deque] = {}  # timeframe -> deque of candles
+        self._candle_cache: Dict[str, deque] = {}
         self._last_candle_time: Dict[str, datetime] = {}
         self._lock = threading.RLock()
         self._callbacks: List[callable] = []
@@ -106,7 +106,7 @@ class MarketDataEngine:
             return list(self._candle_cache[timeframe])[-count:]
 
     def get_latest_candle(self, timeframe: str) -> Optional[Candle]:
-        """Get the latest completed candle."""
+        """Get the latest cached candle (may still be forming)."""
         with self._lock:
             if timeframe not in self._candle_cache or not self._candle_cache[timeframe]:
                 return None
@@ -126,6 +126,7 @@ class MarketDataEngine:
         bid = tick["bid"]
         ask = tick["ask"]
         spread = tick["spread"]
+        mid = (bid + ask) / 2.0
 
         tf_map = {
             "m5": 5,
@@ -157,13 +158,15 @@ class MarketDataEngine:
                         spread=last_candle.spread
                     )
 
-                    # Start new candle
+                    # Start new candle. Using ask for open/high and bid
+                    # for low matches the executable quote on each side —
+                    # a buy fills at ask, a sell fills at bid.
                     new_candle = Candle(
                         timestamp=candle_end,
-                        open=bid,
-                        high=bid,
+                        open=mid,
+                        high=ask,
                         low=bid,
-                        close=bid,
+                        close=mid,
                         volume=0,
                         spread=spread
                     )
@@ -175,10 +178,12 @@ class MarketDataEngine:
                     self._notify_callbacks(tf_name, completed_candle)
                     updated = True
                 else:
-                    # Update current forming candle
-                    last_candle.high = max(last_candle.high, bid)
+                    # Update current forming candle.
+                    # High uses ask, low uses bid — this is what a
+                    # sweep of buy-side liquidity actually requires.
+                    last_candle.high = max(last_candle.high, ask)
                     last_candle.low = min(last_candle.low, bid)
-                    last_candle.close = bid
+                    last_candle.close = mid
                     last_candle.volume += 1
                     last_candle.spread = spread
 
@@ -314,7 +319,6 @@ class MarketDataEngine:
         if not symbol_info:
             return 0.0
 
-        # Convert spread to pips (1 pip = 0.01 for XAUUSD typically)
         point = symbol_info.point
         if point == 0:
             return 0.0
@@ -335,7 +339,6 @@ class MarketDataEngine:
         minute = now.minute
         current_time = hour * 60 + minute
 
-        sessions = config.sessions
         session_info = {
             "current_time_utc": now.strftime("%H:%M"),
             "london": False,
@@ -345,14 +348,12 @@ class MarketDataEngine:
             "active_session": "closed"
         }
 
-        # London: 08:00-17:00 UTC
         london_open = 8 * 60
         london_close = 17 * 60
         if london_open <= current_time < london_close:
             session_info["london"] = True
             session_info["active_session"] = "london"
 
-        # New York: 13:00-22:00 UTC
         ny_open = 13 * 60
         ny_close = 22 * 60
         if ny_open <= current_time < ny_close:
@@ -363,7 +364,6 @@ class MarketDataEngine:
             elif session_info["active_session"] == "closed":
                 session_info["active_session"] = "new_york"
 
-        # Asian: 00:00-09:00 UTC
         asian_open = 0
         asian_close = 9 * 60
         if asian_open <= current_time < asian_close:
@@ -393,13 +393,11 @@ class MarketDataEngine:
             return False
 
         now = datetime.now(timezone.utc)
-        # Friday close_before_weekend_hours before market close (22:00 UTC)
         if now.weekday() == 4:  # Friday
             hours_until_close = 22 - now.hour - now.minute / 60
             if hours_until_close <= config.sessions.close_before_weekend_hours:
                 return True
 
-        # Saturday/Sunday
         if now.weekday() >= 5:
             return True
 

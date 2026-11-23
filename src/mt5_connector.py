@@ -677,7 +677,7 @@ class MT5Connector:
 
         if orders is None:
             logger.error("Could not retrieve pending orders: %s", mt5.last_error())
-            return []
+            return None
 
         result = []
 
@@ -938,6 +938,31 @@ class MT5Connector:
 
             payload.setdefault("deviation", 20)
             payload["type_filling"] = self._get_filling_mode(symbol)
+
+        elif action == mt5.TRADE_ACTION_PENDING:
+            order_type = payload.get("type")
+            if order_type not in (
+                mt5.ORDER_TYPE_BUY_LIMIT,
+                mt5.ORDER_TYPE_SELL_LIMIT,
+                mt5.ORDER_TYPE_BUY_STOP,
+                mt5.ORDER_TYPE_SELL_STOP,
+                mt5.ORDER_TYPE_BUY_STOP_LIMIT,
+                mt5.ORDER_TYPE_SELL_STOP_LIMIT,
+            ):
+                return OrderResult(
+                    success=False,
+                    error_message="Invalid pending order type"
+                )
+
+            # Pending orders keep their specified price — do NOT overwrite.
+            if "price" not in payload or payload["price"] is None:
+                return OrderResult(
+                    success=False,
+                    error_message="Pending order requires a price"
+                )
+
+            payload.setdefault("type_filling", mt5.ORDER_FILLING_RETURN)
+            payload.setdefault("type_time", mt5.ORDER_TIME_GTC)
 
         result = mt5.order_send(payload)
 

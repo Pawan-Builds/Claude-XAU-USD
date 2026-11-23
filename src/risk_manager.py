@@ -1,4 +1,3 @@
-
 """Risk management and broker-aware position sizing."""
 
 from dataclasses import dataclass
@@ -116,7 +115,9 @@ class RiskManager:
 
         account = mt5_connector.get_account_info()
         if account is None:
-            return self._failed_result("Could not retrieve MT5 account information.")
+            return self._failed_result(
+                "Could not retrieve MT5 account information."
+            )
 
         equity = float(account.equity)
         if equity <= 0:
@@ -381,6 +382,19 @@ class RiskManager:
         if raw <= 0 or minimum <= 0 or maximum < minimum or step <= 0:
             return 0.0, False
 
+        # Some brokers report a step finer than they actually accept
+        # (XM GOLD reports 0.001 but enforces 0.01). Anchor the effective
+        # step at the precision of volume_min so we never produce a
+        # volume the broker will reject.
+        min_precision = -minimum.as_tuple().exponent
+        step_floor = Decimal("1").scaleb(-min_precision)
+        if step < step_floor:
+            logger.info(
+                "Clamping broker step %s to volume_min precision %s",
+                step, step_floor
+            )
+            step = step_floor
+
         # Do not force the broker minimum if it exceeds the risk budget.
         if raw < minimum:
             return 0.0, True
@@ -394,6 +408,12 @@ class RiskManager:
 
         normalized = minimum + number_of_steps * step
         normalized = min(normalized, maximum)
+
+        # Quantize down to the effective step's precision.
+        normalized = normalized.quantize(step_floor, rounding=ROUND_DOWN)
+
+        if normalized < minimum:
+            return 0.0, True
 
         adjusted = normalized != raw
 
@@ -430,7 +450,6 @@ class RiskManager:
                 if volume <= 0 or entry <= 0:
                     return None
 
-                # An open position without an SL has unbounded planned risk.
                 if stop <= 0:
                     logger.error(
                         "Open position %s has no stop loss.",

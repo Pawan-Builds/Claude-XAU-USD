@@ -339,7 +339,12 @@ class SignalValidator:
         return actual_rr >= minimum_rr, actual_rr
 
     def _check_entry_price(self, signal: TradeSignal) -> bool:
-        """Check signal entry against current Ask/Bid using broker points."""
+        """Validate that the planned entry is executable as a pending limit.
+
+        BUY_LIMIT must sit strictly BELOW current ask.
+        SELL_LIMIT must sit strictly ABOVE current bid.
+        Distance must be sane (not more than 500 points away).
+        """
 
         try:
             tick = market_data.get_current_tick()
@@ -353,21 +358,38 @@ class SignalValidator:
                 return False
 
             direction = signal.direction
-            signal_entry = float(signal.entry_price)
+            entry = float(signal.entry_price)
 
             if direction == SignalDirection.BUY:
                 current_price = float(tick["ask"])
+                if entry >= current_price:
+                    return False   # limit must sit below ask
             else:
                 current_price = float(tick["bid"])
+                if entry <= current_price:
+                    return False   # limit must sit above bid
 
             if current_price <= 0:
                 return False
 
-            # 50 broker points is a tolerance, not a universal pip value.
-            max_deviation_points = 50
-            allowed_deviation = max_deviation_points * point
+            distance = abs(entry - current_price)
 
-            return abs(signal_entry - current_price) <= allowed_deviation
+            # Must be at least 1 point away (broker minimum).
+            if distance < point:
+                return False
+
+            # Must not be more than 500 points (5 gold dollars) away —
+            # anything further means the setup is stale.
+            if distance > 500 * point:
+                logger.warning(
+                    "Signal entry %.5f is more than 500 points from "
+                    "current price %.5f; treating as stale.",
+                    entry,
+                    current_price,
+                )
+                return False
+
+            return True
 
         except Exception:
             logger.exception("Entry-price validation failed.")

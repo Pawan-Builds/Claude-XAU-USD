@@ -1,4 +1,3 @@
-
 """Liquidity analysis module.
 
 Detects buy-side and sell-side liquidity, identifies candidate sweeps,
@@ -120,6 +119,17 @@ class LiquidityAnalyzer:
                 )
                 return None
 
+            # Analyze only confirmed (closed) candles. Dropping the last
+            # bar prevents repainting: a sweep that only exists on the
+            # half-closed candle cannot generate a signal.
+            candles = candles[:-1]
+            highs = highs[:-1]
+            lows = lows[:-1]
+
+            if len(candles) < 10:
+                self.liquidity_cache.pop(timeframe, None)
+                return None
+
             current_index = len(candles) - 1
 
             # Do not use the candle being tested to construct its own
@@ -140,7 +150,8 @@ class LiquidityAnalyzer:
                 point_value=self.point_value
             )
 
-            # Test the latest candle against previously identified pools.
+            # Test the latest confirmed candle against previously
+            # identified pools.
             buy_side, sell_side = check_liquidity_sweep(
                 buy_side,
                 sell_side,
@@ -182,10 +193,13 @@ class LiquidityAnalyzer:
 
             self.liquidity_cache[timeframe] = state
 
+            # Quietly log sweeps at DEBUG — INFO would spam the console
+            # and the Telegram handler every cycle (sweeps persist for
+            # the entire sweep candle).
             for sweep in recent_sweeps:
-                logger.info(
-                    "Liquidity sweep candidate: timeframe=%s "
-                    "type=%s price=%.3f strength=%s",
+                logger.debug(
+                    "Liquidity sweep: timeframe=%s type=%s "
+                    "price=%.3f strength=%s",
                     timeframe,
                     sweep["type"],
                     sweep["price"],

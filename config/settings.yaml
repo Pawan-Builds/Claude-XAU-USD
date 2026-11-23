@@ -19,6 +19,9 @@ trading:
   max_drawdown_percent: 10.0
   max_consecutive_losses: 5
   max_holding_hours: 48
+  entry_order_type: "limit"     # "limit" (planned) or "market" (reactive)
+  pending_expiry_hours: 4       # cancel unfilled limit orders after N hours
+  max_pending_orders: 5  
 
 # DEMO account
 demo:
@@ -153,6 +156,7 @@ logging:
   date_format: "%Y-%m-%d %H:%M:%S"
 
 safety:
+  demo_only: true
   verify_demo_on_startup: true
   kill_switch_enabled: true
   max_errors_before_pause: 10

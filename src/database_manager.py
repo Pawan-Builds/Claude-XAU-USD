@@ -114,6 +114,8 @@ class OrderRequest(Base):
     error_code = Column(Integer, nullable=True)
     error_message = Column(Text, nullable=True)
     environment = Column(String(20), default="demo")
+    mt5_ticket = Column(BigInteger, nullable=True, index=True)
+    expires_at = Column(DateTime, nullable=True)
 
 
 class ExecutedOrder(Base):
@@ -403,75 +405,72 @@ class DatabaseManager:
         logger.info("Database tables created and schema verified")
 
     def _migrate_schema(self):
-        """
-        Add missing columns without deleting or resetting existing records.
-        Migrations are idempotent: already-existing columns are skipped.
-        """
-
-        migrations = {
-            "initial_sl": "FLOAT NOT NULL DEFAULT 0.0",
-            "initial_tp": "FLOAT NOT NULL DEFAULT 0.0",
-            "initial_risk_distance": "FLOAT NOT NULL DEFAULT 0.0",
-            "remaining_volume": "FLOAT NOT NULL DEFAULT 0.0",
-            "highest_r": "FLOAT NOT NULL DEFAULT 0.0",
-            "lowest_r": "FLOAT NOT NULL DEFAULT 0.0",
-            "management_state": "JSON"
+        """Additive, idempotent column migrations."""
+        migrations_map = {
+            "open_positions": {
+                "initial_sl": "FLOAT NOT NULL DEFAULT 0.0",
+                "initial_tp": "FLOAT NOT NULL DEFAULT 0.0",
+                "initial_risk_distance": "FLOAT NOT NULL DEFAULT 0.0",
+                "remaining_volume": "FLOAT NOT NULL DEFAULT 0.0",
+                "highest_r": "FLOAT NOT NULL DEFAULT 0.0",
+                "lowest_r": "FLOAT NOT NULL DEFAULT 0.0",
+                "management_state": "JSON",
+            },
+            "order_requests": {
+                "mt5_ticket": "BIGINT",
+                "expires_at": "DATETIME",
+            },
         }
 
         inspector = inspect(self.engine)
+        table_names = inspector.get_table_names()
 
-        if "open_positions" not in inspector.get_table_names():
-            raise RuntimeError(
-                "Cannot migrate database: open_positions table is missing"
-            )
-
-        existing_columns = {
-            column["name"]
-            for column in inspector.get_columns("open_positions")
-        }
-
-        added_columns = []
+        added_columns: List[str] = []
 
         with self.engine.begin() as connection:
-            for column_name, column_definition in migrations.items():
+            for table, columns in migrations_map.items():
+                if table not in table_names:
+                    continue
 
-                if column_name not in existing_columns:
-                    connection.exec_driver_sql(
-                        f'ALTER TABLE open_positions '
-                        f'ADD COLUMN "{column_name}" {column_definition}'
-                    )
-                    added_columns.append(column_name)
+                existing = {
+                    c["name"] for c in inspector.get_columns(table)
+                }
+                for col_name, col_def in columns.items():
+                    if col_name not in existing:
+                        connection.exec_driver_sql(
+                            f'ALTER TABLE "{table}" ADD COLUMN '
+                            f'"{col_name}" {col_def}'
+                        )
+                        added_columns.append(f"{table}.{col_name}")
 
-            # Backfill existing open positions where possible.
-            connection.execute(text("""
-                UPDATE open_positions
-                SET initial_sl = sl
-                WHERE initial_sl = 0 AND sl != 0
-            """))
-
-            connection.execute(text("""
-                UPDATE open_positions
-                SET initial_tp = tp
-                WHERE initial_tp = 0 AND tp != 0
-            """))
-
-            connection.execute(text("""
-                UPDATE open_positions
-                SET remaining_volume = volume
-                WHERE remaining_volume = 0 AND volume > 0
-            """))
-
-            connection.execute(text("""
-                UPDATE open_positions
-                SET initial_risk_distance = ABS(price_open - initial_sl)
-                WHERE initial_risk_distance = 0
-                  AND initial_sl != 0
-            """))
+            # Backfill open_positions (unchanged).
+            if "open_positions" in table_names:
+                connection.execute(text("""
+                    UPDATE open_positions
+                    SET initial_sl = sl
+                    WHERE initial_sl = 0 AND sl != 0
+                """))
+                connection.execute(text("""
+                    UPDATE open_positions
+                    SET initial_tp = tp
+                    WHERE initial_tp = 0 AND tp != 0
+                """))
+                connection.execute(text("""
+                    UPDATE open_positions
+                    SET remaining_volume = volume
+                    WHERE remaining_volume = 0 AND volume > 0
+                """))
+                connection.execute(text("""
+                    UPDATE open_positions
+                    SET initial_risk_distance = ABS(price_open - initial_sl)
+                    WHERE initial_risk_distance = 0
+                      AND initial_sl != 0
+                """))
 
         if added_columns:
             logger.info(
                 "Database migration added columns: %s",
-                ", ".join(added_columns)
+                ", ".join(added_columns),
             )
         else:
             logger.info("Database schema is already up to date")
