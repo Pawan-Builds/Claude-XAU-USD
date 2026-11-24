@@ -7,6 +7,7 @@ F-05/F-06 additions:
   rows, populated from actual realised profit/swap/commission.
 """
 
+import json
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from src.database_manager import (
     ExecutedOrder,
     ClosedTrade,
     OrderRequest,
+    AppSettings,
 )
 from src.logger import get_logger
 
@@ -448,15 +450,50 @@ class TradeManager:
                 actions.append(action)
         return actions
 
-    def _refresh_remaining_volume(self, ticket: int):
+    def _refresh_remaining_volume(self, ticket: int) -> bool:
+        """Sync the in-memory remaining_volume with the broker.
+
+        Distinguishes three outcomes that ``_get_mt5_position`` collapses
+        into ``None``:
+
+          * Query raised / returned None → **leave volume unchanged**,
+            log loudly, retry next cycle. Silently zeroing was the bug
+            (H-06 §6.7): it desynced partial-TP and ClosedTrade logic
+            from the broker after a transient network hiccup.
+          * Query succeeded, ticket absent → position is closed → set
+            volume to 0.0.
+          * Query succeeded, ticket present → set volume from broker.
+
+        Returns True when the volume is now known to be correct.
+        """
         pos = self._managed_positions.get(ticket)
         if not pos:
-            return
-        live_position = self._get_mt5_position(ticket)
-        if live_position is not None:
-            pos["remaining_volume"] = float(live_position["volume"])
-        else:
-            pos["remaining_volume"] = 0.0
+            return False
+
+        try:
+            positions = mt5_connector.get_positions()
+        except Exception:
+            logger.exception(
+                "Position query raised while refreshing volume for %s; "
+                "leaving stale volume in place.", ticket,
+            )
+            return False
+
+        if positions is None:
+            logger.error(
+                "Position query returned None while refreshing volume "
+                "for %s; leaving stale volume in place.", ticket,
+            )
+            return False
+
+        for position in positions:
+            if int(position["ticket"]) == int(ticket):
+                pos["remaining_volume"] = float(position["volume"])
+                return True
+
+        # Query succeeded and the position is genuinely absent.
+        pos["remaining_volume"] = 0.0
+        return True
 
     # ---------------------------------------------------------
     # Maximum holding time (unchanged)
@@ -637,78 +674,145 @@ class TradeManager:
     def reconcile_with_broker(self) -> bool:
         """Full bidirectional reconciliation of DB position state with MT5.
 
-        Returns False only when MT5 position data could not be fetched.
-        Partial recovery (one orphan fill, one missing closure) is handled
-        best-effort and logged; the caller stays fail-closed because the
-        entry gate will not unpause if the account is not healthy.
+        Returns True only when MT5 was reachable and no bot-owned
+        position remains unresolved. Any unresolved ticket causes
+        ``has_unresolved_reconciliation()`` to report True until the
+        position is resolved (H-05 / H-06).
         """
+        unresolved: List[int] = []
+        errors: List[str] = []
+
         try:
             mt5_positions = mt5_connector.get_positions()
         except Exception as exc:
             logger.exception("MT5 position query failed: %s", exc)
+            self._persist_unresolved([], f"query failed: {exc}")
             return False
 
         if mt5_positions is None:
             logger.error(
                 "MT5 returned no position data; reconciliation skipped"
             )
+            self._persist_unresolved([], "position query returned None")
             return False
 
-        live_tickets = {
-            int(position["ticket"]) for position in mt5_positions
-        }
+        live_tickets = {int(p["ticket"]) for p in mt5_positions}
 
-        # --- 1. Handle live MT5 positions -------------------------------
+        # 1. Live positions: resolve or mark unresolved.
         for position in mt5_positions:
             ticket = int(position["ticket"])
             try:
-                self._reconcile_live_position(position)
-            except Exception:
+                ok = self._reconcile_live_position(position)
+            except Exception as exc:
                 logger.exception(
                     "Failed to reconcile live position %s", ticket,
                 )
-                # Do not return False: one bad position should not stop
-                # the whole pass. The gate remains fail-closed downstream.
+                errors.append(f"ticket {ticket}: exception: {exc}")
+                unresolved.append(ticket)
+                continue
+            if not ok:
+                errors.append(f"ticket {ticket}: could not reconstruct")
+                unresolved.append(ticket)
 
-        # --- 2. Handle DB positions no longer present in MT5 -----------
+        # 2. DB positions no longer in MT5: reconstruct closures.
         try:
             open_db_positions = db_manager.get_open_positions(
                 environment=self.environment
             )
-        except Exception:
-            logger.exception("Could not list OpenPosition rows for recovery.")
+        except Exception as exc:
+            logger.exception("Could not list OpenPosition rows.")
             open_db_positions = []
+            errors.append(f"DB open-position list failed: {exc}")
 
         for record in open_db_positions:
             ticket = int(record.ticket)
             if ticket in live_tickets:
                 continue
             try:
-                self.reconstruct_closed_trade(
-                    ticket, exit_reason="RECOVERED"
+                ok = self.reconstruct_closed_trade(
+                    ticket, exit_reason="RECOVERED",
                 )
-            except Exception:
+            except Exception as exc:
                 logger.exception(
                     "Failed to reconstruct closure for ticket %s", ticket,
                 )
+                errors.append(f"closure {ticket}: exception: {exc}")
+                unresolved.append(ticket)
+                continue
+            if not ok:
+                errors.append(f"closure {ticket}: reconstruct returned False")
+                unresolved.append(ticket)
 
-        # --- 3. Drop stale in-memory tracking for closed positions -----
+        # 3. Drop stale in-memory tracking.
         for ticket in list(self._managed_positions.keys()):
             if ticket not in live_tickets:
                 self.remove_position(ticket)
 
+        self._persist_unresolved(unresolved, "; ".join(errors))
+
         logger.info(
             "Broker reconciliation complete. MT5 positions: %s | "
-            "Managed positions: %s | DB open rows: %s",
+            "Managed positions: %s | DB open rows: %s | unresolved: %s",
             len(mt5_positions),
             len(self._managed_positions),
             len(open_db_positions),
+            len(unresolved),
         )
-        return True
+        return len(unresolved) == 0
 
-    def _reconcile_live_position(self, position: Dict):
+    def _persist_unresolved(
+        self, tickets: List[int], errors: str,
+    ) -> None:
+        key = f"unresolved_recon_{self.environment}"
+        payload = {
+            "tickets": sorted({int(t) for t in tickets}),
+            "errors": errors or "",
+        }
+        try:
+            with db_manager.get_session() as session:
+                setting = session.query(AppSettings).filter_by(key=key).first()
+                if setting is None:
+                    session.add(AppSettings(
+                        key=key, value=json.dumps(payload),
+                    ))
+                else:
+                    setting.value = json.dumps(payload)
+        except Exception:
+            logger.exception(
+                "Could not persist unresolved-reconciliation marker."
+            )
+
+    def has_unresolved_reconciliation(self) -> bool:
+        return len(self.get_unresolved_tickets()) > 0
+
+    def get_unresolved_tickets(self) -> List[int]:
+        key = f"unresolved_recon_{self.environment}"
+        try:
+            setting = db_manager.query_one(AppSettings, key=key)
+        except Exception:
+            logger.exception(
+                "Could not read unresolved-reconciliation marker."
+            )
+            return []
+        if setting is None or not setting.value:
+            return []
+        try:
+            payload = json.loads(setting.value)
+            return [int(t) for t in payload.get("tickets", [])]
+        except (json.JSONDecodeError, TypeError, ValueError):
+            logger.exception(
+                "Corrupt unresolved-reconciliation marker."
+            )
+            return []
+
+    def _reconcile_live_position(self, position: Dict) -> bool:
         """Ensure ExecutedOrder + OpenPosition + tracking exist for one
-        live MT5 position, reconstructing from deal history if needed."""
+        live MT5 position, reconstructing from deal history if needed.
+
+        Returns True when the position is fully tracked, False when it
+        remains unresolved (no IN deal, or DB insert failed). H-05
+        requires that unresolved positions are not reported as success.
+        """
         ticket = int(position["ticket"])
 
         executed = db_manager.query_one(
@@ -717,7 +821,6 @@ class TradeManager:
         open_row = self._get_database_position(ticket)
 
         if executed is not None and open_row is not None:
-            # Normal case — just refresh.
             if ticket in self._managed_positions:
                 self._refresh_remaining_volume(ticket)
             else:
@@ -730,9 +833,8 @@ class TradeManager:
                     volume=float(position["volume"]),
                     strategy=open_row.strategy or "UNKNOWN",
                 )
-            return
+            return True
 
-        # Reconstruction path.
         logger.warning(
             "F-05 RECOVERY | ticket=%s has MT5 position but %s missing",
             ticket,
@@ -747,7 +849,7 @@ class TradeManager:
                 "Position will remain untracked until resolved manually.",
                 ticket,
             )
-            return
+            return False
 
         entry_price = float(entry_deal["price"])
         entry_time = entry_deal["time"]
@@ -821,7 +923,7 @@ class TradeManager:
                 logger.exception(
                     "Failed to create recovered OpenPosition for %s", ticket,
                 )
-                return
+                return False
 
         self.initialize_position_tracking(
             ticket=ticket,
@@ -837,6 +939,7 @@ class TradeManager:
             "strategy=%s",
             ticket, entry_price, entry_volume, strategy,
         )
+        return True
 
     def _lookup_strategy_for_ticket(self, ticket: int) -> Optional[str]:
         req = db_manager.query_one(

@@ -8,14 +8,35 @@ F-02 fix summary:
 - Made ClosedTrade inserts idempotent.
 - Restricted close_all_positions to bot-owned magic only.
 - Added EntryGate check at the top of execute_signal (defence in depth).
+
+Batch 4 corrections:
+- Deleted the duplicated §1d position-sizing block (kept one).
+- §1d now sizes against mt5_connector.get_tick() — the canonical quote
+  source, matching _process_trade_plans and _prepare_order_request —
+  instead of symbol_info.ask/bid. Fails closed if the quote is missing
+  or non-positive.
+- §1g reads the gate token via getattr(final_gate, "token", None).
+  The connector is the enforcement boundary for opening actions (C-03);
+  the executor's job is only to pass the token through. This avoids
+  turning a missing-token condition into an "uncertain" status that
+  blocks the fingerprint duplicate check and needs reconciliation.
+- _prepare_order_request calls MT5Connector.pip_size_for() (class static
+  method) with an isinstance guard, so the pip size stays a real float
+  when the connector instance is patched by tests.
 """
 
 import hashlib
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
 
-from src.mt5_connector import mt5_connector, OrderResult, mt5
+from src.mt5_connector import (
+    mt5_connector,
+    MT5Connector,
+    OrderResult,
+    mt5,
+)
 from src.risk_manager import risk_manager, PositionSizeResult
 from src.signal_validator import signal_validator, ValidationResult
 from src.trade_manager import trade_manager
@@ -27,10 +48,21 @@ from src.database_manager import (
     OpenPosition,
     ClosedTrade,
     TradingSignal,
+    AppSettings,
 )
 from src.logger import get_logger
 
+
 logger = get_logger(__name__)
+
+
+def _to_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """Normalize a datetime to aware UTC; SQLite strips tzinfo on read."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 @dataclass
@@ -43,7 +75,61 @@ class ExecutionResult:
     error: Optional[str] = None
     pending: bool = False
     pending_order_ticket: Optional[int] = None
+    # True when the broker's response could not be definitively
+    # interpreted. Callers MUST NOT treat this as a safe retry signal.
+    uncertain: bool = False
 
+@dataclass
+class CloseAllResult:
+    """Result of ``close_all_positions``.
+
+    Iterable like a list for backward compatibility, but carries a
+    ``query_ok`` flag so callers can distinguish "no positions to close"
+    from "position query failed". H-08 relies on this distinction.
+    """
+
+    results: List[OrderResult] = field(default_factory=list)
+    query_ok: bool = True
+
+    @property
+    def closed(self) -> int:
+        return sum(1 for r in self.results if r.success)
+
+    @property
+    def failed(self) -> int:
+        return sum(1 for r in self.results if not r.success)
+
+    def __iter__(self):
+        return iter(self.results)
+
+    def __len__(self) -> int:
+        return len(self.results)
+
+@dataclass
+class CancelAllResult:
+    """Result of ``cancel_all_pending``.
+
+    Iterable like a list for backward compatibility. Carries ``query_ok``
+    so the caller can distinguish "nothing to cancel" from "broker query
+    failed" (Phase 3D, §6.6). Field semantics mirror ``CloseAllResult``.
+    """
+
+    results: List[OrderResult] = field(default_factory=list)
+    query_ok: bool = True
+
+    @property
+    def succeeded(self) -> int:
+        return sum(1 for r in self.results if r.success)
+
+    @property
+    def failed(self) -> int:
+        return sum(1 for r in self.results if not r.success)
+
+    def __iter__(self):
+        return iter(self.results)
+
+    def __len__(self) -> int:
+        return len(self.results)
 
 class OrderExecutor:
     """Places limit/market orders and reconciles their fill state."""
@@ -52,6 +138,13 @@ class OrderExecutor:
         self.trading_config = config.trading
         self.magic_number = self.trading_config.magic_number
         self.ENVIRONMENT = config.trading.mode.lower()
+
+        # Phase 3D (§6.6): escalation threshold for stuck cancels.
+        self._STUCK_CANCEL_THRESHOLD = 3
+
+        # Per-process consecutive failure counter, reset on success.
+        # Not persisted — a fresh process gives each ticket a fresh try.
+        self._cancel_failures: Dict[int, int] = {}
 
     # ==================================================================
     # 1. Public entry point
@@ -67,8 +160,14 @@ class OrderExecutor:
 
         # --- 1a. Central gate. Must run first. Fail closed. ---
         if gate is None:
-            from src.entry_gate import entry_gate as gate_module
-            gate = gate_module
+            logger.error(
+                "execute_signal called without an explicit EntryGate; "
+                "refusing to authorize entry."
+            )
+            return ExecutionResult(
+                success=False,
+                error="Entry gate not supplied; refusing to submit order.",
+            )
 
         try:
             gate_result = gate.check()
@@ -126,10 +225,47 @@ class OrderExecutor:
                 error=validation.reason,
             )
 
-        # --- 1d. Position sizing ---
+        # --- 1d. Position sizing (H-02: use expected executable price) ---
+        # For market entries the broker fills at the CURRENT ask/bid, not
+        # at the planned entry price. Size against the price we actually
+        # expect to pay. Never widen risk to compensate for slippage;
+        # if the expected price is unavailable, refuse.
+        if market_entry:
+            tick = mt5_connector.get_tick()
+            if not tick:
+                return ExecutionResult(
+                    success=False,
+                    validation=validation,
+                    error=(
+                        "Could not retrieve executable quote for "
+                        "size calculation."
+                    ),
+                )
+            try:
+                bid = float(tick.get("bid") or 0)
+                ask = float(tick.get("ask") or 0)
+            except (TypeError, ValueError):
+                return ExecutionResult(
+                    success=False,
+                    validation=validation,
+                    error="Broker quote is invalid for size calculation.",
+                )
+            if bid <= 0 or ask <= 0:
+                return ExecutionResult(
+                    success=False,
+                    validation=validation,
+                    error="Broker quote is invalid for size calculation.",
+                )
+            if signal.direction.value.upper() == "BUY":
+                expected_entry = ask
+            else:
+                expected_entry = bid
+        else:
+            expected_entry = signal.entry_price
+
         try:
             position_size = risk_manager.calculate_position_size(
-                signal.entry_price,
+                expected_entry,
                 signal.sl_price,
                 signal.direction.value,
                 signal.risk_percent,
@@ -203,20 +339,84 @@ class OrderExecutor:
                 error=f"Could not prepare order request: {exc}",
             )
 
-        # --- 1g. Submit ---
+        # --- 1f.5 Central gate re-check immediately before submission ---
+        # Defence in depth: pause / kill-switch / shutdown may have flipped
+        # between the initial gate check (1a) and now.
         try:
-            order_result = mt5_connector.send_order(order_request)
+            final_gate = gate.check()
         except Exception as exc:
-            logger.exception("MT5 order submission raised.")
+            logger.exception("Entry gate re-check raised before submission.")
             self._update_order_request_error(
-                request_id, f"Submission exception: {exc}"
+                request_id,
+                f"Entry gate re-check error before submission: {exc}",
             )
             return ExecutionResult(
                 success=False,
                 signal_id=signal_id,
                 position_size=position_size,
                 validation=validation,
-                error=f"MT5 submission exception: {exc}",
+                error=f"Entry gate re-check error: {exc}",
+            )
+
+        if not final_gate.ok:
+            logger.warning(
+                "ORDER BLOCKED BY ENTRY GATE RE-CHECK | %s | %s %s",
+                final_gate.reason,
+                getattr(signal, "symbol", "?"),
+                getattr(getattr(signal, "direction", None), "value", "?"),
+            )
+            self._mark_request_status(request_id, "rejected")
+            return ExecutionResult(
+                success=False,
+                signal_id=signal_id,
+                position_size=position_size,
+                validation=validation,
+                error=f"Entry gate re-check: {final_gate.reason}",
+            )
+
+        # LIVE authorization enforced independently at the submission
+        # boundary; never rely solely on the startup check.
+        if self.ENVIRONMENT == "live" and not config.live_trading_enabled:
+            logger.error(
+                "LIVE submission blocked at boundary: "
+                "live_trading_enabled is False."
+            )
+            self._mark_request_status(request_id, "rejected")
+            return ExecutionResult(
+                success=False,
+                signal_id=signal_id,
+                position_size=position_size,
+                validation=validation,
+                error="LIVE submission blocked at boundary.",
+            )
+
+        # --- 1g. Submit ---
+        # C-03: pass the gate token through. The connector enforces the
+        # token at its submission boundary on opening actions. If the
+        # gate supplied no token, we pass None — the connector will fail
+        # closed. We do not pre-check here because that would turn a
+        # missing-token condition into an "uncertain" status, which blocks
+        # the fingerprint check and requires reconciliation.
+        gate_token = getattr(final_gate, "token", None)
+        try:
+            order_result = mt5_connector.send_order(
+                order_request, gate_token=gate_token,
+            )
+        except Exception as exc:
+            # The broker may have accepted the order before the exception.
+            # We MUST NOT treat this as a definitive rejection.
+            logger.exception("MT5 order submission raised.")
+            self._mark_request_uncertain(
+                request_id,
+                f"Submission exception (outcome unknown): {exc}",
+            )
+            return ExecutionResult(
+                success=False,
+                signal_id=signal_id,
+                position_size=position_size,
+                validation=validation,
+                error=f"MT5 submission outcome uncertain: {exc}",
+                uncertain=True,
             )
 
         # --- 1h. Record broker response ---
@@ -227,6 +427,26 @@ class OrderExecutor:
         except Exception:
             logger.exception(
                 "Could not update order-request record after MT5 response."
+            )
+
+        # FIX C-02: ambiguous broker outcome is not a rejection.
+        if getattr(order_result, "uncertain", False):
+            self._mark_request_uncertain(
+                request_id,
+                order_result.error_message
+                or "Broker response ambiguous",
+            )
+            return ExecutionResult(
+                success=False,
+                signal_id=signal_id,
+                order_result=order_result,
+                position_size=position_size,
+                validation=validation,
+                error=(
+                    order_result.error_message
+                    or "Broker response ambiguous"
+                ),
+                uncertain=True,
             )
 
         if not order_result.success:
@@ -311,7 +531,14 @@ class OrderExecutor:
                         OrderRequest.environment == self.ENVIRONMENT,
                         OrderRequest.fingerprint == fingerprint,
                         OrderRequest.status.in_(
-                            ["placed", "pending", "sent", "filled_unconfirmed"]
+                            [
+                                "placed",
+                                "pending",
+                                "sent",
+                                "filled_unconfirmed",
+                                "uncertain",
+                                "submission_error",
+                            ]
                         ),
                     )
                     .first()
@@ -330,16 +557,17 @@ class OrderExecutor:
                     .filter(
                         OrderRequest.environment == self.ENVIRONMENT,
                         OrderRequest.fingerprint == fingerprint,
-                        OrderRequest.status == "filled",
+                        OrderRequest.status.in_(
+                            ["filled", "filled_closed", "unresolved_closed"]
+                        ),
                         OrderRequest.timestamp >= cutoff,
                     )
                     .first()
                 )
                 if recent_filled:
                     logger.info(
-                        "Duplicate check: recent filled order found for "
-                        "fingerprint %s",
-                        fingerprint,
+                        "Duplicate check: recent filled/closed order found "
+                        "for fingerprint %s", fingerprint,
                     )
                     return True
         except Exception:
@@ -487,6 +715,21 @@ class OrderExecutor:
             )
         else:
             live_tickets = {int(o["ticket"]) for o in live_orders}
+            # Phase 3D: clear stuck-cancel markers for tickets no longer
+            # present in the broker (filled / expired / cancelled by
+            # another path). Prevents the marker from ageing out into a
+            # permanent false positive.
+            try:
+                stuck_map = self._load_stuck_cancels()
+                stale = [t for t in stuck_map if t not in live_tickets]
+                if stale:
+                    for t in stale:
+                        stuck_map.pop(t, None)
+                    self._save_stuck_cancels(stuck_map)
+            except Exception:
+                logger.exception(
+                    "Could not prune stale stuck-cancel markers."
+                )
             pending_requests = self._pending_db_requests()
             if pending_requests is not None:
                 for req in pending_requests:
@@ -501,6 +744,8 @@ class OrderExecutor:
             self._enforce_pending_order_cap(live_orders)
 
         self._reconcile_market_entries()
+        self._reconcile_uncertain_and_stuck_requests()
+        self._reconcile_unresolved_closed()
 
     # ---------- market-entry recovery ----------
 
@@ -571,25 +816,136 @@ class OrderExecutor:
             if order_id:
                 position = self._find_position_by_order_id(int(order_id))
 
-        if position is None:
+        if position is not None:
+            try:
+                with db_manager.get_session() as session:
+                    row = (
+                        session.query(OrderRequest)
+                        .filter(OrderRequest.id == req.id)
+                        .first()
+                    )
+                    if row is not None and row.mt5_ticket is None:
+                        row.mt5_ticket = int(position["ticket"])
+            except Exception:
+                logger.exception(
+                    "Could not persist mt5_ticket for request %s.", req.id
+                )
+
+            self._handle_filled_pending(req, position)
+            self._mark_request_status(req.id, "filled")
             return
 
+        # NEW: check deal history for a fill+close that never produced a
+        # live position we could observe.
+        ticket: Optional[int] = None
+        if req.mt5_ticket:
+            ticket = int(req.mt5_ticket)
+        else:
+            response = req.response_data or {}
+            raw = response.get("order_id") or response.get("ticket")
+            if raw:
+                try:
+                    ticket = int(raw)
+                except (TypeError, ValueError):
+                    ticket = None
+
+        if ticket is None:
+            return
+
+        resolution = self._resolve_via_deal_history(req, ticket)
+        if resolution == "filled_closed":
+            logger.info(
+                "MARKET FILLED+CLOSED | req=%s ticket=%s",
+                req.id, ticket,
+            )
+            self._mark_request_status(req.id, "filled_closed")
+        elif resolution == "unresolved_closed":
+            logger.warning(
+                "MARKET FILLED+CLOSED but ClosedTrade failed | req=%s "
+                "ticket=%s", req.id, ticket,
+            )
+            self._mark_request_status(req.id, "unresolved_closed")
+        elif resolution == "live_fill":
+            logger.info(
+                "MARKET FILLED but position not yet visible | req=%s; "
+                "deferring.", req.id,
+            )
+        # None: no deal found; stay `filled_unconfirmed` and retry.
+
+    # ---------- deal-history fill+close recovery ----------
+
+    def _resolve_via_deal_history(
+        self, req: OrderRequest, order_ticket: int,
+    ) -> Optional[str]:
+        """Classify a request that is neither live nor pending.
+
+        Used for both pending-order finalisation and market-entry
+        recovery when the position is not (or no longer) visible in
+        get_positions(). Returns:
+
+          * ``"filled_closed"``     — fill+close confirmed, ClosedTrade created
+          * ``"unresolved_closed"`` — fill+close confirmed, ClosedTrade failed
+          * ``"live_fill"``         — fill confirmed, no close yet (retry)
+          * ``None``                — no fill deal found (not executed)
+        """
         try:
-            with db_manager.get_session() as session:
-                row = (
-                    session.query(OrderRequest)
-                    .filter(OrderRequest.id == req.id)
-                    .first()
-                )
-                if row is not None and row.mt5_ticket is None:
-                    row.mt5_ticket = int(position["ticket"])
+            deals = mt5_connector.get_history_deals(
+                from_date=datetime.now(timezone.utc) - timedelta(days=2),
+                to_date=datetime.now(timezone.utc) + timedelta(minutes=1),
+            )
         except Exception:
             logger.exception(
-                "Could not persist mt5_ticket for request %s.", req.id
+                "Deal-history lookup failed for req %s.", req.id,
             )
+            return None
 
-        self._handle_filled_pending(req, position)
-        self._mark_request_status(req.id, "filled")
+        if deals is None:
+            logger.warning(
+                "Deal history returned None for req %s; deferring.",
+                req.id,
+            )
+            return None
+
+        # Locate the IN deal for this order.
+        position_id: Optional[int] = None
+        for deal in deals:
+            if int(deal.get("order") or 0) != int(order_ticket):
+                continue
+            entry = str(deal.get("entry", "")).upper()
+            if entry != "IN":
+                continue
+            pid = deal.get("position_id")
+            if pid:
+                position_id = int(pid)
+                break
+
+        if position_id is None:
+            return None
+
+        # Is there an OUT deal for the same position?
+        has_out = any(
+            int(d.get("position_id") or 0) == position_id
+            and str(d.get("entry", "")).upper()
+                in ("OUT", "OUT_BY", "INOUT")
+            for d in deals
+        )
+
+        if not has_out:
+            return "live_fill"
+
+        # Reconstruct the ClosedTrade from deal history.
+        try:
+            ok = trade_manager.reconstruct_closed_trade(
+                position_id, exit_reason="RECOVERED_FILLED_CLOSED",
+            )
+        except Exception:
+            logger.exception(
+                "ClosedTrade reconstruction raised for position %s "
+                "(req %s).", position_id, req.id,
+            )
+            ok = False
+
+        return "filled_closed" if ok else "unresolved_closed"
 
     # ---------- pending-order reconciliation ----------
 
@@ -612,11 +968,22 @@ class OrderExecutor:
 
     @staticmethod
     def _request_ticket(req: OrderRequest) -> Optional[int]:
+        """Resolve the broker ticket for a pending request.
+
+        Reads `response_data` first, but falls back to `mt5_ticket` — the
+        canonical column populated by `_update_order_request` on success.
+        Without the fallback, any request whose `response_data` was not
+        persisted (crash between broker response and DB update; JSON
+        truncated; legacy row from before `response_data` was written)
+        is silently skipped by `_pending_db_requests`, which breaks
+        pending-order reconciliation (H-07).
+        """
         response = req.response_data or {}
         ticket = (
             response.get("order_id")
             or response.get("ticket")
             or response.get("pending_ticket")
+            or getattr(req, "mt5_ticket", None)
         )
         try:
             ticket = int(ticket)
@@ -658,8 +1025,35 @@ class OrderExecutor:
         if fill_position is not None:
             self._handle_filled_pending(req, fill_position)
             self._mark_request_status(req.id, "filled")
-        else:
-            self._handle_cancelled_pending(req)
+            return
+
+        # NEW: the order may have filled AND closed between cycles —
+        # invisible to positions() but visible in deal history.
+        resolution = self._resolve_via_deal_history(req, ticket)
+        if resolution == "filled_closed":
+            logger.info(
+                "PENDING FILLED+CLOSED | req=%s ticket=%s",
+                req.id, ticket,
+            )
+            self._mark_request_status(req.id, "filled_closed")
+            return
+        if resolution == "unresolved_closed":
+            logger.warning(
+                "PENDING FILLED+CLOSED but ClosedTrade failed | req=%s "
+                "ticket=%s", req.id, ticket,
+            )
+            self._mark_request_status(req.id, "unresolved_closed")
+            return
+        if resolution == "live_fill":
+            # Position should be live; will be located next cycle.
+            logger.info(
+                "PENDING FILLED but no live position yet | req=%s; "
+                "deferring.", req.id,
+            )
+            return
+
+        # No fill deal → definitively not executed.
+        self._handle_cancelled_pending(req)
 
     def _find_unrecorded_position(
         self, req: OrderRequest, positions: List[Dict]
@@ -764,43 +1158,459 @@ class OrderExecutor:
             if now - time_setup > max_age:
                 ticket = int(order["ticket"])
                 logger.info(
-                    "Cancelling expired pending order %s", ticket
+                    "Cancelling expired pending order %s", ticket,
                 )
-                try:
-                    mt5_connector.delete_order(ticket)
-                except Exception:
-                    logger.exception(
-                        "Failed to cancel expired pending order %s", ticket
-                    )
+                # Phase 3D: route through cancel_pending_order for
+                # consistent DB update and failure escalation.
+                self.cancel_pending_order(ticket, reason="EXPIRED")
 
     def _enforce_pending_order_cap(self, live_orders: List[Dict]) -> None:
         cap = int(config.trading.max_pending_orders)
         if cap <= 0 or len(live_orders) <= cap:
             return
 
+        stuck = set(self.get_stuck_cancellations())
+        candidates = [
+            o for o in live_orders
+            if int(o["ticket"]) not in stuck
+        ]
+
+        excess = len(live_orders) - cap
+        if len(candidates) <= excess:
+            # Not enough cancellable candidates — either all excess
+            # tickets are stuck, or the cap is being exceeded only by
+            # stuck orders. Log and let the natural expiry path handle
+            # the newest.
+            if stuck:
+                logger.warning(
+                    "Pending-order cap exceeded (%d > %d) but %d "
+                    "stuck order(s) cannot be cancelled. Newest "
+                    "orders will expire naturally per "
+                    "pending_expiry_hours.",
+                    len(live_orders), cap, len(stuck),
+                )
+            return
+
         ordered = sorted(
-            live_orders,
+            candidates,
             key=lambda o: (
                 o.get("time_setup")
                 or datetime.min.replace(tzinfo=timezone.utc)
             ),
         )
-        to_cancel = ordered[: len(ordered) - cap]
+        to_cancel = ordered[:excess]
 
         for order in to_cancel:
             ticket = int(order["ticket"])
             logger.info(
                 "Cancelling oldest pending order %s (cap=%s, active=%s)",
-                ticket,
-                cap,
-                len(live_orders),
+                ticket, cap, len(live_orders),
             )
+            self.cancel_pending_order(ticket, reason="CAP")
+   
+    # ---------- uncertain / stuck-request recovery ----------
+
+    def _reconcile_uncertain_and_stuck_requests(self) -> None:
+        """Resolve submissions whose outcome is not definitively known.
+
+        Covers three states that the existing reconciler did not:
+          * ``uncertain``         — an exception fired after send_order.
+          * ``pending`` / ``sent`` — the process crashed between request
+            persistence and response persistence.
+        """
+        grace = timedelta(minutes=5)
+        age_limit = datetime.utcnow() - timedelta(days=7)
+        cutoff = datetime.utcnow() - grace
+
+        try:
+            with db_manager.get_session() as session:
+                candidates = (
+                    session.query(OrderRequest)
+                    .filter(
+                        OrderRequest.environment == self.ENVIRONMENT,
+                        OrderRequest.status.in_(
+                            ["uncertain", "pending", "sent",
+                             "submission_error"]
+                        ),
+                        OrderRequest.timestamp <= cutoff,
+                        OrderRequest.timestamp >= age_limit,
+                    )
+                    .all()
+                )
+        except Exception:
+            logger.exception(
+                "Could not query uncertain/stuck order requests."
+            )
+            return
+
+        if not candidates:
+            return
+
+        try:
+            positions = mt5_connector.get_positions()
+            orders = mt5_connector.get_orders()
+            deals = mt5_connector.get_history_deals(
+                from_date=datetime.now(timezone.utc) - timedelta(days=7),
+                to_date=datetime.now(timezone.utc) + timedelta(minutes=1),
+            )
+        except Exception:
+            logger.exception(
+                "Could not query broker state for uncertain reconciliation."
+            )
+            return
+
+        if positions is None or orders is None or deals is None:
+            logger.warning(
+                "Uncertain reconciliation skipped: broker-state query "
+                "returned None (positions=%s orders=%s deals=%s).",
+                positions is None,
+                orders is None,
+                deals is None,
+            )
+            return
+
+        for req in candidates:
             try:
-                mt5_connector.delete_order(ticket)
+                self._resolve_uncertain_request(
+                    req, positions, orders, deals
+                )
             except Exception:
                 logger.exception(
-                    "Failed to cancel pending order %s", ticket
+                    "Could not reconcile uncertain request %s.", req.id
                 )
+
+    def _reconcile_unresolved_closed(self) -> None:
+        """Retry ClosedTrade reconstruction for requests marked unresolved.
+
+        A request lands in ``unresolved_closed`` when fill+close was
+        detected via deal history but the ClosedTrade row could not be
+        created (e.g., DB error at that instant). Retried every cycle
+        until it succeeds, or until the row ages out of the 7-day window.
+        """
+        age_limit = datetime.utcnow() - timedelta(days=7)
+        try:
+            with db_manager.get_session() as session:
+                candidates = (
+                    session.query(OrderRequest)
+                    .filter(
+                        OrderRequest.environment == self.ENVIRONMENT,
+                        OrderRequest.status == "unresolved_closed",
+                        OrderRequest.timestamp >= age_limit,
+                    )
+                    .all()
+                )
+        except Exception:
+            logger.exception(
+                "Could not query unresolved_closed requests."
+            )
+            return
+
+        for req in candidates:
+            try:
+                ticket = (
+                    int(req.mt5_ticket) if req.mt5_ticket
+                    else self._request_ticket(req)
+                )
+                if not ticket:
+                    continue
+                resolution = self._resolve_via_deal_history(req, ticket)
+                if resolution == "filled_closed":
+                    logger.info(
+                        "UNRESOLVED_CLOSED resolved | req=%s ticket=%s",
+                        req.id, ticket,
+                    )
+                    self._mark_request_status(req.id, "filled_closed")
+                # "unresolved_closed"/"live_fill"/None → leave, retry.
+            except Exception:
+                logger.exception(
+                    "Could not reconcile unresolved_closed req %s.", req.id,
+                )
+
+    def _resolve_uncertain_request(
+        self,
+        req: OrderRequest,
+        positions: List[Dict[str, Any]],
+        orders: List[Dict[str, Any]],
+        deals: List[Dict[str, Any]],
+    ) -> None:
+        # 1. Matching live pending order → 'placed'
+        matching_order = self._find_matching_order(req, orders)
+        if matching_order is not None:
+            ticket = int(matching_order["ticket"])
+            logger.info(
+                "UNCERTAIN RESOLVED as pending order | req=%s ticket=%s",
+                req.id, ticket,
+            )
+            try:
+                with db_manager.get_session() as session:
+                    row = (
+                        session.query(OrderRequest)
+                        .filter(OrderRequest.id == req.id)
+                        .first()
+                    )
+                    if row is not None:
+                        row.mt5_ticket = ticket
+                        row.status = "placed"
+            except Exception:
+                logger.exception(
+                    "Could not persist resolution for request %s.", req.id
+                )
+            return
+
+        # 2. Matching open position → 'filled' with bookkeeping
+        matching_position = self._find_matching_position(req, positions)
+        if matching_position is not None:
+            logger.info(
+                "UNCERTAIN RESOLVED as open position | req=%s ticket=%s",
+                req.id, int(matching_position["ticket"]),
+            )
+            self._handle_filled_pending(req, matching_position)
+            self._mark_request_status(req.id, "filled")
+            return
+
+        # 3. Matching closed deal → 'filled_closed' (or 'unresolved_closed')
+        matching_deal = self._find_matching_deal(req, deals)
+        if matching_deal is not None:
+            position_id = matching_deal.get("position_id")
+            reconstructed = False
+            if position_id:
+                try:
+                    reconstructed = trade_manager.reconstruct_closed_trade(
+                        int(position_id),
+                        exit_reason="RECOVERED_UNCERTAIN_CLOSED",
+                    )
+                except Exception:
+                    logger.exception(
+                        "ClosedTrade reconstruction failed for req %s.",
+                        req.id,
+                    )
+                    reconstructed = False
+            logger.info(
+                "UNCERTAIN RESOLVED as already-closed deal | req=%s | "
+                "position_id=%s reconstructed=%s",
+                req.id, position_id, reconstructed,
+            )
+            self._mark_request_status(
+                req.id,
+                "filled_closed" if reconstructed else "unresolved_closed",
+            )
+            return
+
+        # 4. Nothing found — only finalise once the request is old enough.
+        age = datetime.utcnow() - _to_utc(req.timestamp).replace(tzinfo=None)
+        if age < timedelta(minutes=10):
+            logger.info(
+                "Uncertain request %s not yet resolvable (age=%s); "
+                "will retry next cycle.",
+                req.id, age,
+            )
+            return
+
+        logger.warning(
+            "UNCERTAIN RESOLVED as not-executed | req=%s age=%s",
+            req.id, age,
+        )
+        self._mark_request_status(req.id, "rejected_notfound")
+
+    # ---------- matching helpers ----------
+
+    @staticmethod
+    def _order_type_to_side(value) -> Optional[str]:
+        """Normalize an order type (int, string name, or stringified int)
+        to ``"BUY"`` or ``"SELL"``. Returns None when unclassifiable.
+
+        Handles three real representations in this codebase:
+          * MT5 integer constants  (mt5.ORDER_TYPE_BUY_LIMIT == 2)
+          * MT5 string names       (``get_orders()`` -> "BUY_LIMIT")
+          * SQLite-coerced strings (``OrderRequest.order_type`` -> "2")
+        """
+        if value is None:
+            return None
+        if isinstance(value, str):
+            upper = value.strip().upper()
+            if upper.startswith("BUY"):
+                return "BUY"
+            if upper.startswith("SELL"):
+                return "SELL"
+            try:
+                value = int(upper)
+            except ValueError:
+                return None
+        buy_codes = {
+            getattr(mt5, "ORDER_TYPE_BUY", None),
+            getattr(mt5, "ORDER_TYPE_BUY_LIMIT", None),
+            getattr(mt5, "ORDER_TYPE_BUY_STOP", None),
+            getattr(mt5, "ORDER_TYPE_BUY_STOP_LIMIT", None),
+        }
+        sell_codes = {
+            getattr(mt5, "ORDER_TYPE_SELL", None),
+            getattr(mt5, "ORDER_TYPE_SELL_LIMIT", None),
+            getattr(mt5, "ORDER_TYPE_SELL_STOP", None),
+            getattr(mt5, "ORDER_TYPE_SELL_STOP_LIMIT", None),
+        }
+        buy_codes.discard(None)
+        sell_codes.discard(None)
+        if value in buy_codes:
+            return "BUY"
+        if value in sell_codes:
+            return "SELL"
+        return None
+
+    @staticmethod
+    def _position_type_to_side(value) -> Optional[str]:
+        """Normalize a position type to ``"BUY"`` or ``"SELL"``."""
+        if value is None:
+            return None
+        if isinstance(value, str):
+            upper = value.strip().upper()
+            if upper == "BUY":
+                return "BUY"
+            if upper == "SELL":
+                return "SELL"
+            try:
+                value = int(upper)
+            except ValueError:
+                return None
+        if value == getattr(mt5, "POSITION_TYPE_BUY", None):
+            return "BUY"
+        if value == getattr(mt5, "POSITION_TYPE_SELL", None):
+            return "SELL"
+        return None
+
+    @staticmethod
+    def _order_direction_matches(broker_type, stored_type) -> bool:
+        """Both arguments may be ints, MT5 name strings, or stringified ints."""
+        b = OrderExecutor._order_type_to_side(broker_type)
+        s = OrderExecutor._order_type_to_side(stored_type)
+        return b is not None and b == s
+
+    @staticmethod
+    def _position_direction_matches(pos_type, stored_order_type) -> bool:
+        p = OrderExecutor._position_type_to_side(pos_type)
+        s = OrderExecutor._order_type_to_side(stored_order_type)
+        return p is not None and p == s
+
+    def _find_matching_order(
+        self, req: OrderRequest, orders: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        tol_vol = 0.001
+        window = timedelta(minutes=5)
+        req_ts = _to_utc(req.timestamp)
+        matches: List[Dict[str, Any]] = []
+
+        for order in orders:
+            if int(order.get("magic", 0)) != int(req.magic_number):
+                continue
+            if order.get("symbol") != req.symbol:
+                continue
+            if abs(
+                float(order.get("volume", 0.0)) - float(req.volume)
+            ) > tol_vol:
+                continue
+            if not self._order_direction_matches(
+                order.get("type"), req.order_type
+            ):
+                continue
+            time_setup = order.get("time_setup")
+            if isinstance(time_setup, datetime):
+                delta = abs(
+                    (_to_utc(time_setup) - req_ts).total_seconds()
+                )
+                if delta > window.total_seconds():
+                    continue
+            matches.append(order)
+
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            logger.error(
+                "Ambiguous uncertain resolution: %d pending orders match "
+                "request %s; manual reconciliation required.",
+                len(matches), req.id,
+            )
+        return None
+
+    def _find_matching_position(
+        self, req: OrderRequest, positions: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        tol_vol = 0.001
+        window = timedelta(minutes=10)
+        req_ts = _to_utc(req.timestamp)
+        matches: List[Dict[str, Any]] = []
+
+        for pos in positions:
+            if int(pos.get("magic", 0)) != int(req.magic_number):
+                continue
+            if pos.get("symbol") != req.symbol:
+                continue
+            if abs(
+                float(pos.get("volume", 0.0)) - float(req.volume)
+            ) > tol_vol:
+                continue
+            if not self._position_direction_matches(
+                pos.get("type"), req.order_type
+            ):
+                continue
+            time_open = pos.get("time_open")
+            if isinstance(time_open, datetime):
+                delta = abs(
+                    (_to_utc(time_open) - req_ts).total_seconds()
+                )
+                if delta > window.total_seconds():
+                    continue
+            matches.append(pos)
+
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            logger.error(
+                "Ambiguous uncertain resolution: %d positions match "
+                "request %s.", len(matches), req.id,
+            )
+        return None
+
+    def _find_matching_deal(
+        self, req: OrderRequest, deals: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """Match an IN deal to a request by magic, symbol, volume, side, time.
+
+        get_history_deals returns ``entry`` as a string ("IN"/"OUT"/…), so
+        the check is string-based, NOT against mt5.DEAL_ENTRY_IN.
+        """
+        tol_vol = 0.001
+        window = timedelta(minutes=10)
+        req_ts = _to_utc(req.timestamp)
+
+        for deal in deals:
+            if int(deal.get("magic", 0)) != int(req.magic_number):
+                continue
+            if deal.get("symbol") != req.symbol:
+                continue
+            entry = str(deal.get("entry", "")).upper()
+            if entry != "IN":
+                continue
+            if abs(
+                float(deal.get("volume", 0.0)) - float(req.volume)
+            ) > tol_vol:
+                continue
+            # Deal type is "BUY"/"SELL" (from _deal_type_to_str); this is
+            # the deal direction, which for an IN deal matches the
+            # position side.
+            if not self._order_direction_matches(
+                deal.get("type"), req.order_type
+            ):
+                continue
+            deal_time = deal.get("time")
+            if isinstance(deal_time, datetime):
+                delta = abs(
+                    (_to_utc(deal_time) - req_ts).total_seconds()
+                )
+                if delta > window.total_seconds():
+                    continue
+            return deal
+        return None
+
+
 
     # ==================================================================
     # 4. Manual cancellation
@@ -809,24 +1619,228 @@ class OrderExecutor:
     def cancel_pending_order(
         self, ticket: int, reason: str = "MANUAL"
     ) -> OrderResult:
+        """Cancel a pending order via the broker and reconcile DB state.
+
+        Phase 3D (§6.6) failure classification:
+          * ``success``                          → DB row marked ``cancelled``,
+                                                    failure counter cleared
+          * ``not found``                        → benign terminal state
+                                                    (order filled/expired/
+                                                    already cancelled);
+                                                    reconciler resolves via
+                                                    deal history, no retry
+          * ``does not belong`` / ``symbol``     → permanent; escalate to
+                                                    stuck list immediately
+          * everything else                      → retry; escalate after
+                                                    ``_STUCK_CANCEL_THRESHOLD``
+                                                    consecutive failures
+        """
+        ticket = int(ticket)
         logger.info(
-            "Cancelling pending order %s - reason: %s", ticket, reason
+            "Cancelling pending order %s - reason: %s", ticket, reason,
         )
-        result = mt5_connector.delete_order(ticket)
+
+        try:
+            result = mt5_connector.delete_order(ticket)
+        except Exception as exc:
+            logger.exception("delete_order raised for ticket %s.", ticket)
+            result = OrderResult(
+                success=False,
+                error_message=f"delete_order raised: {exc}",
+            )
+
         if result.success:
-            for req in self._pending_db_requests() or []:
-                if self._request_ticket(req) == int(ticket):
-                    self._mark_request_status(req.id, "cancelled")
-                    break
+            self._clear_cancel_state(ticket)
+            self._mark_db_cancelled(ticket)
+            return result
+
+        message = (result.error_message or "").lower()
+
+        if "not found" in message:
+            # Order is gone (filled, expired, cancelled by broker). No
+            # retry needed — the reconciler will resolve via deal history.
+            logger.info(
+                "Cancel ticket %s: already gone (benign).", ticket,
+            )
+            self._clear_cancel_state(ticket)
+            return result
+
+        if "does not belong" in message or "symbol" in message:
+            # Permanent. We cannot cancel this order; there is no retry
+            # path. Escalate immediately so the operator sees it.
+            logger.critical(
+                "PERMANENT cancel failure for ticket %s: %s",
+                ticket, result.error_message,
+            )
+            self._escalate_stuck(ticket, result)
+            return result
+
+        # Retryable — increment and escalate after threshold.
+        self._record_cancel_failure(ticket, result)
         return result
 
-    def cancel_all_pending(self, reason: str = "SHUTDOWN") -> List[OrderResult]:
-        results: List[OrderResult] = []
-        for order in mt5_connector.get_orders() or []:
-            results.append(
-                self.cancel_pending_order(int(order["ticket"]), reason)
+    def cancel_all_pending(
+        self, reason: str = "SHUTDOWN"
+    ) -> "CancelAllResult":
+        """Cancel every bot-owned pending order.
+
+        Phase 3D (§6.6): returns a ``CancelAllResult`` carrying
+        ``query_ok`` so the caller can distinguish "nothing to cancel"
+        from "broker query failed". Still iterable as a list for
+        backward compatibility.
+        """
+        try:
+            orders = mt5_connector.get_orders()
+        except Exception:
+            logger.exception(
+                "cancel_all_pending: get_orders raised.",
             )
-        return results
+            return CancelAllResult(results=[], query_ok=False)
+
+        if orders is None:
+            logger.error(
+                "cancel_all_pending: pending-order query failed; "
+                "cannot confirm cancellation."
+            )
+            return CancelAllResult(results=[], query_ok=False)
+
+        results: List[OrderResult] = []
+        for order in orders:
+            try:
+                results.append(
+                    self.cancel_pending_order(
+                        int(order["ticket"]), reason,
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "cancel_pending_order raised for ticket %s.",
+                    order.get("ticket"),
+                )
+                results.append(OrderResult(
+                    success=False,
+                    error_message="cancel_pending_order raised",
+                ))
+
+        return CancelAllResult(results=results, query_ok=True)
+
+    # ---------- Phase 3D: cancel-failure bookkeeping ----------
+
+    def _mark_db_cancelled(self, ticket: int) -> None:
+        """Set the DB row for this ticket to ``cancelled``.
+
+        Matches any order-request status that could still be waiting
+        on a pending order (not just ``placed``) so a successful cancel
+        clears the row regardless of reconciliation lag.
+        """
+        try:
+            with db_manager.get_session() as session:
+                candidates = (
+                    session.query(OrderRequest)
+                    .filter(
+                        OrderRequest.environment == self.ENVIRONMENT,
+                        OrderRequest.status.in_([
+                            "placed", "pending", "sent",
+                            "uncertain", "submission_error",
+                        ]),
+                    )
+                    .all()
+                )
+            for req in candidates:
+                if self._request_ticket(req) == int(ticket):
+                    self._mark_request_status(req.id, "cancelled")
+                    return
+        except Exception:
+            logger.exception(
+                "Could not mark DB cancelled for ticket %s.", ticket,
+            )
+
+    def _record_cancel_failure(
+        self, ticket: int, result: OrderResult,
+    ) -> None:
+        ticket = int(ticket)
+        count = self._cancel_failures.get(ticket, 0) + 1
+        self._cancel_failures[ticket] = count
+        logger.warning(
+            "Cancel failure %d/%d for ticket %s: %s",
+            count, self._STUCK_CANCEL_THRESHOLD,
+            ticket, result.error_message,
+        )
+        if count >= self._STUCK_CANCEL_THRESHOLD:
+            self._escalate_stuck(ticket, result)
+
+    def _escalate_stuck(
+        self, ticket: int, result: OrderResult,
+    ) -> None:
+        ticket = int(ticket)
+        existing = self._load_stuck_cancels()
+        existing[ticket] = {
+            "ticket": ticket,
+            "failures": self._cancel_failures.get(
+                ticket, self._STUCK_CANCEL_THRESHOLD,
+            ),
+            "last_error": result.error_message or "unknown",
+            "last_attempt_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        self._save_stuck_cancels(existing)
+        logger.critical(
+            "TICKET %s marked STUCK for cancellation; operator "
+            "intervention may be required. Error: %s",
+            ticket, result.error_message,
+        )
+
+    def _clear_cancel_state(self, ticket: int) -> None:
+        ticket = int(ticket)
+        self._cancel_failures.pop(ticket, None)
+        existing = self._load_stuck_cancels()
+        if ticket in existing:
+            del existing[ticket]
+            self._save_stuck_cancels(existing)
+
+    def _load_stuck_cancels(self) -> Dict[int, Dict[str, Any]]:
+        key = f"pending_cancel_stuck_{self.ENVIRONMENT}"
+        try:
+            setting = db_manager.query_one(AppSettings, key=key)
+        except Exception:
+            logger.exception("Could not read stuck-cancel marker.")
+            return {}
+        if setting is None or not setting.value:
+            return {}
+        try:
+            raw = json.loads(setting.value)
+            return {int(k): v for k, v in raw.items()}
+        except (json.JSONDecodeError, TypeError, ValueError):
+            logger.exception(
+                "Corrupt stuck-cancel marker; ignoring."
+            )
+            return {}
+
+    def _save_stuck_cancels(
+        self, data: Dict[int, Dict[str, Any]],
+    ) -> None:
+        key = f"pending_cancel_stuck_{self.ENVIRONMENT}"
+        payload = json.dumps(
+            {str(k): v for k, v in data.items()}
+        )
+        try:
+            with db_manager.get_session() as session:
+                setting = (
+                    session.query(AppSettings).filter_by(key=key).first()
+                )
+                if setting is None:
+                    session.add(AppSettings(key=key, value=payload))
+                else:
+                    setting.value = payload
+        except Exception:
+            logger.exception("Could not persist stuck-cancel marker.")
+
+    def get_stuck_cancellations(self) -> List[int]:
+        """Return tickets whose pending-cancel has been escalated.
+
+        Reads from ``AppSettings`` so it reflects state across process
+        restarts. Used by the agent health check and dashboard.
+        """
+        return sorted(self._load_stuck_cancels().keys())
 
     # ==================================================================
     # 5. Order request preparation
@@ -866,8 +1880,11 @@ class OrderExecutor:
             raise RuntimeError(
                 f"Could not obtain broker symbol info for {symbol}."
             )
-        pip_size = mt5_connector.pip_size_for(symbol_info_dc)
-        if pip_size <= 0:
+
+        # Call the class static method, not the instance — the instance
+        # is often patched in tests and would return a MagicMock.
+        pip_size = MT5Connector.pip_size_for(symbol_info_dc)
+        if not isinstance(pip_size, (int, float)) or pip_size <= 0:
             raise RuntimeError(f"Broker pip size for {symbol} is invalid.")
 
         configured_slippage = config.trade_management.max_slippage_pips
@@ -1057,6 +2074,30 @@ class OrderExecutor:
                 "Could not record submission exception for %s.", request_id
             )
 
+    def _mark_request_uncertain(
+        self, request_id: int, message: str
+    ) -> None:
+        """Record that the broker's response was lost or ambiguous.
+
+        This state blocks fingerprint duplicates and must be reconciled
+        against broker state; it is never equivalent to `rejected`.
+        """
+        try:
+            with db_manager.get_session() as session:
+                request = (
+                    session.query(OrderRequest)
+                    .filter(OrderRequest.id == request_id)
+                    .first()
+                )
+                if request is not None:
+                    request.status = "uncertain"
+                    request.error_message = message
+        except Exception:
+            logger.exception(
+                "Could not record uncertain status for request %s.",
+                request_id,
+            )
+
     def _save_executed_order(
         self,
         position: Dict[str, Any],
@@ -1175,21 +2216,32 @@ class OrderExecutor:
 
     def close_all_positions(
         self, reason: str = "EMERGENCY"
-    ) -> List[OrderResult]:
-        """Close bot-owned positions only. Manual positions are untouched."""
-        positions = mt5_connector.get_positions()
+    ) -> "CloseAllResult":
+        """Close bot-owned positions only. Manual positions are untouched.
+
+        H-08: returns a CloseAllResult carrying ``query_ok`` so the
+        controller can distinguish "no positions" from "query failed".
+        Still iterable as a list for backward compatibility.
+        """
+        try:
+            positions = mt5_connector.get_positions()
+        except Exception:
+            logger.exception("Cannot close all: position query raised.")
+            return CloseAllResult(results=[], query_ok=False)
+
         if positions is None:
             logger.error("Cannot close all: position query failed.")
-            return []
+            return CloseAllResult(results=[], query_ok=False)
+
         bot_positions = [
-            p
-            for p in positions
+            p for p in positions
             if int(p.get("magic", 0)) == int(self.magic_number)
         ]
-        return [
+        results = [
             self.close_position(int(p["ticket"]), reason)
             for p in bot_positions
         ]
+        return CloseAllResult(results=results, query_ok=True)
 
     def modify_position_sl_tp(
         self,

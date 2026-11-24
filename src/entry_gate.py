@@ -21,7 +21,7 @@ from src.news_filter import news_filter
 from src.risk_manager import risk_manager
 from src.session_filter import session_filter
 from src.logger import get_logger
-
+from src.gate_token import issue as _issue_gate_token
 logger = get_logger(__name__)
 
 
@@ -30,6 +30,7 @@ class GateResult:
     ok: bool
     reason: str
     checks: Dict[str, bool] = field(default_factory=dict)
+    token: str = ""
 
     def __bool__(self) -> bool:
         return self.ok
@@ -43,13 +44,22 @@ class EntryGate:
         is_paused_getter: Optional[Callable[[], bool]] = None,
         is_shutdown_getter: Optional[Callable[[], bool]] = None,
     ):
-        # Callables injected by the agent to avoid a circular import on main.
-        self._is_paused_getter: Callable[[], bool] = (
-            is_paused_getter or (lambda: False)
+        self._is_paused_getter: Optional[Callable[[], bool]] = is_paused_getter
+        self._is_shutdown_getter: Optional[Callable[[], bool]] = is_shutdown_getter
+
+    @property
+    def _configured(self) -> bool:
+        """Derived, not stored: cannot drift out of sync with the getters."""
+        return (
+            self._is_paused_getter is not None
+            and self._is_shutdown_getter is not None
         )
-        self._is_shutdown_getter: Callable[[], bool] = (
-            is_shutdown_getter or (lambda: False)
-        )
+
+    def set_paused_getter(self, getter: Callable[[], bool]) -> None:
+        self._is_paused_getter = getter
+
+    def set_shutdown_getter(self, getter: Callable[[], bool]) -> None:
+        self._is_shutdown_getter = getter
 
     def set_paused_getter(self, getter: Callable[[], bool]) -> None:
         self._is_paused_getter = getter
@@ -77,12 +87,24 @@ class EntryGate:
     # ------------------------------------------------------------------
 
     def _run(self, require_unpaused: bool) -> GateResult:
-        checks: Dict[str, bool] = {}
+        if not self._configured:
+            return GateResult(
+                ok=False,
+                reason=(
+                    "EntryGate is not configured with pause/shutdown "
+                    "getters. Refusing to authorize any entry."
+                ),
+                checks={"configured": False},
+            )
+
+        checks: Dict[str, bool] = {"configured": True}
 
         def fail(name: str, reason: str) -> GateResult:
             checks[name] = False
             logger.debug("Entry gate blocked | %s | %s", name, reason)
-            return GateResult(ok=False, reason=reason, checks=dict(checks))
+            return GateResult(
+                ok=False, reason=reason, checks=dict(checks), token="",
+            )
 
         def step(name: str) -> None:
             checks[name] = True
@@ -270,7 +292,14 @@ class EntryGate:
         step("daily_trades")
 
         logger.debug("Entry gate passed all checks.")
-        return GateResult(ok=True, reason="OK", checks=dict(checks))
+        return GateResult(
+            ok=True,
+            reason="OK",
+            checks=dict(checks),
+            token=_issue_gate_token(),
+        )
+
+
 
 
 # Global gate instance. TradingAgent overrides the paused/shutdown getters

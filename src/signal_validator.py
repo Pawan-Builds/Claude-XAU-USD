@@ -6,7 +6,7 @@ from typing import List, Dict, Any, Optional
 
 from src.smc_strategy import TradeSignal, SignalDirection
 from src.market_data import market_data
-from src.mt5_connector import mt5_connector
+from src.mt5_connector import mt5_connector, MT5Connector
 from src.config_loader import config
 from src.database_manager import db_manager
 from src.logger import get_logger
@@ -297,12 +297,16 @@ class SignalValidator:
                 return False, "Broker symbol information unavailable."
 
             point = float(symbol_info.point)
-            digits = int(symbol_info.digits)
 
             if point <= 0:
                 return False, "Invalid broker point size."
 
-            pip_size = point * 10 if digits in (3, 5) else point
+            # FIX: broker-aware pip derivation — consistent with
+            # mt5_connector.pip_size_for and risk_manager.
+            pip_size = MT5Connector.pip_size_for(symbol_info)
+
+            if not isinstance(pip_size, (int, float)) or pip_size <= 0:
+                return False, "Broker pip size is invalid."
 
             entry = float(signal.entry_price)
             stop = float(signal.sl_price)

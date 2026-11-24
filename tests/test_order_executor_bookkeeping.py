@@ -129,7 +129,9 @@ def test_market_entry_happy_path_bookkeeps_immediately(harness):
     assert result.success is True, result.error
     assert harness.mt5_connector.send_order.call_count == 1
     assert harness.tm.initialize_position_tracking.call_count == 1
-    assert gate.calls["check"] == 1
+    # §1a (pre-validation) + §1f.5 (pre-submission re-check, C-03):
+    # both calls run for every entry that reaches the broker.
+    assert gate.calls["check"] == 2
 
     # Verify persistence actually happened.
     from src.database_manager import OrderRequest, ExecutedOrder, OpenPosition

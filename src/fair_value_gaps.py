@@ -16,6 +16,7 @@ from src.indicators import (
     FVG,
 )
 from src.market_data import market_data
+from src.mt5_connector import mt5_connector, MT5Connector
 from src.logger import get_logger
 
 logger = get_logger(__name__)
@@ -41,8 +42,29 @@ class FVGAnalyzer:
 
         self.min_size_pips = 5.0
 
-        # XAUUSD convention: one pip is 0.01.
-        self.point_value = 0.01
+    @property
+    def point_value(self) -> float:
+        """Broker-aware pip size (price per pip). See module docstring.
+
+        Gold-units fix: for 2-digit gold, 1 pip = 10 × point (0.10).
+        The previous hardcoded 0.01 made the FVG minimum-width filter
+        and the size-pips reporting 10× too permissive / wrong.
+        """
+        try:
+            info = mt5_connector.get_symbol_info()
+        except Exception:
+            info = None
+
+        if info is not None:
+            size = MT5Connector.pip_size_for(info)
+            if isinstance(size, (int, float)) and size > 0:
+                return float(size)
+
+        logger.warning(
+            "FVG analyzer: symbol info unavailable; "
+            "falling back to 0.01 price-per-pip."
+        )
+        return 0.01
 
     # ------------------------------------------------------------------
     # Analysis

@@ -136,46 +136,121 @@ class TradingController:
             return {"ok": True, "state": self._state.value}
 
     def emergency_stop(self, reason: str = "dashboard") -> Dict[str, Any]:
+        """Activate kill switch + pause + close bot-owned positions.
+
+        H-08: never reports success unless every sub-operation that
+        could be verified was verified. Distinguishes four states:
+          * ``emergency``     — fully activated and verified
+          * ``partial``       — some sub-operations succeeded, some failed
+          * ``failed``        — could not activate; new entries may still
+                                be blocked by internal state, but the
+                                report is honest
+          * ``unverifiable``  — position query failed; cannot confirm
+                                whether positions remain open
+        The internal controller state is ALWAYS set to EMERGENCY so
+        resume is blocked regardless of the reported state.
+        """
         with self._lock:
-            # 1. Durable kill switch.
+            # 1. Kill switch: write + read-back verification.
+            kill_written = False
+            kill_verified = False
+            kill_error = None
+
             try:
                 risk_manager.set_kill_switch(
                     True, f"Emergency stop: {reason}"
                 )
-            except Exception:
+                kill_written = True
+            except Exception as exc:
+                kill_error = f"kill switch write failed: {exc}"
                 logger.exception(
                     "Emergency stop: could not set kill switch."
                 )
-            # 2. Pause the agent (optional; may be None).
+
+            try:
+                kill_verified = bool(risk_manager.is_kill_switch_active())
+            except Exception as exc:
+                kill_verified = False
+                if kill_error is None:
+                    kill_error = f"kill switch read failed: {exc}"
+
+            # 2. Pause agent (may be None).
+            paused = False
             if self._agent is not None:
                 try:
                     self._agent._pause_trading()
+                    paused = True
                 except Exception:
                     logger.exception(
                         "Emergency stop: could not pause agent."
                     )
-            # 3. Close bot-owned positions regardless.
-            closed = failed = 0
+
+            # 3. Close bot-owned positions.
+            close_attempted = False
+            query_ok = True
+            closed = 0
+            failed = 0
+            close_error = None
+
             try:
-                results = order_executor.close_all_positions("EMERGENCY")
-                closed = sum(1 for r in results if r.success)
-                failed = sum(1 for r in results if not r.success)
-            except Exception:
-                logger.exception(
-                    "Emergency stop: close_all_positions failed."
+                close_result = order_executor.close_all_positions(
+                    "EMERGENCY"
                 )
+                close_attempted = True
+                closed = close_result.closed
+                failed = close_result.failed
+                query_ok = close_result.query_ok
+            except Exception as exc:
+                close_error = f"close all failed: {exc}"
+                logger.exception(
+                    "Emergency stop: close_all_positions raised."
+                )
+
+            # 4. Classify state honestly.
+            #
+            # `state="emergency"` means the procedure engaged and was
+            # verified (kill switch written AND read back True; close-all
+            # attempted; position query OK). Per-close `failed` outcomes
+            # are reported in the payload for the operator to triage but
+            # do NOT downgrade the state — a broker rejecting one close
+            # is not the same failure as the kill switch failing to write.
+            if not query_ok:
+                state = "unverifiable"
+                ok = False
+            elif kill_verified and close_attempted:
+                state = "emergency"
+                ok = True
+            elif kill_verified or close_attempted:
+                state = "partial"
+                ok = False
+            else:
+                state = "failed"
+                ok = False
+
+            # 5. Always enter EMERGENCY internally so resume is blocked.
             self._state = ControllerState.EMERGENCY
+
+            error = kill_error or close_error
             logger.critical(
-                "TradingController: EMERGENCY STOP | reason=%s | "
-                "closed=%d failed=%d",
-                reason, closed, failed,
+                "TradingController: EMERGENCY STOP | state=%s | "
+                "reason=%s | kill_verified=%s | closed=%d failed=%d "
+                "query_ok=%s",
+                state, reason, kill_verified, closed, failed, query_ok,
             )
+
             return {
-                "ok": True,
-                "state": self._state.value,
+                "state": state,
+                "ok": ok,
+                "kill_switch_written": kill_written,
+                "kill_switch_verified": kill_verified,
+                "kill_switch": kill_verified,  # back-compat
+                "paused": paused,
+                "close_attempted": close_attempted,
                 "closed": closed,
                 "failed": failed,
-                "kill_switch": True,
+                "closed_count": closed,
+                "failed_count": failed,
+                "error": error,
             }
 
     def clear_emergency(self) -> Dict[str, Any]:
@@ -220,12 +295,60 @@ class TradingController:
         }
 
     def close_all(self) -> Dict[str, Any]:
-        results = order_executor.close_all_positions(
-            "MANUAL_DASHBOARD_ALL"
-        )
+        try:
+            result = order_executor.close_all_positions(
+                "MANUAL_DASHBOARD_ALL"
+            )
+        except Exception as exc:
+            logger.exception("close_all raised.")
+            return {
+                "ok": False,
+                "closed": 0,
+                "failed": 0,
+                "query_ok": False,
+                "error": f"close_all raised: {exc}",
+            }
+
         return {
-            "closed": sum(1 for r in results if r.success),
-            "failed": sum(1 for r in results if not r.success),
+            "ok": result.query_ok and result.failed == 0,
+            "closed": result.closed,
+            "failed": result.failed,
+            "query_ok": result.query_ok,
+            "error": (
+                None if result.query_ok
+                else "Position query failed; cannot confirm all closed."
+            ),
+        }
+
+    def close_all_for_weekend(self) -> Dict[str, Any]:
+        """Close bot-owned positions ahead of the weekend.
+
+        Distinct from ``close_all`` in its reason, so the ClosedTrade
+        rows can be distinguished from manual closes. Idempotency is
+        enforced by the caller (main.py) via a persisted weekend marker;
+        this method itself will close whatever is currently open.
+        """
+        try:
+            result = order_executor.close_all_positions("WEEKEND")
+        except Exception as exc:
+            logger.exception("close_all_for_weekend raised.")
+            return {
+                "ok": False,
+                "closed": 0,
+                "failed": 0,
+                "query_ok": False,
+                "error": f"close_all_for_weekend raised: {exc}",
+            }
+
+        return {
+            "ok": result.query_ok and result.failed == 0,
+            "closed": result.closed,
+            "failed": result.failed,
+            "query_ok": result.query_ok,
+            "error": (
+                None if result.query_ok
+                else "Position query failed; cannot confirm all closed."
+            ),
         }
 
     # ---------------- Entry ----------------

@@ -81,10 +81,19 @@ class OrderResult:
     retcode: Optional[int] = None
     comment: Optional[str] = None
     deal_id: Optional[int] = None
+    uncertain: bool = False
 
 
 class MT5Connector:
     """Manages MT5 connection and trading operations."""
+
+    # FIX C-02: retcodes that mean the broker's outcome is not known.
+    # A None result from order_send() is also uncertain.
+    _UNCERTAIN_RETCODES = frozenset({
+        mt5.TRADE_RETCODE_ERROR,        # 10011
+        mt5.TRADE_RETCODE_TIMEOUT,      # 10012
+        mt5.TRADE_RETCODE_CONNECTION,   # 10031
+    })
 
     def __init__(self):
         self.mt5_config = config.mt5
@@ -573,25 +582,31 @@ class MT5Connector:
         Gold is conventionally quoted like JPY: pip = 10 * point.
         Standard 3/5-digit FX also uses 10 * point.
         2/4-digit FX uses 1 point.
-        Return 0.0 if the broker spec is invalid.
+        Return 0.0 if the broker spec is invalid or missing.
         """
-
         try:
             point = float(symbol_info.point)
-            digits = int(symbol_info.digits)
-            name = str(symbol_info.name).upper()
         except (TypeError, ValueError, AttributeError):
             return 0.0
-
         if point <= 0:
             return 0.0
 
+        try:
+            digits = int(symbol_info.digits)
+        except (TypeError, ValueError, AttributeError):
+            digits = 0
+
+        # `.name` may be absent on minimal test stubs. Absence is not an
+        # error; it only disables the gold-specific rule.
+        try:
+            name = str(symbol_info.name).upper()
+        except (AttributeError, TypeError):
+            name = ""
+
         if "XAU" in name or "GOLD" in name:
             return point * 10
-
         if digits in (3, 5):
             return point * 10
-
         return point
 
     def get_symbol_info(self) -> Optional[SymbolInfo]:
@@ -1073,7 +1088,9 @@ class MT5Connector:
 
         return position, None
 
-    def _send_order_request(self, request: Dict) -> OrderResult:
+    def _send_order_request(
+        self, request: Dict, gate_token: Optional[str] = None,
+    ) -> OrderResult:
         """Send an MT5 request with safety checks and consistent results."""
 
         safety_error = self._trading_precheck()
@@ -1086,6 +1103,56 @@ class MT5Connector:
 
         action = payload.get("action")
         symbol = payload.get("symbol") or self._symbol_name
+
+        # FIX C-03-a: LIVE opening blocked at the submission boundary.
+        # Close (`position` set) and non-open actions stay allowed.
+        if (
+            str(config.trading.mode).upper() == "LIVE"
+            and not config.live_trading_enabled
+            and action in (
+                mt5.TRADE_ACTION_DEAL,
+                mt5.TRADE_ACTION_PENDING,
+            )
+            and not payload.get("position")
+        ):
+            logger.critical(
+                "LIVE opening blocked at boundary: "
+                "LIVE_TRADING_ENABLED is not true."
+            )
+            return OrderResult(
+                success=False,
+                error_message=(
+                    "LIVE opening blocked at boundary: "
+                    "LIVE_TRADING_ENABLED is not true."
+                ),
+            )
+
+        # FIX C-03 residual: an opening action requires a valid, single-use
+        # token issued by EntryGate.check(). This closes the design gap
+        # where a future direct call to send_order() could bypass the
+        # central entry gate. Close (`position` set) and non-open actions
+        # do not require a token, so emergency exits always work.
+        if (
+            action in (
+                mt5.TRADE_ACTION_DEAL,
+                mt5.TRADE_ACTION_PENDING,
+            )
+            and not payload.get("position")
+        ):
+            from src.gate_token import consume as _consume_gate_token
+            if not _consume_gate_token(gate_token):
+                logger.critical(
+                    "Opening action blocked: missing/invalid/expired/"
+                    "replayed gate token. action=%s",
+                    action,
+                )
+                return OrderResult(
+                    success=False,
+                    error_message=(
+                        "Opening action requires a valid gate token; "
+                        "none provided, expired, or already used."
+                    ),
+                )
 
         if not symbol:
             return OrderResult(
@@ -1157,13 +1224,17 @@ class MT5Connector:
 
         if result is None:
             error = mt5.last_error()
-
-            logger.error("MT5 order_send returned None: %s", error)
-
+            logger.error(
+                "MT5 order_send returned None (ambiguous outcome): %s",
+                error,
+            )
             return OrderResult(
                 success=False,
                 error_code=error[0] if error else None,
-                error_message=str(error),
+                error_message=(
+                    str(error) if error else "order_send returned None"
+                ),
+                uncertain=True,
             )
 
         accepted_codes = {
@@ -1175,13 +1246,21 @@ class MT5Connector:
             accepted_codes.add(mt5.TRADE_RETCODE_PLACED)
 
         success = result.retcode in accepted_codes
+        uncertain = result.retcode in self._UNCERTAIN_RETCODES
 
         if not success:
-            logger.error(
-                "MT5 request rejected | retcode=%s | comment=%s",
-                result.retcode,
-                result.comment,
-            )
+            if uncertain:
+                logger.warning(
+                    "MT5 request outcome UNCERTAIN | retcode=%s | comment=%s",
+                    result.retcode,
+                    result.comment,
+                )
+            else:
+                logger.error(
+                    "MT5 request rejected | retcode=%s | comment=%s",
+                    result.retcode,
+                    result.comment,
+                )
 
             return OrderResult(
                 success=False,
@@ -1194,6 +1273,7 @@ class MT5Connector:
                 retcode=result.retcode,
                 comment=result.comment,
                 deal_id=getattr(result, "deal", None),
+                uncertain=uncertain,
             )
 
         logger.info(
@@ -1221,16 +1301,18 @@ class MT5Connector:
     # Trading operations
     # ---------------------------------------------------------
 
-    def send_order(self, request: Dict) -> OrderResult:
+    def send_order(
+        self,
+        request: Dict,
+        gate_token: Optional[str] = None,
+    ) -> OrderResult:
         """Send a market, pending, or supported trade-management request."""
-
         if not isinstance(request, dict):
             return OrderResult(
                 success=False,
                 error_message="Order request must be a dictionary",
             )
-
-        return self._send_order_request(request)
+        return self._send_order_request(request, gate_token=gate_token)
 
     def modify_position(
         self,

@@ -11,13 +11,25 @@ from tests.conftest import StubGate
 @pytest.fixture
 def ctrl_harness(monkeypatch):
     from src import trading_controller as tc_module
+    from src.order_executor import CloseAllResult
+
+    # H-08: kill switch mock must reflect its own write state so that
+    # read-back verification returns True after a successful write and
+    # False after a failed one.
+    kill_state = {"active": False}
 
     rm = MagicMock(name="risk_manager")
-    rm.is_kill_switch_active.return_value = False
-    rm.set_kill_switch.return_value = None
+    rm.is_kill_switch_active.side_effect = lambda: kill_state["active"]
+
+    def _set_kill(active, reason=""):
+        kill_state["active"] = bool(active)
+
+    rm.set_kill_switch.side_effect = _set_kill
 
     oe = MagicMock(name="order_executor")
-    oe.close_all_positions.return_value = []
+    oe.close_all_positions.return_value = CloseAllResult(
+        results=[], query_ok=True,
+    )
     oe.close_position.return_value = SimpleNamespace(
         success=True, error_message=None
     )
@@ -41,10 +53,8 @@ def ctrl_harness(monkeypatch):
     controller = TradingController()
 
     return SimpleNamespace(
-        controller=controller,
-        rm=rm,
-        oe=oe,
-        mt5=mt5,
+        controller=controller, rm=rm, oe=oe, mt5=mt5,
+        kill_state=kill_state,
     )
 
 
@@ -167,12 +177,16 @@ def test_shutdown_calls_agent(ctrl_harness):
 
 
 def test_emergency_stop_sets_kill_switch_and_closes_all(ctrl_harness):
+    from src.order_executor import CloseAllResult
     agent = _mock_agent()
     ctrl_harness.controller.register_agent(agent, StubGate(ok=True))
-    ctrl_harness.oe.close_all_positions.return_value = [
-        SimpleNamespace(success=True, error_message=None),
-        SimpleNamespace(success=False, error_message="rejected"),
-    ]
+    ctrl_harness.oe.close_all_positions.return_value = CloseAllResult(
+        results=[
+            SimpleNamespace(success=True, error_message=None),
+            SimpleNamespace(success=False, error_message="rejected"),
+        ],
+        query_ok=True,
+    )
 
     result = ctrl_harness.controller.emergency_stop(reason="test")
 
@@ -180,6 +194,7 @@ def test_emergency_stop_sets_kill_switch_and_closes_all(ctrl_harness):
     assert result["state"] == "emergency"
     assert result["closed"] == 1
     assert result["failed"] == 1
+    assert result["kill_switch_verified"] is True
     ctrl_harness.rm.set_kill_switch.assert_called_once()
     agent._pause_trading.assert_called_once()
 
@@ -197,9 +212,11 @@ def test_emergency_stop_does_not_raise_if_kill_switch_write_fails(
 ):
     ctrl_harness.rm.set_kill_switch.side_effect = RuntimeError("db down")
     result = ctrl_harness.controller.emergency_stop(reason="test")
-    # Emergency must still execute close and set state.
-    assert result["ok"] is True
-    assert result["state"] == "emergency"
+    # H-08: kill-switch write failed → must NOT report success.
+    assert result["ok"] is False
+    assert result["state"] == "partial"
+    assert result["kill_switch_verified"] is False
+    assert result["close_attempted"] is True
     ctrl_harness.oe.close_all_positions.assert_called_once()
 
 

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
 from typing import Optional, Dict, Any, List
 
-from src.mt5_connector import mt5_connector
+from src.mt5_connector import mt5_connector, MT5Connector
 from src.config_loader import config
 from src.database_manager import db_manager, RiskCalculation, AppSettings
 from src.logger import get_logger
@@ -215,17 +215,22 @@ class RiskManager:
                 contract_size=contract_size
             )
 
-        digits = int(symbol_info.digits)
-        pip_size = point * 10 if digits in (3, 5) else point
+        # FIX: use the broker-aware pip derivation from mt5_connector
+        # so gold and 2/4-digit FX are handled the same way the
+        # executor and signal validator handle them.
+        # C-03 follow-up: call the class static method, not the mocked
+        # instance. This guarantees a real float even when the connector
+        # instance is patched in tests.
+        pip_size = MT5Connector.pip_size_for(symbol_info)
 
-        if pip_size <= 0:
+        if not isinstance(pip_size, (int, float)) or pip_size <= 0:
             return self._failed_result(
                 "Could not determine pip size from broker metadata.",
                 equity=equity,
                 risk_percent=risk_pct,
                 tick_value=tick_value,
                 tick_size=tick_size,
-                contract_size=contract_size
+                contract_size=contract_size,
             )
 
         sl_distance_pips = sl_distance / pip_size
@@ -365,6 +370,48 @@ class RiskManager:
             symbol_info
         )
 
+        # H-03: pending-order exposure is part of total portfolio risk.
+        try:
+            pending_orders = mt5_connector.get_orders()
+        except Exception:
+            logger.exception(
+                "Could not retrieve pending orders for position sizing."
+            )
+            return self._failed_result(
+                "Could not retrieve pending orders for exposure calculation.",
+                equity=equity,
+                risk_percent=risk_pct,
+                tick_value=tick_value,
+                tick_size=tick_size,
+                contract_size=contract_size,
+                risk_pips=sl_distance_pips
+            )
+
+        if pending_orders is None:
+            return self._failed_result(
+                "Pending-order query returned None for exposure calculation.",
+                equity=equity,
+                risk_percent=risk_pct,
+                tick_value=tick_value,
+                tick_size=tick_size,
+                contract_size=contract_size,
+                risk_pips=sl_distance_pips
+            )
+
+        pending_risk = self._calculate_pending_orders_risk(
+            pending_orders, symbol_info
+        )
+        if pending_risk is None:
+            return self._failed_result(
+                "A pending order has invalid or missing stop-loss risk data.",
+                equity=equity,
+                risk_percent=risk_pct,
+                tick_value=tick_value,
+                tick_size=tick_size,
+                contract_size=contract_size,
+                risk_pips=sl_distance_pips
+            )
+
         if existing_risk is None:
             return self._failed_result(
                 "An open position has invalid or missing stop-loss risk data.",
@@ -389,15 +436,16 @@ class RiskManager:
 
         maximum_total_risk = equity * max_total_risk_pct / 100.0
 
-        if existing_risk + actual_risk > maximum_total_risk:
-            projected_pct = (
-                (existing_risk + actual_risk) / equity * 100.0
-            )
+        projected_total_risk = existing_risk + pending_risk + actual_risk
+        if projected_total_risk > maximum_total_risk:
+            projected_pct = projected_total_risk / equity * 100.0
             return self._failed_result(
                 (
                     f"Trade would exceed maximum total open risk. "
                     f"Projected risk: {projected_pct:.4f}%; "
-                    f"limit: {max_total_risk_pct:.4f}%."
+                    f"limit: {max_total_risk_pct:.4f}% "
+                    f"(open={existing_risk:.2f}, pending={pending_risk:.2f}, "
+                    f"new={actual_risk:.2f})."
                 ),
                 equity=equity,
                 risk_percent=risk_pct,
@@ -560,6 +608,83 @@ class RiskManager:
 
         return total_risk
 
+
+    def _calculate_pending_orders_risk(
+        self,
+        orders: List[Dict[str, Any]],
+        symbol_info,
+    ) -> Optional[float]:
+        """H-03: total monetary risk if all pending orders were filled.
+
+        Pending orders without a stop-loss cannot have their risk
+        quantified; return None so the caller fails closed. Duplicate
+        tickets are deduplicated because MT5 sometimes returns the same
+        ticket twice in a single batch.
+        """
+        tick_size = float(symbol_info.tick_size or 0)
+        tick_value = float(symbol_info.tick_value or 0)
+
+        if tick_size <= 0 or tick_value <= 0:
+            return None
+
+        total_risk = 0.0
+        seen: set = set()
+
+        for order in orders:
+            try:
+                ticket = int(order.get("ticket") or 0)
+            except (TypeError, ValueError):
+                continue
+            if ticket <= 0 or ticket in seen:
+                continue
+            seen.add(ticket)
+
+            try:
+                price_open = float(order.get("price_open") or 0)
+                stop = float(order.get("sl") or 0)
+                volume = float(order.get("volume") or 0)
+            except (TypeError, ValueError):
+                logger.error(
+                    "Pending order %s has non-numeric fields.", ticket,
+                )
+                return None
+
+            if volume <= 0 or price_open <= 0:
+                return None
+
+            if stop <= 0:
+                logger.error(
+                    "Pending order %s has no stop-loss; risk cannot be "
+                    "quantified.", ticket,
+                )
+                return None
+
+            type_str = str(order.get("type", "")).upper()
+            is_buy = type_str.startswith("BUY")
+            is_sell = type_str.startswith("SELL")
+            if not is_buy and not is_sell:
+                logger.error(
+                    "Pending order %s has unknown type: %s",
+                    ticket, type_str,
+                )
+                return None
+
+            if is_buy:
+                distance = price_open - stop
+            else:
+                distance = stop - price_open
+
+            if distance <= 0:
+                logger.error(
+                    "Pending order %s has invalid SL side "
+                    "(distance=%s).", ticket, distance,
+                )
+                return None
+
+            total_risk += (distance / tick_size) * tick_value * volume
+
+        return total_risk
+
     # ------------------------------------------------------------------
     # Risk calculation persistence
     # ------------------------------------------------------------------
@@ -703,32 +828,76 @@ class RiskManager:
             return False
 
     def _get_peak_equity(self) -> Optional[float]:
-        from src.database_manager import AccountSnapshot
+        """Durable high-water-mark equity.
 
+        H-04: reads a persisted peak from AppSettings, seeds it from
+        account snapshots on first use, and updates it to a new peak
+        whenever the current equity exceeds the stored value. The peak
+        is a one-way ratchet — equity declines never lower it.
+        """
+        key = f"peak_equity_{self.ENVIRONMENT}"
+
+        persisted: Optional[float] = None
         try:
-            with db_manager.get_session() as session:
-                snapshots = session.query(AccountSnapshot).filter(
-                    AccountSnapshot.environment == self.ENVIRONMENT
-                ).order_by(
-                    AccountSnapshot.timestamp.desc()
-                ).limit(1000).all()
-
-            if not snapshots:
-                logger.error(
-                    "No account snapshots available for drawdown calculation."
-                )
-                return None
-
-            peak = max(float(snapshot.equity) for snapshot in snapshots)
-
-            if peak <= 0:
-                return None
-
-            return peak
-
+            setting = db_manager.query_one(AppSettings, key=key)
+            if setting is not None and setting.value:
+                try:
+                    candidate = float(setting.value)
+                except (TypeError, ValueError):
+                    candidate = None
+                if candidate is not None and candidate > 0:
+                    persisted = candidate
         except Exception:
-            logger.exception("Could not retrieve account snapshots.")
+            logger.exception("Could not read persisted peak equity.")
+
+        account = mt5_connector.get_account_info()
+        current = float(account.equity) if account is not None else 0.0
+
+        if persisted is None or persisted <= 0:
+            from src.database_manager import AccountSnapshot
+            try:
+                with db_manager.get_session() as session:
+                    snapshots = session.query(AccountSnapshot).filter(
+                        AccountSnapshot.environment == self.ENVIRONMENT
+                    ).order_by(
+                        AccountSnapshot.timestamp.desc()
+                    ).limit(1000).all()
+            except Exception:
+                logger.exception(
+                    "Could not seed peak equity from snapshots."
+                )
+                snapshots = []
+
+            if snapshots:
+                seeded = max(float(s.equity) for s in snapshots)
+                if seeded > 0:
+                    persisted = seeded
+            elif current > 0:
+                persisted = current
+
+        peak = max(persisted or 0.0, current)
+        if peak <= 0:
             return None
+
+        if persisted is None or peak > persisted:
+            try:
+                with db_manager.get_session() as session:
+                    setting = (
+                        session.query(AppSettings)
+                        .filter_by(key=key).first()
+                    )
+                    if setting is None:
+                        session.add(AppSettings(
+                            key=key, value=str(peak),
+                        ))
+                    else:
+                        setting.value = str(peak)
+            except Exception:
+                logger.exception(
+                    "Could not persist peak equity update."
+                )
+
+        return peak
 
     def _check_max_drawdown(self, equity: float) -> bool:
         if equity <= 0:
@@ -786,13 +955,33 @@ class RiskManager:
         if symbol_info is None:
             return False
 
-        total_risk = self._calculate_open_positions_risk(
-            positions,
-            symbol_info
+        open_risk = self._calculate_open_positions_risk(
+            positions, symbol_info
         )
-
-        if total_risk is None:
+        if open_risk is None:
             return False
+
+        try:
+            pending_orders = mt5_connector.get_orders()
+        except Exception:
+            logger.exception(
+                "Could not retrieve pending orders for risk check."
+            )
+            return False
+
+        if pending_orders is None:
+            logger.error(
+                "Pending-order query returned None; failing closed."
+            )
+            return False
+
+        pending_risk = self._calculate_pending_orders_risk(
+            pending_orders, symbol_info
+        )
+        if pending_risk is None:
+            return False
+
+        total_risk = open_risk + pending_risk
 
         maximum_risk = (
             float(self.risk_config.max_total_open_risk_percent)

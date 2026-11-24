@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 import tempfile
+from src import gate_token
 from src.config_loader import config
 from src.mt5_connector import AccountInfo, MT5Connector, OrderResult
 from src.risk_manager import RiskManager
@@ -320,6 +321,7 @@ class TestMT5Connector(unittest.TestCase):
     @patch("src.mt5_connector.mt5")
     def test_send_order_success(self, mock_mt5):
         self._wire_connected_connector(mock_mt5)
+        gate_token.reset_for_tests()
 
         mock_result = Mock()
         mock_result.retcode = mock_mt5.TRADE_RETCODE_DONE
@@ -342,7 +344,12 @@ class TestMT5Connector(unittest.TestCase):
             "comment": "TEST",
         }
 
-        result = self.connector.send_order(request)
+        # C-03 residual: opening actions require a gate token. Tests that
+        # call the connector directly must issue one, exactly as
+        # OrderExecutor.execute_signal would.
+        result = self.connector.send_order(
+            request, gate_token=gate_token.issue()
+        )
 
         self.assertTrue(result.success)
         self.assertEqual(result.ticket, 11111)
@@ -350,6 +357,7 @@ class TestMT5Connector(unittest.TestCase):
     @patch("src.mt5_connector.mt5")
     def test_send_order_rejected(self, mock_mt5):
         self._wire_connected_connector(mock_mt5)
+        gate_token.reset_for_tests()
 
         mock_result = Mock()
         mock_result.retcode = 10015
@@ -369,7 +377,9 @@ class TestMT5Connector(unittest.TestCase):
             "magic": 123456789,
         }
 
-        result = self.connector.send_order(request)
+        result = self.connector.send_order(
+            request, gate_token=gate_token.issue()
+        )
 
         self.assertFalse(result.success)
         self.assertEqual(result.retcode, 10015)

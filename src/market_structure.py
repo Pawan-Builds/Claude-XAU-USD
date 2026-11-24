@@ -70,7 +70,7 @@ class MarketStructureAnalyzer:
             logger.warning("Unsupported structure timeframe: %s", timeframe)
             return None
 
-        candles = market_data.get_candles(
+        candles = market_data.get_closed_candles(
             timeframe,
             self.structure_lookback + 20,
         )

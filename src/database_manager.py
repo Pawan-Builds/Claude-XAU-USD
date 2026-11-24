@@ -543,6 +543,50 @@ class DatabaseManager:
                         "index (non-fatal)"
                     )
 
+            # 5. H-06 §6.8: ClosedTrade composite uniqueness.
+            #
+            # A ticket must produce at most one ClosedTrade row per
+            # environment. Application-level idempotency (the early
+            # existence check in TradeManager.reconstruct_closed_trade)
+            # is necessary but not sufficient — a race across processes,
+            # a manual intervention, or a future code path can still
+            # duplicate. The DB is the correct layer for the invariant.
+            #
+            # Pre-check for existing duplicates so the migration never
+            # fails on an already-polluted DB. If duplicates exist, log
+            # a warning and skip index creation — no records are deleted
+            # or reordered, and the operator resolves them manually.
+            if "closed_trades" in table_names:
+                try:
+                    dup_count = connection.execute(text(
+                        "SELECT COUNT(*) FROM ("
+                        "  SELECT ticket, environment, COUNT(*) AS n "
+                        "  FROM closed_trades "
+                        "  GROUP BY ticket, environment "
+                        "  HAVING n > 1"
+                        ")"
+                    )).scalar()
+
+                    if dup_count and int(dup_count) > 0:
+                        logger.warning(
+                            "Cannot create ix_closed_trades_ticket_env: "
+                            "%d duplicate (ticket, environment) group(s) "
+                            "exist. Resolve manually and restart to "
+                            "enforce uniqueness.",
+                            int(dup_count),
+                        )
+                    else:
+                        connection.exec_driver_sql(
+                            "CREATE UNIQUE INDEX IF NOT EXISTS "
+                            "ix_closed_trades_ticket_env "
+                            "ON closed_trades (ticket, environment)"
+                        )
+                except Exception:
+                    logger.exception(
+                        "Could not enforce closed_trades uniqueness "
+                        "(non-fatal)."
+                    )
+
         if added_columns:
             logger.info(
                 "Database migration added columns: %s",

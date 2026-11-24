@@ -6,7 +6,7 @@ from typing import Dict, Any, Optional, Callable, List
 from dataclasses import dataclass
 from enum import Enum
 
-from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, Bot
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     ContextTypes, MessageHandler, filters
@@ -44,9 +44,6 @@ class TelegramBot:
         self._state = BotState.STOPPED
         self._authorized_users = {self.chat_id}
         self._command_handlers: Dict[str, Callable] = {}
-        self._shutdown_callback: Optional[Callable] = None
-        self._pause_callback: Optional[Callable] = None
-        self._resume_callback: Optional[Callable] = None
 
     async def initialize(self):
         """Initialize the Telegram bot."""
@@ -81,21 +78,15 @@ class TelegramBot:
             return False
 
     def _register_handlers(self):
-        """Register command and callback handlers."""
-        # Commands
+        """Register read-only commands and the single emergency trigger."""
         self._application.add_handler(CommandHandler("start", self._cmd_start))
         self._application.add_handler(CommandHandler("status", self._cmd_status))
         self._application.add_handler(CommandHandler("balance", self._cmd_balance))
         self._application.add_handler(CommandHandler("positions", self._cmd_positions))
         self._application.add_handler(CommandHandler("history", self._cmd_history))
         self._application.add_handler(CommandHandler("performance", self._cmd_performance))
-        self._application.add_handler(CommandHandler("pause", self._cmd_pause))
-        self._application.add_handler(CommandHandler("resume", self._cmd_resume))
-        self._application.add_handler(CommandHandler("shutdown", self._cmd_shutdown))
+        self._application.add_handler(CommandHandler("kill", self._cmd_kill))
         self._application.add_handler(CommandHandler("help", self._cmd_help))
-
-        # Callbacks for inline keyboards
-        self._application.add_handler(CallbackQueryHandler(self._handle_callback))
 
     def _is_authorized(self, user_id: int) -> bool:
         """Check if user is authorized."""
@@ -123,12 +114,20 @@ class TelegramBot:
             await update.message.reply_text("❌ Unauthorized")
             return
 
-        status_emoji = "🟢" if self._state == BotState.RUNNING else "🟡" if self._state == BotState.PAUSED else "🔴"
+        from src.trading_controller import trading_controller
+        status = trading_controller.status()
+        emoji = {
+            "running": "🟢", "paused": "🟡",
+            "stopped": "🔴", "emergency": "🚨",
+        }.get(status.state, "❔")
+
         await update.message.reply_text(
-            f"{status_emoji} <b>XAU/USD SMC Trading Bot</b>\n\n"
-            f"Status: <b>{self._state.value.upper()}</b>\n\n"
+            f"{emoji} <b>XAU/USD SMC Trading Bot</b>\n\n"
+            f"Agent state: <b>{status.state.upper()}</b>\n"
+            f"Mode: {status.mode}\n"
+            f"Kill switch: {'ACTIVE' if status.kill_switch else 'inactive'}\n\n"
             f"Use /help for available commands.",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
 
     async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -141,7 +140,12 @@ class TelegramBot:
         account = mt5_connector.get_account_info()
 
         text = f"📊 <b>System Status</b>\n\n"
-        text += f"Bot State: <b>{self._state.value.upper()}</b>\n"
+        from src.trading_controller import trading_controller
+        controller_status = trading_controller.status()
+        text = f"📊 <b>System Status</b>\n\n"
+        text += f"Agent State: <b>{controller_status.state.upper()}</b>\n"
+        text += f"MT5 Connected: {'✅' if mt5_connected else '❌'}\n"
+        text += f"Kill Switch: {'🚨 ACTIVE' if controller_status.kill_switch else '✅ inactive'}\n"
         text += f"MT5 Connected: {'✅' if mt5_connected else '❌'}\n"
 
         if account:
@@ -301,70 +305,51 @@ class TelegramBot:
         text += f"Expectancy: ${expectancy:,.2f}\n"
 
         await update.message.reply_text(text, parse_mode="HTML")
+        
+    async def _cmd_kill(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+    ):
+        """Emergency: activate the durable kill switch.
 
-    async def _cmd_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        This is the ONLY state-changing Telegram command. It writes to
+        the database, requires no live agent, blocks all new entries,
+        and never closes positions.
+        """
         if not self._is_authorized(update.effective_user.id):
             await update.message.reply_text("❌ Unauthorized")
             return
 
-        if self._state == BotState.PAUSED:
-            await update.message.reply_text("⏸ Already paused")
-            return
-
-        self._state = BotState.PAUSED
-        if self._pause_callback:
-            self._pause_callback()
-
-        await update.message.reply_text("⏸ <b>Trading PAUSED</b>\nNo new positions will be opened.", parse_mode="HTML")
-        logger.info("Trading paused via Telegram")
-
-    async def _cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._is_authorized(update.effective_user.id):
-            await update.message.reply_text("❌ Unauthorized")
-            return
-
-        if self._state == BotState.RUNNING:
-            await update.message.reply_text("▶️ Already running")
-            return
-
-        # Run safety checks before resuming
-        risk_checks = risk_manager.check_risk_limits()
-
-        if not risk_checks["ok"]:
+        from src.risk_manager import risk_manager
+        try:
+            risk_manager.set_kill_switch(
+                True, reason="Telegram /kill",
+            )
+        except Exception as exc:
+            logger.exception("Telegram /kill failed.")
             await update.message.reply_text(
-                f"⚠️ <b>Cannot Resume</b>\nRisk checks failed:\n" +
-                "\n".join(f"• {k}: {'✅' if v else '❌'}" for k, v in risk_checks["checks"].items()),
-                parse_mode="HTML"
+                f"❌ Kill switch write failed: {exc}\n\n"
+                "No action taken. Use the dashboard or host terminal.",
             )
             return
 
-        self._state = BotState.RUNNING
-        if self._resume_callback:
-            self._resume_callback()
+        try:
+            active = risk_manager.is_kill_switch_active()
+        except Exception:
+            active = None
 
-        await update.message.reply_text("▶️ <b>Trading RESUMED</b>", parse_mode="HTML")
-        logger.info("Trading resumed via Telegram")
-
-    async def _cmd_shutdown(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._is_authorized(update.effective_user.id):
-            await update.message.reply_text("❌ Unauthorized")
-            return
-
-        keyboard = [
-            [
-                InlineKeyboardButton("✅ Confirm Shutdown", callback_data="confirm_shutdown"),
-                InlineKeyboardButton("❌ Cancel", callback_data="cancel_shutdown")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await update.message.reply_text(
-            "🛑 <b>Confirm Shutdown</b>\n\n"
-            "This will stop the bot and disconnect from MT5.\n"
-            "Open positions will be preserved by default.",
-            reply_markup=reply_markup,
-            parse_mode="HTML"
-        )
+        if active is True:
+            await update.message.reply_text(
+                "🚨 <b>KILL SWITCH ACTIVE</b>\n\n"
+                "• New entries blocked\n"
+                "• Open positions remain open\n"
+                "• Clear from dashboard or DB",
+                parse_mode="HTML",
+            )
+        else:
+            await update.message.reply_text(
+                "⚠️ Kill-switch write reported success, but read-back "
+                "was inconclusive. Verify in dashboard.",
+            )
 
     async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_authorized(update.effective_user.id):
@@ -373,37 +358,23 @@ class TelegramBot:
 
         text = (
             "📖 <b>Available Commands</b>\n\n"
+            "<b>Read-only</b>\n"
             "/start - Bot status overview\n"
             "/status - Detailed system status\n"
             "/balance - Account balance & equity\n"
             "/positions - Open positions\n"
             "/history - Recent trade history\n"
             "/performance - Performance statistics\n"
-            "/pause - Pause new entries\n"
-            "/resume - Resume trading (with safety checks)\n"
-            "/shutdown - Safely stop the bot\n"
-            "/help - This help message"
+            "/help - This help message\n\n"
+            "<b>Emergency</b>\n"
+            "/kill - Activate the durable kill switch. Blocks new "
+            "entries. Does <b>not</b> close open positions. Clear via "
+            "dashboard or DB.\n\n"
+            "<i>All other control (pause, resume, close, shutdown) is "
+            "performed on the agent host or via the local dashboard.</i>"
         )
         await update.message.reply_text(text, parse_mode="HTML")
 
-    async def _handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-
-        if not self._is_authorized(query.from_user.id):
-            await query.edit_message_text("❌ Unauthorized")
-            return
-
-        if query.data == "confirm_shutdown":
-            self._state = BotState.STOPPED
-            await query.edit_message_text("🛑 <b>Shutdown initiated</b>", parse_mode="HTML")
-            if self._shutdown_callback:
-                self._shutdown_callback()
-
-        elif query.data == "cancel_shutdown":
-            await query.edit_message_text("✅ Shutdown cancelled", parse_mode="HTML")
-
-    # --- Notification Methods ---
 
     async def notify(self, title: str, message: str, emoji: str = "ℹ️"):
         """Send a notification."""
@@ -554,17 +525,6 @@ class TelegramBot:
     async def notify_error(self, error: str):
         text = f"❌ <b>Error</b>\n\n{error}"
         await self._send_message(text)
-
-    # --- Callback Setters ---
-
-    def set_shutdown_callback(self, callback: Callable):
-        self._shutdown_callback = callback
-
-    def set_pause_callback(self, callback: Callable):
-        self._pause_callback = callback
-
-    def set_resume_callback(self, callback: Callable):
-        self._resume_callback = callback
 
     def get_state(self) -> BotState:
         return self._state

@@ -17,6 +17,7 @@ from src.indicators import (
     OrderBlock,
 )
 from src.market_data import market_data
+from src.mt5_connector import mt5_connector, MT5Connector
 from src.logger import get_logger
 
 logger = get_logger(__name__)
@@ -43,8 +44,33 @@ class OrderBlockAnalyzer:
         self.lookback = 20
         self.displacement_threshold = 1.5
 
-        # XAUUSD convention: one pip is 0.01.
-        self.point_value = 0.01
+    @property
+    def point_value(self) -> float:
+        """Broker-aware pip size (price per pip). See module docstring.
+
+        Gold-units fix: for a 2-digit gold symbol, 1 pip is 10 × point
+        (0.10 on XM GOLD). The previous hardcoded 0.01 was the *point*
+        value, which made every 'pips' threshold in this file 10× too
+        tight.
+        """
+        try:
+            info = mt5_connector.get_symbol_info()
+        except Exception:
+            info = None
+
+        if info is not None:
+            size = MT5Connector.pip_size_for(info)
+            if isinstance(size, (int, float)) and size > 0:
+                return float(size)
+
+        # Fail-safe fallback for the (rare) case where the symbol info
+        # is unavailable. Matches the previous default so callers do not
+        # crash; live code never reaches here when MT5 is connected.
+        logger.warning(
+            "Order-block analyzer: symbol info unavailable; "
+            "falling back to 0.01 price-per-pip."
+        )
+        return 0.01
 
     # ------------------------------------------------------------------
     # Analysis
@@ -79,7 +105,11 @@ class OrderBlockAnalyzer:
             return None
 
         try:
-            candles = market_data.get_candles(
+            # H-12: OB detection looks ahead i+1..i+5 closes to compute
+            # displacement strength. If the forming candle is in the
+            # array, it enters that lookahead window and the OB
+            # repaints. Use closed candles only.
+            candles = market_data.get_closed_candles(
                 timeframe,
                 self.lookback + 20
             )

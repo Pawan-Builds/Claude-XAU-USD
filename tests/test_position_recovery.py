@@ -213,13 +213,21 @@ def test_reconcile_idempotent(harness):
 
 
 def test_reconcile_leaves_orphan_untracked_when_no_deals(harness):
-    """MT5 has a position but history query returns nothing."""
+    """MT5 has a position but history query returns nothing.
+
+    H-05: the orphan remains unresolved, so reconcile_with_broker must
+    return False and has_unresolved_reconciliation() must be True.
+    """
     harness.mt5.get_positions.return_value = [_live_position(ticket=5004)]
     harness.mt5.get_history_deals.return_value = []
 
-    assert harness.manager.reconcile_with_broker() is True
+    assert harness.manager.reconcile_with_broker() is False
 
     from src.database_manager import ExecutedOrder, OpenPosition
     assert len(harness.db.query(ExecutedOrder)) == 0
     assert len(harness.db.query(OpenPosition)) == 0
     assert harness.manager.get_position_state(5004) is None
+
+    # H-05: the state must reflect that a position remains unresolved.
+    assert harness.manager.has_unresolved_reconciliation() is True
+    assert harness.manager.get_unresolved_tickets() == [5004]

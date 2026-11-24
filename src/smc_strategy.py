@@ -187,7 +187,15 @@ class SMCEngine:
     # ------------------------------------------------------------------
 
     def _latest_close(self, timeframe: str) -> Optional[float]:
-        candle = market_data.get_latest_candle(timeframe)
+        """Close of the last CONFIRMED candle.
+
+        Fixed: previously called ``market_data.get_latest_candle()``,
+        which does not exist on MarketDataEngine. The method is
+        currently unused by the six strategies (which read entry price
+        from the FVG/OB zone, not from a candle close), but leaving a
+        broken method is a landmine for future edits.
+        """
+        candle = market_data.get_latest_closed_candle(timeframe)
         if candle is None:
             return None
 
@@ -843,6 +851,199 @@ class SMCEngine:
                             return signal
 
         return None
+
+    # ------------------------------------------------------------------
+    # H-01: TradePlan reconfirmation
+    # ------------------------------------------------------------------
+
+    def reconfirm_plan(self, plan) -> tuple[bool, str]:
+        """Reconfirm that the SMC setup underlying a TradePlan is still valid.
+
+        Called by ``TradingAgent._process_trade_plans`` immediately before
+        the submission gate, using the freshly-cached closed-candle state.
+        Returns ``(valid, reason)``. Any failure of the strategy-specific
+        checks invalidates the plan — this method never fabricates a
+        confirmation.
+        """
+        direction = str(getattr(plan, "direction", "")).upper()
+        if direction not in ("BUY", "SELL"):
+            return False, f"Invalid plan direction: {direction!r}"
+
+        strategy = str(getattr(plan, "strategy", "")).lower()
+
+        try:
+            entry = float(plan.entry_price)
+            sl = float(plan.sl_price)
+            tp = float(plan.tp_price)
+        except (TypeError, ValueError):
+            return False, "Plan prices are not numeric."
+
+        if min(entry, sl, tp) <= 0:
+            return False, "Plan prices are not positive."
+
+        # Common precondition: H4 bias must still match plan direction.
+        h4_bias = market_structure.get_higher_tf_bias()
+        h1_bias = market_structure.get_structure_tf_bias()
+        required_h4 = "bullish" if direction == "BUY" else "bearish"
+
+        if h4_bias != required_h4:
+            return (
+                False,
+                f"H4 bias is {h4_bias!r}; plan requires {required_h4!r}.",
+            )
+
+        # Common precondition: SL still on the correct side of entry.
+        if direction == "BUY" and sl >= entry:
+            return False, "SL is no longer below entry."
+        if direction == "SELL" and sl <= entry:
+            return False, "SL is no longer above entry."
+
+        checks = {
+            "liquidity_sweep_fvg": self._reconfirm_sweep_fvg,
+            "liquidity_sweep_choch": self._reconfirm_sweep_choch,
+            "bos_order_block": self._reconfirm_bos_ob,
+            "choch_order_block": self._reconfirm_choch_ob,
+            "displacement_fvg": self._reconfirm_displacement_fvg,
+            "liquidity_sweep_ob_fvg": self._reconfirm_sweep_ob_fvg,
+        }
+
+        checker = checks.get(strategy)
+        if checker is None:
+            return False, f"Unknown strategy: {strategy!r}"
+
+        try:
+            return checker(
+                direction, entry, sl, tp, h4_bias, h1_bias,
+            )
+        except Exception as exc:
+            logger.exception(
+                "Reconfirmation raised for strategy %s: %s", strategy, exc,
+            )
+            return False, f"Reconfirmation error: {exc}"
+
+    # ---------- per-strategy reconfirmation checkers ----------
+    # Each checker re-validates the specific confirmations that produced
+    # the original plan, using the freshly-cached closed-candle state.
+
+    @staticmethod
+    def _zone_covers_entry(zones, entry: float, tol: float = 1e-6) -> bool:
+        return any(
+            float(z.bottom) - tol <= entry <= float(z.top) + tol
+            for z in zones
+        )
+
+    def _reconfirm_sweep_fvg(
+        self, direction, entry, sl, tp, h4, h1,
+    ) -> tuple[bool, str]:
+        if direction == "BUY":
+            fvgs = fair_value_gaps.get_active_bullish_fvgs("m5")
+        else:
+            fvgs = fair_value_gaps.get_active_bearish_fvgs("m5")
+
+        if not fvgs:
+            return False, "M5 FVG mitigated or removed."
+
+        if not self._zone_covers_entry(fvgs, entry):
+            return False, "M5 FVG no longer covers the planned entry zone."
+
+        return True, "OK"
+
+    def _reconfirm_sweep_choch(
+        self, direction, entry, sl, tp, h4, h1,
+    ) -> tuple[bool, str]:
+        if direction == "BUY":
+            if not market_structure.is_choch_bullish("m15"):
+                return False, "M15 bullish CHoCH no longer confirmed."
+        else:
+            if not market_structure.is_choch_bearish("m15"):
+                return False, "M15 bearish CHoCH no longer confirmed."
+
+        return True, "OK"
+
+    def _reconfirm_bos_ob(
+        self, direction, entry, sl, tp, h4, h1,
+    ) -> tuple[bool, str]:
+        required_h1 = "bullish" if direction == "BUY" else "bearish"
+        if h1 != required_h1:
+            return False, f"H1 bias flipped to {h1!r}."
+
+        if direction == "BUY":
+            if not market_structure.is_bos_bullish("h1"):
+                return False, "H1 bullish BOS no longer confirmed."
+            obs = order_blocks.get_active_bullish_obs("m15")
+        else:
+            if not market_structure.is_bos_bearish("h1"):
+                return False, "H1 bearish BOS no longer confirmed."
+            obs = order_blocks.get_active_bearish_obs("m15")
+
+        if not obs:
+            return False, "M15 OB mitigated or removed."
+
+        if not self._zone_covers_entry(obs, entry):
+            return False, "M15 OB no longer covers the planned entry zone."
+
+        return True, "OK"
+
+    def _reconfirm_choch_ob(
+        self, direction, entry, sl, tp, h4, h1,
+    ) -> tuple[bool, str]:
+        if direction == "BUY":
+            if not market_structure.is_choch_bullish("m15"):
+                return False, "M15 bullish CHoCH no longer confirmed."
+            obs = order_blocks.get_active_bullish_obs("m5")
+        else:
+            if not market_structure.is_choch_bearish("m15"):
+                return False, "M15 bearish CHoCH no longer confirmed."
+            obs = order_blocks.get_active_bearish_obs("m5")
+
+        if not obs:
+            return False, "M5 OB mitigated or removed."
+
+        if not self._zone_covers_entry(obs, entry):
+            return False, "M5 OB no longer covers the planned entry zone."
+
+        return True, "OK"
+
+    def _reconfirm_displacement_fvg(
+        self, direction, entry, sl, tp, h4, h1,
+    ) -> tuple[bool, str]:
+        if direction == "BUY":
+            fvgs = fair_value_gaps.get_active_bullish_fvgs("m5")
+        else:
+            fvgs = fair_value_gaps.get_active_bearish_fvgs("m5")
+
+        if not fvgs:
+            return False, "M5 FVG mitigated or removed."
+
+        if not self._zone_covers_entry(fvgs, entry):
+            return False, "M5 FVG no longer covers the planned entry zone."
+
+        return True, "OK"
+
+    def _reconfirm_sweep_ob_fvg(
+        self, direction, entry, sl, tp, h4, h1,
+    ) -> tuple[bool, str]:
+        if direction == "BUY":
+            obs = order_blocks.get_active_bullish_obs("m15")
+            fvgs = fair_value_gaps.get_active_bullish_fvgs("m5")
+        else:
+            obs = order_blocks.get_active_bearish_obs("m15")
+            fvgs = fair_value_gaps.get_active_bearish_fvgs("m5")
+
+        if not obs:
+            return False, "M15 OB mitigated or removed."
+        if not fvgs:
+            return False, "M5 FVG mitigated or removed."
+
+        if not (
+            self._zone_covers_entry(obs, entry)
+            or self._zone_covers_entry(fvgs, entry)
+        ):
+            return False, (
+                "Entry zone no longer covered by an active OB or FVG."
+            )
+
+        return True, "OK"
 
 
 # Shared engine instance used by the trading agent.

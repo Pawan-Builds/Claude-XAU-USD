@@ -208,6 +208,24 @@ class TradingAgent:
 
         return positions
 
+    @staticmethod
+    def _as_utc(dt: Optional[datetime]) -> Optional[datetime]:
+        """Normalize a datetime to timezone-aware UTC.
+
+        SQLAlchemy's SQLite DateTime type stores values as a fixed
+        naive-looking string and returns them naive on read, regardless of
+        whether the write was tz-aware. Every value we persist is UTC, so
+        this helper restores the explicit UTC tzinfo and makes comparisons
+        against ``datetime.now(timezone.utc)`` safe. Safe to call on
+        already-aware datetimes.
+        """
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+        
+
     def _save_account_snapshot(self):
         account = mt5_connector.get_account_info()
 
@@ -217,6 +235,7 @@ class TradingAgent:
             )
 
         positions = self._get_positions_or_raise()
+
 
         floating_pl = sum(
             float(position.get("profit", 0.0))
@@ -235,6 +254,7 @@ class TradingAgent:
         )
 
         db_manager.add(snapshot)
+
 
     # =========================================================
     # STARTUP
@@ -270,16 +290,6 @@ class TradingAgent:
 
             logger.info("Initializing database...")
             db_manager.create_tables()
-
-            telegram_bot.set_shutdown_callback(
-                self._request_shutdown
-            )
-            telegram_bot.set_pause_callback(
-                self._pause_trading
-            )
-            telegram_bot.set_resume_callback(
-                self._resume_trading
-            )
 
             try:
                 self._telegram_ready = bool(
@@ -482,6 +492,9 @@ class TradingAgent:
 
                 await self._manage_positions()
 
+                # Phase 3A: honour config.sessions.close_before_weekend_hours.
+                self._handle_weekend_close()
+
                 self._error_count = max(
                     0, self._error_count - 1
                 )
@@ -631,7 +644,7 @@ class TradingAgent:
                 ).all()
 
                 for plan in plans:
-                    if now >= plan.expiry_time:
+                    if now >= self._as_utc(plan.expiry_time):
                         plan.status = "EXPIRED"
                         plan.invalidated_reason = "Time expired"
                         logger.info(
@@ -656,6 +669,35 @@ class TradingAgent:
                             plan.symbol,
                             plan.entry_price
                         )
+
+                        # H-01: reconfirm the SMC setup on fresh closed-
+                        # candle data. Prevents a plan whose premise has
+                        # expired from becoming a live order.
+                        try:
+                            reconfirmed, reconfirm_reason = (
+                                smc_engine.reconfirm_plan(plan)
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Plan reconfirmation raised; failing closed."
+                            )
+                            reconfirmed = False
+                            reconfirm_reason = "reconfirmation error"
+
+                        if not reconfirmed:
+                            plan.status = "INVALIDATED"
+                            plan.invalidated_reason = (
+                                f"Reconfirmation: {reconfirm_reason}"
+                            )
+                            logger.warning(
+                                "TRADE PLAN INVALIDATED AT RECONFIRM | "
+                                "%s %s @ %.5f | %s",
+                                plan.direction,
+                                plan.symbol,
+                                plan.entry_price,
+                                reconfirm_reason,
+                            )
+                            continue
                         
                         # F-01 FIX: Independent fail-closed permission check
                         # F-01: fail-closed gate. Pause is honoured here.
@@ -718,6 +760,26 @@ class TradingAgent:
                             )
                             if self._telegram_ready:
                                 await telegram_bot.notify_new_trade(signal, result)
+                        elif getattr(result, "uncertain", False):
+                            # Submission outcome is not definitively known.
+                            # Leave the plan WAITING; the fingerprint
+                            # duplicate check blocks an immediate retry,
+                            # and the executor's reconciler will resolve
+                            # the uncertain request to filled /
+                            # rejected_notfound on a later cycle.
+                            logger.warning(
+                                "TRADE PLAN UNCERTAIN | %s %s @ %.5f | %s",
+                                plan.direction,
+                                plan.symbol,
+                                plan.entry_price,
+                                result.error,
+                            )
+                            if self._telegram_ready:
+                                await telegram_bot.notify_error(
+                                    "Order outcome uncertain for "
+                                    f"{plan.direction} {plan.symbol}: "
+                                    f"{result.error}"
+                                )
                         else:
                             plan.status = "INVALIDATED"
                             plan.invalidated_reason = result.error
@@ -912,6 +974,131 @@ class TradingAgent:
 
                     self._pause_trading()
 
+
+    # =========================================================
+    # WEEKEND CLOSE
+    # =========================================================
+
+    _WEEKEND_MARKER_KEY = "last_weekend_close_date"
+
+    def _handle_weekend_close(self):
+        """Close bot-owned positions once per weekend when configured.
+
+        Behaviour:
+        - Fires only when ``config.sessions.weekend_protection`` is True
+          AND ``config.sessions.close_before_weekend_hours > 0`` AND
+          ``market_data.is_weekend_protection_active()`` is True.
+        - Persists a per-weekend marker (Friday's ISO date) in AppSettings
+          so it fires exactly once per calendar weekend, even if the
+          agent restarts mid-session.
+        - A failure to record the marker is logged but does NOT skip the
+          close — the operator's safety beats the idempotency guard.
+        """
+        try:
+            sessions_cfg = config.sessions
+        except Exception:
+            logger.exception("Could not read session config.")
+            return
+
+        if not bool(getattr(sessions_cfg, "weekend_protection", False)):
+            return
+
+        try:
+            hours_before = int(
+                getattr(sessions_cfg, "close_before_weekend_hours", 0)
+            )
+        except (TypeError, ValueError):
+            hours_before = 0
+
+        if hours_before <= 0:
+            return
+
+        try:
+            if not market_data.is_weekend_protection_active():
+                return
+        except Exception:
+            logger.exception("Weekend protection check raised.")
+            return
+
+        # Key on Friday of the current calendar week, so re-running
+        # during the weekend does not double-fire.
+        now = datetime.now(timezone.utc)
+        if now.weekday() == 4:                     # Friday
+            week_key = now.date().isoformat()
+        elif now.weekday() >= 5:                    # Sat / Sun
+            week_key = (now - timedelta(
+                days=now.weekday() - 4
+            )).date().isoformat()
+        else:
+            return  # Mon–Thu: nothing to do
+
+        from src.database_manager import AppSettings
+        try:
+            setting = db_manager.query_one(
+                AppSettings, key=self._WEEKEND_MARKER_KEY,
+            )
+        except Exception:
+            logger.exception("Could not read weekend-close marker.")
+            setting = None
+
+        if setting is not None and setting.value == week_key:
+            return  # Already closed for this weekend.
+
+        logger.warning(
+            "Weekend protection active and close_before_weekend_hours=%d; "
+            "closing bot-owned positions (weekend=%s).",
+            hours_before, week_key,
+        )
+
+        result = trading_controller.close_all_for_weekend()
+
+        if not result.get("query_ok", False):
+            logger.error(
+                "Weekend close could not verify position query; "
+                "will retry next cycle. Details: %s", result,
+            )
+            return  # Do NOT mark as done — retry next loop.
+
+        if result.get("failed", 0) > 0:
+            logger.error(
+                "Weekend close partially failed: closed=%d failed=%d. "
+                "Will retry next cycle.", result["closed"], result["failed"],
+            )
+            return  # Do NOT mark — retry next loop.
+
+        # Successfully closed. Persist the marker.
+        try:
+            with db_manager.get_session() as session:
+                row = (
+                    session.query(AppSettings)
+                    .filter_by(key=self._WEEKEND_MARKER_KEY).first()
+                )
+                if row is None:
+                    session.add(AppSettings(
+                        key=self._WEEKEND_MARKER_KEY, value=week_key,
+                    ))
+                else:
+                    row.value = week_key
+        except Exception:
+            logger.exception(
+                "Could not persist weekend-close marker; close already "
+                "executed. Next tick will re-attempt close but should "
+                "find nothing to close (idempotent at broker level)."
+            )
+
+        if self._telegram_ready:
+            try:
+                asyncio.create_task(
+                    telegram_bot.notify(
+                        "Weekend Close",
+                        f"Closed {result['closed']} bot-owned position(s) "
+                        f"ahead of the weekend.",
+                        "🕒",
+                    )
+                )
+            except Exception:
+                logger.exception("Weekend-close Telegram notify failed.")
+
     # =========================================================
     # HEALTH CHECKS AND RECONNECTION
     # =========================================================
@@ -953,15 +1140,40 @@ class TradingAgent:
 
         self._save_account_snapshot()
 
-        # F-05: periodic reconciliation so a position closed while the
-        # agent was looking elsewhere is finalised as a ClosedTrade.
+        # F-05 / H-05 / H-06: periodic reconciliation. Fail closed when
+        # any bot-owned position remains unresolved.
         if not self._shutdown_requested:
             try:
-                trade_manager.reconcile_with_broker()
+                reconciled = trade_manager.reconcile_with_broker()
+
+                if not reconciled:
+                    self._pause_trading()
+                    unresolved = trade_manager.get_unresolved_tickets()
+                    logger.error(
+                        "Broker reconciliation incomplete; new entries "
+                        "paused. Unresolved tickets: %s", unresolved,
+                    )
             except Exception:
                 logger.exception(
                     "Periodic broker reconciliation failed."
                 )
+                self._pause_trading()
+
+        # Phase 3D: surface stuck pending-cancel attempts. Not a pause
+        # trigger — stuck cancels are a housekeeping issue, not a safety
+        # issue; positions are unaffected. Logged WARNING so it appears
+        # in the operator's Telegram feed and dashboard.
+        try:
+            stuck = order_executor.get_stuck_cancellations()
+            if stuck:
+                logger.warning(
+                    "Stuck pending cancellations require operator "
+                    "attention: %s", stuck,
+                )
+        except Exception:
+            logger.exception(
+                "Could not check stuck pending cancellations."
+            )
 
         if self._paused and not self._shutdown_requested:
             probe = self._entry_gate.probe()
@@ -1051,11 +1263,25 @@ class TradingAgent:
                 cancelled = order_executor.cancel_all_pending(
                     reason="SHUTDOWN"
                 )
-                logger.info(
-                    "Shutdown policy: cancelled %d bot-owned pending "
-                    "order(s).",
-                    len(cancelled),
-                )
+                if not getattr(cancelled, "query_ok", True):
+                    logger.error(
+                        "Shutdown cancel: pending-order query failed; "
+                        "could not confirm cancellation."
+                    )
+                else:
+                    failed = getattr(cancelled, "failed", 0)
+                    total = len(cancelled)
+                    if failed:
+                        logger.error(
+                            "Shutdown cancel: %d/%d pending order(s) "
+                            "failed to cancel. Check stuck list.",
+                            failed, total,
+                        )
+                    else:
+                        logger.info(
+                            "Shutdown policy: cancelled %d bot-owned "
+                            "pending order(s).", total,
+                        )
             except Exception:
                 logger.exception(
                     "Failed to cancel bot-owned pending orders at shutdown."
