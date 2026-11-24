@@ -31,7 +31,10 @@ class ValidationResult:
 class SignalValidator:
     """Validates trading signals before they reach the order executor."""
 
-    ENVIRONMENT = "demo"
+    @property
+    def ENVIRONMENT(self) -> str:
+        """Runtime-derived environment for database queries."""
+        return config.trading.mode.lower()
 
     def __init__(self):
         self.trading_config = config.trading
@@ -42,7 +45,7 @@ class SignalValidator:
     # Main validation
     # ------------------------------------------------------------------
 
-    def validate_signal(self, signal: TradeSignal) -> ValidationResult:
+    def validate_signal(self, signal: TradeSignal, market_entry: bool = False) -> ValidationResult:
         checks: Dict[str, bool] = {}
         reasons: List[str] = []
 
@@ -52,109 +55,55 @@ class SignalValidator:
                 reasons.append(failure_reason)
 
         # 1. Trading mode
-        record(
-            "trading_mode",
-            str(self.trading_config.mode).upper() == "DEMO",
-            "Trading mode is not DEMO."
-        )
+        record("trading_mode", str(self.trading_config.mode).upper() == "DEMO", "Trading mode is not DEMO.")
 
         # 2. MT5 connection
         connected = mt5_connector.is_connected()
-        record(
-            "mt5_connected",
-            connected,
-            "MT5 is not connected."
-        )
-
+        record("mt5_connected", connected, "MT5 is not connected.")
         if not connected:
             return self._result(checks, reasons)
 
         # 3. Account information
         account = mt5_connector.get_account_info()
-
-        record(
-            "account_available",
-            account is not None,
-            "Could not retrieve MT5 account information."
-        )
-
+        record("account_available", account is not None, "Could not retrieve MT5 account information.")
         if account is None:
             return self._result(checks, reasons)
 
         # 4. Demo account
-        record(
-            "demo_account",
-            bool(account.is_demo),
-            "Connected MT5 account is not a demo account."
-        )
+        record("demo_account", bool(account.is_demo), "Connected MT5 account is not a demo account.")
 
         # 5. Trading permissions
-        record(
-            "trading_allowed",
-            bool(account.trade_allowed and account.trade_expert),
-            "Trading is not permitted on this account or terminal."
-        )
+        record("trading_allowed", bool(account.trade_allowed and account.trade_expert), "Trading is not permitted on this account or terminal.")
 
         # 6. Signal data
         signal_data_valid = self._check_signal_data(signal)
-        record(
-            "signal_data",
-            signal_data_valid,
-            "Signal contains invalid prices, direction, or risk parameters."
-        )
-
+        record("signal_data", signal_data_valid, "Signal contains invalid prices, direction, or risk parameters.")
         if not signal_data_valid:
             return self._result(checks, reasons)
 
         # 7. Open positions
         positions = mt5_connector.get_positions()
-
-        record(
-            "positions_available",
-            positions is not None,
-            "Could not retrieve open MT5 positions."
-        )
-
+        record("positions_available", positions is not None, "Could not retrieve open MT5 positions.")
         if positions is None:
             return self._result(checks, reasons)
 
-        record(
-            "max_positions",
-            len(positions) < int(self.trading_config.max_positions),
-            f"Maximum open positions ({self.trading_config.max_positions}) reached."
-        )
+        record("max_positions", len(positions) < int(self.trading_config.max_positions), f"Maximum open positions ({self.trading_config.max_positions}) reached.")
 
         # 8. Daily trade limit
         daily_trades_ok = self._check_daily_trade_limit()
-        record(
-            "daily_trades",
-            daily_trades_ok,
-            "Daily trade limit reached or trade history unavailable."
-        )
+        record("daily_trades", daily_trades_ok, "Daily trade limit reached or trade history unavailable.")
 
         # 9. Daily loss limit
         daily_loss_ok = self._check_daily_loss_limit()
-        record(
-            "daily_loss",
-            daily_loss_ok,
-            "Daily loss limit reached or daily loss data unavailable."
-        )
+        record("daily_loss", daily_loss_ok, "Daily loss limit reached or daily loss data unavailable.")
 
         # 10. Maximum drawdown
         drawdown_ok = self._check_max_drawdown()
-        record(
-            "max_drawdown",
-            drawdown_ok,
-            "Maximum drawdown reached or account snapshot history unavailable."
-        )
+        record("max_drawdown", drawdown_ok, "Maximum drawdown reached or account snapshot history unavailable.")
 
         # 11. Consecutive losses
         consecutive_ok = self._check_consecutive_losses()
-        record(
-            "consecutive_losses",
-            consecutive_ok,
-            "Maximum consecutive losses reached or trade history unavailable."
-        )
+        record("consecutive_losses", consecutive_ok, "Maximum consecutive losses reached or trade history unavailable.")
 
         # 12. Spread
         try:
@@ -162,12 +111,7 @@ class SignalValidator:
         except Exception:
             logger.exception("Spread check failed.")
             spread_ok = False
-
-        record(
-            "spread",
-            spread_ok,
-            "Spread is too high or spread information is unavailable."
-        )
+        record("spread", spread_ok, "Spread is too high or spread information is unavailable.")
 
         # 13. Trading session
         try:
@@ -175,12 +119,7 @@ class SignalValidator:
         except Exception:
             logger.exception("Trading session check failed.")
             session_ok = False
-
-        record(
-            "trading_session",
-            session_ok,
-            "Outside configured trading session or session data unavailable."
-        )
+        record("trading_session", session_ok, "Outside configured trading session or session data unavailable.")
 
         # 14. Weekend protection
         try:
@@ -188,47 +127,24 @@ class SignalValidator:
         except Exception:
             logger.exception("Weekend protection check failed.")
             weekend_ok = False
+        record("weekend", weekend_ok, "Weekend protection is active or could not be checked.")
 
-        record(
-            "weekend",
-            weekend_ok,
-            "Weekend protection is active or could not be checked."
-        )
-
-        # 15. Risk/reward, recalculated from prices
+        # 15. Risk/reward
         rr_ok, actual_rr = self._check_risk_reward(signal)
-
-        record(
-            "risk_reward",
-            rr_ok,
-            (
-                f"Risk/reward {actual_rr:.2f} is below the configured "
-                f"minimum ({self.trading_config.min_risk_reward})."
-            )
-        )
+        record("risk_reward", rr_ok, f"Risk/reward {actual_rr:.2f} is below the configured minimum ({self.trading_config.min_risk_reward}).")
 
         # 16. Current entry price
-        entry_ok = self._check_entry_price(signal)
-        record(
-            "entry_price",
-            entry_ok,
-            "Entry price is too far from the current executable market price."
-        )
+        if not market_entry:
+            entry_ok = self._check_entry_price(signal)
+            record("entry_price", entry_ok, "Entry price is too far from the current executable market price.")
+        else:
+            checks["entry_price_market"] = True
 
         # 17. Stop-loss and take-profit distances/direction
         distance_ok, distance_reason = self._check_sl_tp_distance(signal)
-
-        record(
-            "sl_tp_distance",
-            distance_ok,
-            distance_reason
-        )
+        record("sl_tp_distance", distance_ok, distance_reason)
 
         # 18-20. Broker lot constraints.
-        # Initial validation occurs before the executor calculates volume.
-        # A positive lot size means the signal is already sized and can be
-        # checked here. A zero lot size is not accepted as an executable
-        # order; the executor must run validation again after sizing.
         try:
             lot_size = float(signal.lot_size or 0.0)
         except (TypeError, ValueError):
@@ -237,42 +153,19 @@ class SignalValidator:
         if lot_size > 0:
             lot_checks = self._check_lot_constraints(lot_size)
             for name, passed in lot_checks.items():
-                record(
-                    name,
-                    passed,
-                    f"Position volume failed broker constraint: {name}."
-                )
+                record(name, passed, f"Position volume failed broker constraint: {name}.")
         elif lot_size < 0:
-            record(
-                "lot_size",
-                False,
-                "Signal lot size is invalid."
-            )
+            record("lot_size", False, "Signal lot size is invalid.")
         else:
             checks["lot_size_pending"] = True
 
         # 21. Total open risk
-        total_risk_ok = self._check_total_open_risk(
-            signal,
-            positions,
-            account
-        )
-
-        record(
-            "total_risk",
-            total_risk_ok,
-            "Total open risk would exceed the configured limit or could not be calculated."
-        )
+        total_risk_ok = self._check_total_open_risk(signal, positions, account)
+        record("total_risk", total_risk_ok, "Total open risk would exceed the configured limit or could not be calculated.")
 
         # 22. News filter
-        # This is explicitly a placeholder. No economic calendar is connected.
         news_ok = self._check_news_filter()
-
-        record(
-            "news",
-            news_ok,
-            "News filter blocked the signal."
-        )
+        record("news", news_ok, "News filter blocked the signal.")
 
         return self._result(checks, reasons)
 
@@ -753,13 +646,16 @@ class SignalValidator:
     # ------------------------------------------------------------------
 
     def _check_news_filter(self) -> bool:
-        """
-        Placeholder only.
-
-        No economic calendar or news provider is currently connected.
-        This method does NOT protect the strategy from news volatility.
-        """
-        return True
+        """Check the actual economic calendar news filter."""
+        from src.news_filter import news_filter
+        
+        try:
+            result = news_filter.should_block_trading()
+            # If block is True, validation fails (returns False)
+            return not result.get("block", True)
+        except Exception:
+            logger.exception("News filter check failed in SignalValidator.")
+            return False  # Fail closed: if news check crashes, block the trade
 
 
 # Global signal validator instance

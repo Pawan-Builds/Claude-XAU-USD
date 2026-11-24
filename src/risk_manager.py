@@ -6,7 +6,7 @@ from typing import Optional, Dict, Any, List
 
 from src.mt5_connector import mt5_connector
 from src.config_loader import config
-from src.database_manager import db_manager, RiskCalculation
+from src.database_manager import db_manager, RiskCalculation, AppSettings
 from src.logger import get_logger
 
 logger = get_logger(__name__)
@@ -30,12 +30,45 @@ class PositionSizeResult:
 class RiskManager:
     """Calculates position sizes and enforces account risk limits."""
 
-    ENVIRONMENT = "demo"
+    @property
+    def ENVIRONMENT(self) -> str:
+        """Runtime-derived environment for every risk query."""
+        return config.trading.mode.lower()
 
     def __init__(self):
         self.risk_config = config.risk
         self.trading_config = config.trading
         self._last_equity = 0.0
+
+    # ------------------------------------------------------------------
+    # Kill Switch
+    # ------------------------------------------------------------------
+
+    def set_kill_switch(self, active: bool, reason: str = ""):
+        """Persistently enable or disable the kill switch in the DB."""
+        try:
+            with db_manager.get_session() as session:
+                setting = session.query(AppSettings).filter_by(key="kill_switch").first()
+                if not setting:
+                    setting = AppSettings(key="kill_switch", value="false")
+                    session.add(setting)
+                setting.value = "true" if active else "false"
+                
+                if reason:
+                    logger.critical("KILL SWITCH state changed to %s. Reason: %s", active, reason)
+                else:
+                    logger.info("KILL SWITCH state changed to %s.", active)
+        except Exception:
+            logger.exception("Failed to set kill switch")
+
+    def is_kill_switch_active(self) -> bool:
+        """Check if the persistent kill switch is active."""
+        try:
+            setting = db_manager.query_one(AppSettings, key="kill_switch")
+            return setting is not None and setting.value == "true"
+        except Exception:
+            logger.exception("Failed to read kill switch state; failing closed.")
+            return True  # Fail safe: if DB is broken, assume active
 
     # ------------------------------------------------------------------
     # Position sizing
@@ -74,12 +107,6 @@ class RiskManager:
     ) -> PositionSizeResult:
         """
         Calculate volume from actual broker tick economics.
-
-        Monetary risk formula:
-            price_distance / tick_size * tick_value * volume
-
-        Volume is rounded down to the broker's volume step. If the minimum
-        permitted volume exceeds the risk budget, the trade is rejected.
         """
 
         try:
@@ -188,8 +215,6 @@ class RiskManager:
                 contract_size=contract_size
             )
 
-        # Standard pip convention: 10 points for 3/5-digit instruments;
-        # one point for 2/4-digit instruments.
         digits = int(symbol_info.digits)
         pip_size = point * 10 if digits in (3, 5) else point
 
@@ -206,7 +231,6 @@ class RiskManager:
         sl_distance_pips = sl_distance / pip_size
         risk_budget = equity * risk_pct / 100.0
 
-        # Convert price movement into the number of broker ticks.
         ticks_to_stop = sl_distance / tick_size
         risk_per_lot = ticks_to_stop * tick_value
 
@@ -251,10 +275,70 @@ class RiskManager:
         actual_risk = risk_per_lot * adjusted_lots
         actual_risk_pct = actual_risk / equity * 100.0
 
-        # Safety check: rounding/normalization must never exceed the budget.
         if actual_risk > risk_budget + 1e-8:
             return self._failed_result(
                 "Normalized volume exceeds the configured monetary risk budget.",
+                equity=equity,
+                risk_percent=risk_pct,
+                tick_value=tick_value,
+                tick_size=tick_size,
+                contract_size=contract_size,
+                risk_pips=sl_distance_pips
+            )
+
+        # ------------------------------------------------------------------
+        # MARGIN CHECK (Milestone 5)
+        # Defensive: free_margin and margin_initial may be missing or
+        # non-numeric depending on broker; fail safely if unavailable.
+        # ------------------------------------------------------------------
+        try:
+            free_margin = float(account.free_margin)
+        except (TypeError, ValueError, AttributeError):
+            return self._failed_result(
+                "Could not read free margin from account information.",
+                equity=equity,
+                risk_percent=risk_pct,
+                tick_value=tick_value,
+                tick_size=tick_size,
+                contract_size=contract_size,
+                risk_pips=sl_distance_pips
+            )
+
+        required_margin = 0.0
+        try:
+            margin_initial = float(symbol_info.margin_initial or 0)
+        except (TypeError, ValueError, AttributeError):
+            margin_initial = 0.0
+
+        if margin_initial > 0:
+            required_margin = margin_initial * adjusted_lots
+
+        if required_margin <= 0:
+            try:
+                leverage = float(account.leverage or 0)
+            except (TypeError, ValueError, AttributeError):
+                leverage = 0
+
+            if leverage <= 0:
+                return self._failed_result(
+                    "Cannot determine required margin: broker provided no "
+                    "margin_initial and no valid leverage.",
+                    equity=equity,
+                    risk_percent=risk_pct,
+                    tick_value=tick_value,
+                    tick_size=tick_size,
+                    contract_size=contract_size,
+                    risk_pips=sl_distance_pips
+                )
+
+            required_margin = (
+                adjusted_lots * contract_size * entry_price
+            ) / leverage
+
+        if required_margin > free_margin:
+            return self._failed_result(
+                f"Insufficient free margin. Required: "
+                f"${required_margin:.2f}, Free: ${free_margin:.2f}",
                 equity=equity,
                 risk_percent=risk_pct,
                 tick_value=tick_value,
@@ -382,10 +466,6 @@ class RiskManager:
         if raw <= 0 or minimum <= 0 or maximum < minimum or step <= 0:
             return 0.0, False
 
-        # Some brokers report a step finer than they actually accept
-        # (XM GOLD reports 0.001 but enforces 0.01). Anchor the effective
-        # step at the precision of volume_min so we never produce a
-        # volume the broker will reject.
         min_precision = -minimum.as_tuple().exponent
         step_floor = Decimal("1").scaleb(-min_precision)
         if step < step_floor:
@@ -395,21 +475,17 @@ class RiskManager:
             )
             step = step_floor
 
-        # Do not force the broker minimum if it exceeds the risk budget.
         if raw < minimum:
             return 0.0, True
 
         capped = min(raw, maximum)
 
-        # Broker volume steps are anchored at volume_min.
         number_of_steps = (
             (capped - minimum) / step
         ).to_integral_value(rounding=ROUND_DOWN)
 
         normalized = minimum + number_of_steps * step
         normalized = min(normalized, maximum)
-
-        # Quantize down to the effective step's precision.
         normalized = normalized.quantize(step_floor, rounding=ROUND_DOWN)
 
         if normalized < minimum:
@@ -551,12 +627,9 @@ class RiskManager:
 
         checks = {}
 
-        checks["daily_loss"] = self._check_daily_loss(
-            float(account.equity)
-        )
-        checks["max_drawdown"] = self._check_max_drawdown(
-            float(account.equity)
-        )
+        checks["kill_switch"] = not self.is_kill_switch_active()
+        checks["daily_loss"] = self._check_daily_loss(float(account.equity))
+        checks["max_drawdown"] = self._check_max_drawdown(float(account.equity))
         checks["consecutive_losses"] = self._check_consecutive_losses()
         checks["max_positions"] = (
             len(positions) < int(self.trading_config.max_positions)
@@ -580,34 +653,50 @@ class RiskManager:
 
     def _check_daily_loss(self, equity: float) -> bool:
         from datetime import datetime, timezone
-        from src.database_manager import ClosedTrade
+        from src.database_manager import ClosedTrade, AccountSnapshot
 
         if equity <= 0:
             return False
 
         try:
             today_start = datetime.now(timezone.utc).replace(
-                hour=0,
-                minute=0,
-                second=0,
-                microsecond=0
+                hour=0, minute=0, second=0, microsecond=0
             )
 
             with db_manager.get_session() as session:
-                trades = session.query(ClosedTrade).filter(
-                    ClosedTrade.environment == self.ENVIRONMENT,
-                    ClosedTrade.time_close >= today_start
-                ).all()
+                start_snapshot = (
+                    session.query(AccountSnapshot)
+                    .filter(
+                        AccountSnapshot.environment == self.ENVIRONMENT,
+                        AccountSnapshot.timestamp >= today_start,
+                    )
+                    .order_by(AccountSnapshot.timestamp.asc())
+                    .first()
+                )
 
-            daily_pl = sum(float(trade.net_profit or 0) for trade in trades)
+                realized_loss = 0.0
+                trades = (
+                    session.query(ClosedTrade)
+                    .filter(
+                        ClosedTrade.environment == self.ENVIRONMENT,
+                        ClosedTrade.time_close >= today_start,
+                    )
+                    .all()
+                )
+                for trade in trades:
+                    pl = float(trade.net_profit or 0)
+                    if pl < 0:
+                        realized_loss += abs(pl)
 
-            if daily_pl >= 0:
-                return True
+            if start_snapshot is not None and float(start_snapshot.balance) > 0:
+                start_balance = float(start_snapshot.balance)
+                equity_loss = max(0.0, start_balance - equity)
+                total_loss_pct = equity_loss / start_balance * 100.0
+            else:
+                total_loss_pct = realized_loss / equity * 100.0
 
-            daily_loss_pct = abs(daily_pl) / equity * 100.0
-            return daily_loss_pct < float(
-                self.risk_config.daily_loss_limit_percent
-            )
+            limit = float(self.risk_config.daily_loss_limit_percent)
+            return total_loss_pct < limit
 
         except Exception:
             logger.exception("Daily-loss check failed.")
@@ -740,9 +829,7 @@ class RiskManager:
     def get_compound_factor(self) -> float:
         """
         Position sizing already uses current equity.
-
-        Therefore no additional multiplier is applied here; doing so would
-        compound risk twice.
+        Therefore no additional multiplier is applied here.
         """
         return 1.0
 

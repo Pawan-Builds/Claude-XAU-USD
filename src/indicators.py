@@ -770,8 +770,9 @@ def calculate_premium_discount(
     low = float(low)
     current_price = float(current_price)
 
+    # FIX: Handle inverted high/low gracefully to prevent backtest crashes.
     if high < low:
-        raise ValueError("high must be greater than or equal to low")
+        high, low = low, high
 
     midpoint = (high + low) / 2.0
     equilibrium = midpoint
@@ -798,7 +799,6 @@ def calculate_premium_discount(
         "current_price": current_price,
         "distance_from_equilibrium": float(distance_from_eq),
     }
-
 
 # ---------------------------------------------------------------------------
 # Displacement

@@ -115,7 +115,7 @@ sessions:
   close_before_weekend_hours: 4
 
 news:
-  enabled: true
+  enabled: false
   high_impact_only: true
   buffer_minutes_before: 30
   buffer_minutes_after: 30

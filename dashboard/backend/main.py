@@ -25,7 +25,7 @@ from src.order_executor import order_executor
 from src.session_filter import session_filter
 from src.news_filter import news_filter
 from src.telegram_bot import telegram_bot, BotState
-from src.database_manager import db_manager, ClosedTrade, AccountSnapshot, OpenPosition, BacktestReport, BacktestConfig
+from src.database_manager import db_manager, ClosedTrade, AccountSnapshot, OpenPosition, BacktestReport, BacktestConfig, TradePlan
 from src.backtesting.engine import run_backtest_async, BacktestConfig as BTConfig
 from src.backtesting.reports import get_report_summary, list_reports, compare_reports
 from src.logger import get_logger
@@ -156,6 +156,27 @@ async def get_status():
     account = mt5_connector.get_account_info()
     bot_state = telegram_bot.get_state()
 
+    # Fetch active trade plans
+    active_plans = []
+    try:
+        with db_manager.get_session() as session:
+            plans = session.query(TradePlan).filter(
+                TradePlan.environment == config.trading.mode.lower(),
+                TradePlan.status == "WAITING"
+            ).all()
+            active_plans = [
+                {
+                    "direction": p.direction,
+                    "strategy": p.strategy,
+                    "entry_price": p.entry_price,
+                    "sl": p.sl_price,
+                    "tp": p.tp_price,
+                    "expiry": p.expiry_time.isoformat()
+                } for p in plans
+            ]
+    except Exception as e:
+        logger.error(f"Failed to fetch active trade plans: {e}")
+
     return {
         "bot_state": bot_state.value,
         "mt5_connected": mt5_connected,
@@ -173,7 +194,8 @@ async def get_status():
             "symbol": mt5_connector.get_symbol_name(),
             "last_update": datetime.now(timezone.utc).isoformat()
         },
-        "trading_paused": bot_state == BotState.PAUSED
+        "trading_paused": bot_state == BotState.PAUSED,
+        "active_plans": active_plans
     }
 
 
@@ -567,6 +589,27 @@ async def get_live_update() -> Dict:
     positions = mt5_connector.get_positions()
     account = mt5_connector.get_account_info()
 
+    # Fetch active plans for websocket
+    active_plans = []
+    try:
+        with db_manager.get_session() as session:
+            plans = session.query(TradePlan).filter(
+                TradePlan.environment == config.trading.mode.lower(),
+                TradePlan.status == "WAITING"
+            ).all()
+            active_plans = [
+                {
+                    "direction": p.direction,
+                    "strategy": p.strategy,
+                    "entry_price": p.entry_price,
+                    "sl": p.sl_price,
+                    "tp": p.tp_price,
+                    "expiry": p.expiry_time.isoformat()
+                } for p in plans
+            ]
+    except Exception:
+        pass
+
     pos_data = []
     for pos in positions:
         pos_state = trade_manager.get_position_state(pos["ticket"])
@@ -606,7 +649,8 @@ async def get_live_update() -> Dict:
         },
         "positions": pos_data,
         "bot_state": telegram_bot.get_state().value,
-        "spread_pips": market_data.get_spread_pips()
+        "spread_pips": market_data.get_spread_pips(),
+        "active_plans": active_plans
     }
 
 

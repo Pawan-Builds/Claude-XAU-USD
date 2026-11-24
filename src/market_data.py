@@ -61,40 +61,68 @@ class MarketDataEngine:
                 logger.error(f"Callback error: {e}")
 
     def initialize_cache(self, count: int = 500) -> bool:
-        """Initialize candle cache for all timeframes."""
+        """Initialize candle cache for all timeframes atomically.
+
+        FIX #23: if any timeframe fails, clear the entire cache so a
+        partial load cannot leave the strategy engine reading mixed
+        fresh/stale candle series from different timeframes.
+        """
         logger.info("Initializing market data cache...")
 
         tf_map = {
             "m5": 5,
             "m15": 15,
             "h1": 60,
-            "h4": 240
+            "h4": 240,
         }
+
+        loaded: Dict[str, List[Candle]] = {}
 
         for tf_name, tf_minutes in tf_map.items():
             rates = mt5_connector.get_rates(tf_minutes, count)
+
             if rates is None:
-                logger.error(f"Failed to initialize cache for {tf_name}")
+                logger.error(
+                    "Failed to initialize cache for %s; aborting cache load",
+                    tf_name,
+                )
+                with self._lock:
+                    self._candle_cache.clear()
+                    self._last_candle_time.clear()
                 return False
 
-            candles = []
-            for rate in rates:
-                candle = Candle(
+            if len(rates) == 0:
+                logger.error(
+                    "Empty candle list for %s; aborting cache load",
+                    tf_name,
+                )
+                with self._lock:
+                    self._candle_cache.clear()
+                    self._last_candle_time.clear()
+                return False
+
+            candles = [
+                Candle(
                     timestamp=rate["time"],
                     open=rate["open"],
                     high=rate["high"],
                     low=rate["low"],
                     close=rate["close"],
                     volume=rate["tick_volume"],
-                    spread=rate["spread"]
+                    spread=rate["spread"],
                 )
-                candles.append(candle)
+                for rate in rates
+            ]
 
-            with self._lock:
+            loaded[tf_name] = candles
+
+        with self._lock:
+            for tf_name, candles in loaded.items():
                 self._candle_cache[tf_name] = deque(candles, maxlen=1000)
                 self._last_candle_time[tf_name] = candles[-1].timestamp
 
-            logger.info(f"Cached {len(candles)} candles for {tf_name}")
+        for tf_name, candles in loaded.items():
+            logger.info("Cached %d candles for %s", len(candles), tf_name)
 
         return True
 
@@ -105,12 +133,43 @@ class MarketDataEngine:
                 return []
             return list(self._candle_cache[timeframe])[-count:]
 
-    def get_latest_candle(self, timeframe: str) -> Optional[Candle]:
-        """Get the latest cached candle (may still be forming)."""
+    def get_closed_candles(
+        self,
+        timeframe: str,
+        count: int = 100,
+    ) -> List[Candle]:
+        """Return only *closed* candles; excludes the forming candle.
+
+        FIX #22: strategies that confirm on candle close must use this
+        method, not get_candles(). The last element of the internal cache
+        is still forming and must never be treated as a confirmed signal.
+        """
+        if count <= 0:
+            return []
+
         with self._lock:
-            if timeframe not in self._candle_cache or not self._candle_cache[timeframe]:
-                return None
-            return self._candle_cache[timeframe][-1]
+            if timeframe not in self._candle_cache:
+                return []
+
+            candles = list(self._candle_cache[timeframe])
+
+        if len(candles) <= 1:
+            return []
+
+    # Drop the last (forming) candle.
+        closed = candles[:-1]
+
+        return closed[-count:]
+
+
+    def get_latest_closed_candle(
+        self,
+        timeframe: str,
+    ) -> Optional[Candle]:
+        """Return the most recent *closed* candle, or None."""
+        closed = self.get_closed_candles(timeframe, count=1)
+
+        return closed[0] if closed else None
 
     def get_current_tick(self) -> Optional[Dict]:
         """Get current tick data."""
@@ -310,7 +369,12 @@ class MarketDataEngine:
         return float(atr)
 
     def get_spread_pips(self) -> float:
-        """Get current spread in pips."""
+        """Get current spread in pips using broker-derived pip size.
+
+        FIX #20: matches the central pip-size derivation in
+        mt5_connector.pip_size_for(); was previously point * 10 hardcoded,
+        which was wrong for 2-digit XAU/USD brokers.
+        """
         tick = mt5_connector.get_tick()
         if not tick:
             return 0.0
@@ -319,12 +383,11 @@ class MarketDataEngine:
         if not symbol_info:
             return 0.0
 
-        point = symbol_info.point
-        if point == 0:
+        pip_size = mt5_connector.pip_size_for(symbol_info)
+        if pip_size <= 0:
             return 0.0
 
-        spread_pips = tick["spread"] / (point * 10)
-        return spread_pips
+        return float(tick["spread"]) / pip_size
 
     def is_high_spread(self) -> bool:
         """Check if spread exceeds maximum allowed."""

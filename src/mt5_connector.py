@@ -1,9 +1,7 @@
-
 """MT5 Connector for XM MetaTrader 5 integration."""
 
 import os
 import time
-import math
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
@@ -105,24 +103,30 @@ class MT5Connector:
     # ---------------------------------------------------------
 
     def initialize(self) -> bool:
-        """Initialize MT5 and verify the configured account."""
+        """Initialize MT5, ensure the configured account is active, verify."""
 
         logger.info("Initializing MT5 connection...")
 
         terminal_path = self.mt5_config.path
 
-        if not os.path.exists(terminal_path):
+        if not terminal_path or not os.path.exists(terminal_path):
             return self._connection_failure(
-                f"MT5 terminal not found: {terminal_path}"
+                f"MT5 terminal not found: {terminal_path!r}"
             )
 
         if self._initialized:
-            mt5.shutdown()
+            try:
+                mt5.shutdown()
+            except Exception:
+                logger.exception("Prior MT5 shutdown raised.")
             self._initialized = False
 
+    # Step 1: attach to the terminal WITHOUT credentials. This is the
+    # pre-existing successful path when the user has already logged
+    # into the terminal manually.
         if not mt5.initialize(
             path=terminal_path,
-            timeout=self.mt5_config.timeout
+            timeout=self.mt5_config.timeout,
         ):
             return self._connection_failure(
                 f"MT5 initialization failed: {mt5.last_error()}"
@@ -131,25 +135,56 @@ class MT5Connector:
         self._initialized = True
         self.state = ConnectionState.CONNECTING
 
-        logger.info("MT5 terminal initialized")
+        expected_login = int(self.mt5_config.login)
+        expected_server = str(self.mt5_config.server)
 
         account = mt5.account_info()
+
+        attached_ok = (
+            account is not None
+            and int(account.login) == expected_login
+            and str(account.server) == expected_server
+        )
+
+        if not attached_ok:
+        # Step 2: the terminal is on a different account. Attempt an
+        # explicit login using the credentials for the SELECTED mode.
+        # This is a fallback — not the primary path — so a stale
+        # terminal cannot silently route orders to the wrong account.
+            current_login = account.login if account else None
+            current_server = account.server if account else None
+            logger.warning(
+                "Terminal is on account %s/%s but configuration expects "
+                "%s/%s. Attempting explicit login...",
+                current_login,
+                current_server,
+                expected_login,
+                expected_server,
+            )
+
+            if not mt5.login(
+                login=expected_login,
+                password=self.mt5_config.password,
+                server=expected_server,
+                timeout=self.mt5_config.timeout,
+            ):
+                error = mt5.last_error()
+                return self._connection_failure(
+                    "MT5 explicit login failed. Check that "
+                    f"{expected_login}/{expected_server} is a valid account "
+                    "and that DEMO/LIVE credentials in .env are correct "
+                    f"and free of inline comments. Last error: {error}"
+                )
+
+            account = mt5.account_info()
 
         if account is None:
             return self._connection_failure(
                 f"Could not read MT5 account: {mt5.last_error()}"
             )
 
-        expected_login = int(self.mt5_config.login)
-        expected_server = self.mt5_config.server
-
-        if (
-            account.login != expected_login
-            or account.server != expected_server
-        ):
-            return self._connection_failure(
-                "Connected MT5 account does not match configured login/server"
-            )
+        if not self._verify_account_identity(account):
+            return False
 
         if not self.verify_connection():
             error = self._last_error or "MT5 verification failed"
@@ -163,8 +198,40 @@ class MT5Connector:
             "MT5 authenticated | account=%s | server=%s | symbol=%s",
             account.login,
             account.server,
-            self._symbol_name
+            self._symbol_name,
         )
+
+        return True
+
+    def _verify_account_identity(self, account) -> bool:
+        """FIX #4 / #5: enforce DEMO<->demo and LIVE<->real at connect."""
+        expected_login = int(self.mt5_config.login)
+        expected_server = str(self.mt5_config.server)
+
+        if int(account.login) != expected_login:
+            return self._connection_failure(
+                f"Connected login {account.login} does not match "
+                f"configured login {expected_login}"
+            )
+
+        if str(account.server) != expected_server:
+            return self._connection_failure(
+                f"Connected server {account.server!r} does not match "
+                f"configured server {expected_server!r}"
+            )
+
+        mode = config.trading.mode.upper()
+        is_demo = account.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO
+
+        if mode == "DEMO" and not is_demo:
+            return self._connection_failure(
+                "Trading mode DEMO but connected account is REAL."
+            )
+
+        if mode == "LIVE" and is_demo:
+            return self._connection_failure(
+                "Trading mode LIVE but connected account is DEMO."
+            )
 
         return True
 
@@ -174,10 +241,12 @@ class MT5Connector:
 
         logger.error(message)
 
-        if self._initialized:
+        try:
             mt5.shutdown()
-            self._initialized = False
+        except Exception:
+            logger.exception("MT5 shutdown during failure handling raised.")
 
+        self._initialized = False
         self._account_info = None
         self._symbol_info = None
         self._symbol_name = None
@@ -187,8 +256,9 @@ class MT5Connector:
     def login(self) -> bool:
         """Explicitly authenticate using configured credentials.
 
-        Normally initialize() attaches to the already authenticated
-        terminal. This method is retained for compatibility.
+        Kept for backward compatibility. initialize() already performs
+        login, so this is only needed when a caller wants to force a
+        re-authentication on an already-initialized session.
         """
 
         if not self._initialized:
@@ -199,7 +269,7 @@ class MT5Connector:
             login=int(self.mt5_config.login),
             password=self.mt5_config.password,
             server=self.mt5_config.server,
-            timeout=self.mt5_config.timeout
+            timeout=self.mt5_config.timeout,
         )
 
         if not authorized:
@@ -236,8 +306,12 @@ class MT5Connector:
             account.balance,
             account.equity,
             account.is_demo,
-            account.trade_allowed
+            account.trade_allowed,
         )
+
+        # FIX #4: DEMO<->demo and LIVE<->real in every mode.
+        if not self._verify_account_identity(mt5.account_info()):
+            return False
 
         if config.safety.demo_only and not account.is_demo:
             self._last_error = (
@@ -246,14 +320,16 @@ class MT5Connector:
             logger.critical(self._last_error)
             return False
 
-        if config.safety.verify_demo_on_startup and config.safety.demo_only:
-            if not account.trade_allowed:
-                self._last_error = "Trading is disabled on this account"
-                return False
+        # FIX #6: trade permissions are always required, not only in DEMO.
+        if not account.trade_allowed:
+            self._last_error = "Trading is disabled on this account"
+            logger.critical(self._last_error)
+            return False
 
-            if not account.trade_expert:
-                self._last_error = "Expert Advisor trading is disabled"
-                return False
+        if not account.trade_expert:
+            self._last_error = "Expert Advisor trading is disabled"
+            logger.critical(self._last_error)
+            return False
 
         if not self.identify_symbol():
             return False
@@ -272,7 +348,7 @@ class MT5Connector:
         modes = {
             mt5.ACCOUNT_TRADE_MODE_DEMO: "DEMO",
             mt5.ACCOUNT_TRADE_MODE_CONTEST: "CONTEST",
-            mt5.ACCOUNT_TRADE_MODE_REAL: "REAL"
+            mt5.ACCOUNT_TRADE_MODE_REAL: "REAL",
         }
         return modes.get(mode, "UNKNOWN")
 
@@ -280,7 +356,7 @@ class MT5Connector:
         modes = {
             mt5.ACCOUNT_MARGIN_MODE_RETAIL_NETTING: "RETAIL_NETTING",
             mt5.ACCOUNT_MARGIN_MODE_EXCHANGE: "EXCHANGE",
-            mt5.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING: "RETAIL_HEDGING"
+            mt5.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING: "RETAIL_HEDGING",
         }
         return modes.get(mode, "UNKNOWN")
 
@@ -293,7 +369,9 @@ class MT5Connector:
         account = mt5.account_info()
 
         if account is None:
-            self._last_error = f"Account information unavailable: {mt5.last_error()}"
+            self._last_error = (
+                f"Account information unavailable: {mt5.last_error()}"
+            )
             return False
 
         self._account_info = AccountInfo(
@@ -312,7 +390,7 @@ class MT5Connector:
             trade_allowed=account.trade_allowed,
             trade_expert=account.trade_expert,
             margin_mode=self._margin_mode_to_str(account.margin_mode),
-            is_demo=account.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO
+            is_demo=account.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO,
         )
 
         return True
@@ -340,8 +418,17 @@ class MT5Connector:
 
         symbols = mt5.symbols_get()
 
-        if not symbols:
-            self._last_error = f"Could not retrieve symbols: {mt5.last_error()}"
+        # FIX: distinguish MT5 error from "no symbols"
+        if symbols is None:
+            self._last_error = (
+                f"Could not retrieve symbols: {mt5.last_error()}"
+            )
+            logger.error(self._last_error)
+            return False
+
+        if len(symbols) == 0:
+            self._last_error = "Broker returned an empty symbol list"
+            logger.error(self._last_error)
             return False
 
         by_name = {symbol.name.upper(): symbol for symbol in symbols}
@@ -356,7 +443,7 @@ class MT5Connector:
             "GOLDm",
             "GOLDpro",
             "XAU/USD",
-            "XAU_USD"
+            "XAU_USD",
         ]
 
         candidates = []
@@ -366,8 +453,6 @@ class MT5Connector:
             if symbol is not None and symbol not in candidates:
                 candidates.append(symbol)
 
-        # Add broker suffix/prefix variations, but only exact normalized
-        # XAUUSD or GOLD symbols, not unrelated symbols containing GOLD.
         for symbol in symbols:
             normalized = self._normalize_symbol_name(symbol.name)
 
@@ -408,14 +493,17 @@ class MT5Connector:
 
         if not mt5.symbol_select(self._symbol_name, True):
             self._last_error = (
-                f"Could not select symbol {self._symbol_name}: {mt5.last_error()}"
+                f"Could not select symbol {self._symbol_name}: "
+                f"{mt5.last_error()}"
             )
             return False
 
         info = mt5.symbol_info(self._symbol_name)
 
         if info is None:
-            self._last_error = f"Symbol information unavailable: {self._symbol_name}"
+            self._last_error = (
+                f"Symbol information unavailable: {self._symbol_name}"
+            )
             return False
 
         if info.trade_mode == mt5.SYMBOL_TRADE_MODE_DISABLED:
@@ -458,12 +546,13 @@ class MT5Connector:
             session_deals=info.session_deals,
             session_buy_orders=info.session_buy_orders,
             session_sell_orders=info.session_sell_orders,
-            volume_limit=info.volume_limit
+            volume_limit=info.volume_limit,
         )
 
         logger.info(
             "Symbol=%s | Digits=%s | Point=%s | Tick size=%s | "
-            "Tick value=%s | Min lot=%s | Max lot=%s | Step=%s",
+            "Tick value=%s | Min lot=%s | Max lot=%s | Step=%s | "
+            "Pip size=%s",
             info.name,
             info.digits,
             info.point,
@@ -471,10 +560,39 @@ class MT5Connector:
             info.trade_tick_value,
             info.volume_min,
             info.volume_max,
-            info.volume_step
+            info.volume_step,
+            self.pip_size_for(self._symbol_info),
         )
 
         return True
+
+    @staticmethod
+    def pip_size_for(symbol_info: SymbolInfo) -> float:
+        """FIX #10/#18: central broker-aware pip-size derivation.
+
+        Gold is conventionally quoted like JPY: pip = 10 * point.
+        Standard 3/5-digit FX also uses 10 * point.
+        2/4-digit FX uses 1 point.
+        Return 0.0 if the broker spec is invalid.
+        """
+
+        try:
+            point = float(symbol_info.point)
+            digits = int(symbol_info.digits)
+            name = str(symbol_info.name).upper()
+        except (TypeError, ValueError, AttributeError):
+            return 0.0
+
+        if point <= 0:
+            return 0.0
+
+        if "XAU" in name or "GOLD" in name:
+            return point * 10
+
+        if digits in (3, 5):
+            return point * 10
+
+        return point
 
     def get_symbol_info(self) -> Optional[SymbolInfo]:
         if not self._symbol_info or not self._symbol_name:
@@ -515,7 +633,7 @@ class MT5Connector:
             "time": datetime.fromtimestamp(tick.time, tz=timezone.utc),
             "time_msc": tick.time_msc,
             "flags": tick.flags,
-            "spread": tick.ask - tick.bid
+            "spread": tick.ask - tick.bid,
         }
 
     @staticmethod
@@ -527,7 +645,7 @@ class MT5Connector:
             30: mt5.TIMEFRAME_M30,
             60: mt5.TIMEFRAME_H1,
             240: mt5.TIMEFRAME_H4,
-            1440: mt5.TIMEFRAME_D1
+            1440: mt5.TIMEFRAME_D1,
         }
 
     @staticmethod
@@ -541,7 +659,7 @@ class MT5Connector:
                 "close": float(rate[4]),
                 "tick_volume": int(rate[5]),
                 "spread": int(rate[6]),
-                "real_volume": int(rate[7])
+                "real_volume": int(rate[7]),
             }
             for rate in rates
         ]
@@ -550,7 +668,7 @@ class MT5Connector:
         self,
         timeframe: int,
         count: int,
-        from_date: Optional[datetime] = None
+        from_date: Optional[datetime] = None,
     ) -> Optional[List[Dict]]:
         if not self._symbol_name:
             return None
@@ -584,7 +702,7 @@ class MT5Connector:
         self,
         timeframe: int,
         from_date: datetime,
-        to_date: datetime
+        to_date: datetime,
     ) -> Optional[List[Dict]]:
         if not self._symbol_name:
             return None
@@ -603,7 +721,7 @@ class MT5Connector:
             self._symbol_name,
             mt5_tf,
             from_date,
-            to_date
+            to_date,
         )
 
         if rates is None:
@@ -616,8 +734,12 @@ class MT5Connector:
     # Position and order queries
     # ---------------------------------------------------------
 
-    def get_positions(self) -> List[Dict]:
-        """Return positions belonging to this bot on its selected symbol."""
+    def get_positions(self) -> Optional[List[Dict]]:
+        """Return bot-owned positions, or None if the query failed.
+
+        FIX #1: returning None (not []) on MT5 error so callers can
+        distinguish "no positions" from "could not query".
+        """
 
         if not self._symbol_name:
             return []
@@ -625,12 +747,10 @@ class MT5Connector:
         positions = mt5.positions_get(symbol=self._symbol_name)
 
         if positions is None:
-            error = mt5.last_error()
-
-            # MT5 can return None on errors. Do not silently treat an
-            # unavailable position list as an empty account.
-            logger.error("Could not retrieve positions: %s", error)
-            return []
+            logger.error(
+                "Could not retrieve positions: %s", mt5.last_error()
+            )
+            return None
 
         result = []
 
@@ -664,19 +784,23 @@ class MT5Connector:
                     datetime.fromtimestamp(pos.time_update, tz=timezone.utc)
                     if getattr(pos, "time_update", 0)
                     else None
-                )
+                ),
             })
 
         return result
 
-    def get_orders(self) -> List[Dict]:
+    def get_orders(self) -> Optional[List[Dict]]:
+        """Return bot-owned pending orders, or None if the query failed."""
+
         if not self._symbol_name:
             return []
 
         orders = mt5.orders_get(symbol=self._symbol_name)
 
         if orders is None:
-            logger.error("Could not retrieve pending orders: %s", mt5.last_error())
+            logger.error(
+                "Could not retrieve pending orders: %s", mt5.last_error()
+            )
             return None
 
         result = []
@@ -704,7 +828,7 @@ class MT5Connector:
                     )
                     if order.time_expiration
                     else None
-                )
+                ),
             })
 
         return result
@@ -712,16 +836,23 @@ class MT5Connector:
     def get_history_deals(
         self,
         from_date: datetime,
-        to_date: Optional[datetime] = None
-    ) -> List[Dict]:
+        to_date: Optional[datetime] = None,
+    ) -> Optional[List[Dict]]:
+        """Return bot-owned historical deals, or None if the query failed.
+
+        FIX #1: returns None on MT5 error rather than [].
+        """
+
         if to_date is None:
             to_date = datetime.now(timezone.utc)
 
         deals = mt5.history_deals_get(from_date, to_date)
 
         if deals is None:
-            logger.error("Could not retrieve deal history: %s", mt5.last_error())
-            return []
+            logger.error(
+                "Could not retrieve deal history: %s", mt5.last_error()
+            )
+            return None
 
         result = []
 
@@ -745,7 +876,7 @@ class MT5Connector:
                 "comment": deal.comment,
                 "time": datetime.fromtimestamp(
                     deal.time, tz=timezone.utc
-                )
+                ),
             })
 
         return result
@@ -759,7 +890,7 @@ class MT5Connector:
             mt5.ORDER_TYPE_BUY_STOP: "BUY_STOP",
             mt5.ORDER_TYPE_SELL_STOP: "SELL_STOP",
             mt5.ORDER_TYPE_BUY_STOP_LIMIT: "BUY_STOP_LIMIT",
-            mt5.ORDER_TYPE_SELL_STOP_LIMIT: "SELL_STOP_LIMIT"
+            mt5.ORDER_TYPE_SELL_STOP_LIMIT: "SELL_STOP_LIMIT",
         }
         return types.get(type_id, "UNKNOWN")
 
@@ -768,7 +899,7 @@ class MT5Connector:
             mt5.DEAL_TYPE_BUY: "BUY",
             mt5.DEAL_TYPE_SELL: "SELL",
             mt5.DEAL_TYPE_BALANCE: "BALANCE",
-            mt5.DEAL_TYPE_CREDIT: "CREDIT"
+            mt5.DEAL_TYPE_CREDIT: "CREDIT",
         }
         return types.get(type_id, "UNKNOWN")
 
@@ -777,15 +908,46 @@ class MT5Connector:
     # ---------------------------------------------------------
 
     def _trading_precheck(self) -> Optional[str]:
-        """Refresh and validate account permissions before an operation."""
+        """FIX #2/#3: refresh account and re-verify login/server and
+        mode-to-account-type before every trade."""
 
-        if not self._initialized or not self.is_connected():
-            return "MT5 is not connected"
+        if not self._initialized:
+            return "MT5 is not initialized"
+
+        if mt5.terminal_info() is None:
+            return "MT5 terminal is not running"
 
         if not self.update_account_info():
             return "Could not refresh MT5 account information"
 
         account = self._account_info
+        expected_login = int(self.mt5_config.login)
+        expected_server = str(self.mt5_config.server)
+
+        if int(account.login) != expected_login:
+            return (
+                f"Account mismatch: connected login {account.login} "
+                f"does not match configured login {expected_login}"
+            )
+
+        if str(account.server) != expected_server:
+            return (
+                f"Server mismatch: connected server {account.server!r} "
+                f"does not match configured server {expected_server!r}"
+            )
+
+        mode = config.trading.mode.upper()
+        if mode == "DEMO" and not account.is_demo:
+            return (
+                f"Trading mode DEMO but connected account is "
+                f"{account.trade_mode}"
+            )
+
+        if mode == "LIVE" and account.is_demo:
+            return (
+                f"Trading mode LIVE but connected account is "
+                f"{account.trade_mode}"
+            )
 
         if config.safety.demo_only and not account.is_demo:
             return "Demo-only safety: real account trading is blocked"
@@ -835,9 +997,10 @@ class MT5Connector:
             if normalized < minimum or normalized > maximum:
                 return None
 
-            # Determine decimal precision from broker volume step.
             precision = max(0, -step.as_tuple().exponent)
-            normalized = normalized.quantize(Decimal("1").scaleb(-precision))
+            normalized = normalized.quantize(
+                Decimal("1").scaleb(-precision)
+            )
 
             return float(normalized)
 
@@ -861,16 +1024,30 @@ class MT5Connector:
         if filling_flags & mt5.SYMBOL_FILLING_IOC:
             return mt5.ORDER_FILLING_IOC
 
-        # RETURN is not valid for every market-execution symbol.
-        # Use IOC as the final market-order fallback.
         return mt5.ORDER_FILLING_IOC
 
     def _validate_owned_position(self, ticket: int):
-        """Return a position only if it belongs to this bot."""
+        """Return (position, error).
 
-        positions = mt5.positions_get(ticket=int(ticket))
+        FIX #7: distinguish MT5 query failure from "position not found"
+        so that close_position / modify_position are not silently
+        skipped during an outage.
+        """
 
-        if not positions:
+        try:
+            positions = mt5.positions_get(ticket=int(ticket))
+        except Exception as exc:
+            logger.exception("Position query raised for %s: %s", ticket, exc)
+            return None, f"MT5 position query failed: {exc}"
+
+        if positions is None:
+            error = mt5.last_error()
+            logger.error(
+                "MT5 position query failed for %s: %s", ticket, error
+            )
+            return None, f"MT5 position query failed: {error}"
+
+        if len(positions) == 0:
             return None, "Position not found"
 
         position = positions[0]
@@ -879,7 +1056,9 @@ class MT5Connector:
             return None, "Position does not belong to this bot"
 
         if self._symbol_name and position.symbol != self._symbol_name:
-            return None, "Position symbol does not match configured symbol"
+            return None, (
+                "Position symbol does not match configured symbol"
+            )
 
         return position, None
 
@@ -900,13 +1079,13 @@ class MT5Connector:
         if not symbol:
             return OrderResult(
                 success=False,
-                error_message="No trading symbol specified"
+                error_message="No trading symbol specified",
             )
 
         if self._symbol_name and symbol != self._symbol_name:
             return OrderResult(
                 success=False,
-                error_message="Request symbol differs from configured symbol"
+                error_message="Request symbol differs from configured symbol",
             )
 
         payload["symbol"] = symbol
@@ -921,7 +1100,7 @@ class MT5Connector:
             if tick is None or tick.bid <= 0 or tick.ask <= 0:
                 return OrderResult(
                     success=False,
-                    error_message="No valid market quote available"
+                    error_message="No valid market quote available",
                 )
 
             order_type = payload.get("type")
@@ -933,7 +1112,7 @@ class MT5Connector:
             else:
                 return OrderResult(
                     success=False,
-                    error_message="Invalid market order direction"
+                    error_message="Invalid market order direction",
                 )
 
             payload.setdefault("deviation", 20)
@@ -951,14 +1130,13 @@ class MT5Connector:
             ):
                 return OrderResult(
                     success=False,
-                    error_message="Invalid pending order type"
+                    error_message="Invalid pending order type",
                 )
 
-            # Pending orders keep their specified price — do NOT overwrite.
             if "price" not in payload or payload["price"] is None:
                 return OrderResult(
                     success=False,
-                    error_message="Pending order requires a price"
+                    error_message="Pending order requires a price",
                 )
 
             payload.setdefault("type_filling", mt5.ORDER_FILLING_RETURN)
@@ -974,15 +1152,14 @@ class MT5Connector:
             return OrderResult(
                 success=False,
                 error_code=error[0] if error else None,
-                error_message=str(error)
+                error_message=str(error),
             )
 
         accepted_codes = {
             mt5.TRADE_RETCODE_DONE,
-            mt5.TRADE_RETCODE_DONE_PARTIAL
+            mt5.TRADE_RETCODE_DONE_PARTIAL,
         }
 
-        # A pending order may be accepted with PLACED.
         if action == mt5.TRADE_ACTION_PENDING:
             accepted_codes.add(mt5.TRADE_RETCODE_PLACED)
 
@@ -992,7 +1169,7 @@ class MT5Connector:
             logger.error(
                 "MT5 request rejected | retcode=%s | comment=%s",
                 result.retcode,
-                result.comment
+                result.comment,
             )
 
             return OrderResult(
@@ -1005,7 +1182,7 @@ class MT5Connector:
                 error_message=result.comment,
                 retcode=result.retcode,
                 comment=result.comment,
-                deal_id=getattr(result, "deal", None)
+                deal_id=getattr(result, "deal", None),
             )
 
         logger.info(
@@ -1015,7 +1192,7 @@ class MT5Connector:
             getattr(result, "deal", None),
             getattr(result, "volume", None),
             getattr(result, "price", None),
-            result.retcode
+            result.retcode,
         )
 
         return OrderResult(
@@ -1026,7 +1203,7 @@ class MT5Connector:
             price=getattr(result, "price", None),
             retcode=result.retcode,
             comment=result.comment,
-            deal_id=getattr(result, "deal", None)
+            deal_id=getattr(result, "deal", None),
         )
 
     # ---------------------------------------------------------
@@ -1039,7 +1216,7 @@ class MT5Connector:
         if not isinstance(request, dict):
             return OrderResult(
                 success=False,
-                error_message="Order request must be a dictionary"
+                error_message="Order request must be a dictionary",
             )
 
         return self._send_order_request(request)
@@ -1048,14 +1225,14 @@ class MT5Connector:
         self,
         ticket: int,
         sl: Optional[float] = None,
-        tp: Optional[float] = None
+        tp: Optional[float] = None,
     ) -> OrderResult:
         """Modify SL/TP after verifying ownership and broker constraints."""
 
         if sl is None and tp is None:
             return OrderResult(
                 success=False,
-                error_message="No SL or TP modification supplied"
+                error_message="No SL or TP modification supplied",
             )
 
         position, error = self._validate_owned_position(ticket)
@@ -1069,7 +1246,9 @@ class MT5Connector:
         if info is None or tick is None:
             return OrderResult(
                 success=False,
-                error_message="Could not retrieve symbol specifications or tick"
+                error_message=(
+                    "Could not retrieve symbol specifications or tick"
+                ),
             )
 
         digits = info.digits
@@ -1087,26 +1266,34 @@ class MT5Connector:
                 if new_sl >= tick.bid:
                     return OrderResult(
                         success=False,
-                        error_message="BUY stop-loss must be below Bid"
+                        error_message="BUY stop-loss must be below Bid",
                     )
 
-                if tick.bid - new_sl < max(stops_distance, freeze_distance):
+                if tick.bid - new_sl < max(
+                    stops_distance, freeze_distance
+                ):
                     return OrderResult(
                         success=False,
-                        error_message="BUY stop-loss is inside broker stop/freeze distance"
+                        error_message=(
+                            "BUY stop-loss is inside broker "
+                            "stop/freeze distance"
+                        ),
                     )
 
             if new_tp > 0:
                 if new_tp <= tick.bid:
                     return OrderResult(
                         success=False,
-                        error_message="BUY take-profit must be above Bid"
+                        error_message="BUY take-profit must be above Bid",
                     )
 
                 if new_tp - tick.bid < stops_distance:
                     return OrderResult(
                         success=False,
-                        error_message="BUY take-profit is inside broker stop distance"
+                        error_message=(
+                            "BUY take-profit is inside broker "
+                            "stop distance"
+                        ),
                     )
 
         else:
@@ -1114,26 +1301,36 @@ class MT5Connector:
                 if new_sl <= tick.ask:
                     return OrderResult(
                         success=False,
-                        error_message="SELL stop-loss must be above Ask"
+                        error_message="SELL stop-loss must be above Ask",
                     )
 
-                if new_sl - tick.ask < max(stops_distance, freeze_distance):
+                if new_sl - tick.ask < max(
+                    stops_distance, freeze_distance
+                ):
                     return OrderResult(
                         success=False,
-                        error_message="SELL stop-loss is inside broker stop/freeze distance"
+                        error_message=(
+                            "SELL stop-loss is inside broker "
+                            "stop/freeze distance"
+                        ),
                     )
 
             if new_tp > 0:
                 if new_tp >= tick.ask:
                     return OrderResult(
                         success=False,
-                        error_message="SELL take-profit must be below Ask"
+                        error_message=(
+                            "SELL take-profit must be below Ask"
+                        ),
                     )
 
                 if tick.ask - new_tp < stops_distance:
                     return OrderResult(
                         success=False,
-                        error_message="SELL take-profit is inside broker stop distance"
+                        error_message=(
+                            "SELL take-profit is inside broker "
+                            "stop distance"
+                        ),
                     )
 
         request = {
@@ -1142,7 +1339,7 @@ class MT5Connector:
             "symbol": position.symbol,
             "magic": self.trading_config.magic_number,
             "sl": new_sl,
-            "tp": new_tp
+            "tp": new_tp,
         }
 
         return self._send_order_request(request)
@@ -1150,7 +1347,7 @@ class MT5Connector:
     def close_position(
         self,
         ticket: int,
-        volume: Optional[float] = None
+        volume: Optional[float] = None,
     ) -> OrderResult:
         """Close all or part of a bot-owned position."""
 
@@ -1164,7 +1361,9 @@ class MT5Connector:
         if info is None:
             return OrderResult(
                 success=False,
-                error_message="Could not retrieve broker volume specifications"
+                error_message=(
+                    "Could not retrieve broker volume specifications"
+                ),
             )
 
         current_volume = Decimal(str(position.volume))
@@ -1177,7 +1376,10 @@ class MT5Connector:
             if normalized is None:
                 return OrderResult(
                     success=False,
-                    error_message="Requested close volume violates broker volume limits"
+                    error_message=(
+                        "Requested close volume violates broker "
+                        "volume limits"
+                    ),
                 )
 
             close_volume = Decimal(str(normalized))
@@ -1185,20 +1387,22 @@ class MT5Connector:
         if close_volume <= 0 or close_volume > current_volume:
             return OrderResult(
                 success=False,
-                error_message="Close volume exceeds current position volume"
+                error_message=(
+                    "Close volume exceeds current position volume"
+                ),
             )
 
         remaining = current_volume - close_volume
         minimum = Decimal(str(info.volume_min))
 
-        # A partial close must leave either zero or a valid broker position.
         if remaining > 0 and remaining < minimum:
             return OrderResult(
                 success=False,
                 error_message=(
-                    "Partial close would leave less than broker minimum volume. "
-                    "Close the full position or choose a smaller close volume."
-                )
+                    "Partial close would leave less than broker minimum "
+                    "volume. Close the full position or choose a smaller "
+                    "close volume."
+                ),
             )
 
         if remaining > 0:
@@ -1212,7 +1416,10 @@ class MT5Connector:
             if abs(valid_remaining - remaining) > Decimal("0.00000001"):
                 return OrderResult(
                     success=False,
-                    error_message="Remaining position volume would violate broker volume step"
+                    error_message=(
+                        "Remaining position volume would violate "
+                        "broker volume step"
+                    ),
                 )
 
         close_type = (
@@ -1228,7 +1435,7 @@ class MT5Connector:
             "volume": float(close_volume),
             "type": close_type,
             "magic": self.trading_config.magic_number,
-            "comment": "SMC_BOT_CLOSE"
+            "comment": "SMC_BOT_CLOSE",
         }
 
         return self._send_order_request(request)
@@ -1236,12 +1443,27 @@ class MT5Connector:
     def delete_order(self, ticket: int) -> OrderResult:
         """Delete a pending order belonging to this bot."""
 
-        orders = mt5.orders_get(ticket=int(ticket))
-
-        if not orders:
+        try:
+            orders = mt5.orders_get(ticket=int(ticket))
+        except Exception as exc:
+            logger.exception("Order query raised: %s", exc)
             return OrderResult(
                 success=False,
-                error_message="Pending order not found"
+                error_message=f"Order query failed: {exc}",
+            )
+
+        if orders is None:
+            return OrderResult(
+                success=False,
+                error_message=(
+                    f"Order query failed: {mt5.last_error()}"
+                ),
+            )
+
+        if len(orders) == 0:
+            return OrderResult(
+                success=False,
+                error_message="Pending order not found",
             )
 
         order = orders[0]
@@ -1249,13 +1471,15 @@ class MT5Connector:
         if order.magic != self.trading_config.magic_number:
             return OrderResult(
                 success=False,
-                error_message="Pending order does not belong to this bot"
+                error_message="Pending order does not belong to this bot",
             )
 
         if self._symbol_name and order.symbol != self._symbol_name:
             return OrderResult(
                 success=False,
-                error_message="Pending order symbol does not match configured symbol"
+                error_message=(
+                    "Pending order symbol does not match configured symbol"
+                ),
             )
 
         request = {
@@ -1263,7 +1487,7 @@ class MT5Connector:
             "order": int(ticket),
             "symbol": order.symbol,
             "magic": self.trading_config.magic_number,
-            "comment": "SMC_BOT_CANCEL"
+            "comment": "SMC_BOT_CANCEL",
         }
 
         return self._send_order_request(request)
@@ -1273,13 +1497,39 @@ class MT5Connector:
     # ---------------------------------------------------------
 
     def is_connected(self) -> bool:
+        """FIX #3: verify terminal, account, AND account identity.
+
+        If the terminal account switches mid-session, this returns False
+        so the main loop pauses and the health check triggers a reconnect
+        with the configured credentials.
+        """
+
         if not self._initialized:
             return False
 
         terminal = mt5.terminal_info()
         account = mt5.account_info()
 
-        return terminal is not None and account is not None
+        if terminal is None or account is None:
+            return False
+
+        if int(account.login) != int(self.mt5_config.login):
+            logger.error(
+                "Connected account %s != configured login %s",
+                account.login,
+                self.mt5_config.login,
+            )
+            return False
+
+        if str(account.server) != str(self.mt5_config.server):
+            logger.error(
+                "Connected server %r != configured server %r",
+                account.server,
+                self.mt5_config.server,
+            )
+            return False
+
+        return True
 
     def reconnect(self) -> bool:
         logger.warning("Attempting MT5 reconnection...")
@@ -1292,7 +1542,7 @@ class MT5Connector:
             logger.info(
                 "Reconnection attempt %s/%s",
                 attempt + 1,
-                self.mt5_config.retry_attempts
+                self.mt5_config.retry_attempts,
             )
 
             time.sleep(self.mt5_config.retry_delay)
@@ -1306,7 +1556,10 @@ class MT5Connector:
 
     def shutdown(self):
         if self._initialized:
-            mt5.shutdown()
+            try:
+                mt5.shutdown()
+            except Exception:
+                logger.exception("MT5 shutdown raised.")
 
         self._initialized = False
         self._account_info = None

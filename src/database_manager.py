@@ -75,6 +75,25 @@ class TradingSignal(Base):
     status = Column(String(20), default="pending")  # pending, executed, rejected, expired
     executed_order_id = Column(Integer, nullable=True)
     environment = Column(String(20), default="demo")
+    fingerprint = Column(String(64), nullable=True, index=True)
+
+class TradePlan(Base):
+    __tablename__ = "trade_plans"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    timestamp = Column(DateTime, nullable=False, index=True, default=datetime.utcnow)
+    symbol = Column(String(20), nullable=False)
+    direction = Column(String(10), nullable=False)  # BUY, SELL
+    strategy = Column(String(50), nullable=False)
+    entry_price = Column(Float, nullable=False)
+    sl_price = Column(Float, nullable=False)
+    tp_price = Column(Float, nullable=False)
+    risk_reward = Column(Float, nullable=False)
+    status = Column(String(20), default="WAITING")  # WAITING, EXECUTED, INVALIDATED, EXPIRED
+    expiry_time = Column(DateTime, nullable=False)
+    reason = Column(Text, nullable=True)
+    invalidated_reason = Column(Text, nullable=True)
+    environment = Column(String(20), default="demo")
 
 
 class SMCDetection(Base):
@@ -114,6 +133,7 @@ class OrderRequest(Base):
     error_code = Column(Integer, nullable=True)
     error_message = Column(Text, nullable=True)
     environment = Column(String(20), default="demo")
+    fingerprint = Column(String(64), nullable=True, index=True)
     mt5_ticket = Column(BigInteger, nullable=True, index=True)
     expires_at = Column(DateTime, nullable=True)
 
@@ -346,7 +366,6 @@ class ErrorLog(Base):
     resolved = Column(Boolean, default=False)
 
 
-
 class DatabaseManager:
     """Manages database connections, sessions, and safe schema migrations."""
 
@@ -405,7 +424,13 @@ class DatabaseManager:
         logger.info("Database tables created and schema verified")
 
     def _migrate_schema(self):
-        """Additive, idempotent column migrations."""
+        """Additive, idempotent column migrations.
+
+        FIX #27: every DDL statement and backfill runs inside a single
+        `engine.begin()` transaction. Previously the account_snapshots
+        index was created after the with-block exited, which raised
+        ResourceClosedError: "This Connection is closed".
+        """
         migrations_map = {
             "open_positions": {
                 "initial_sl": "FLOAT NOT NULL DEFAULT 0.0",
@@ -419,6 +444,10 @@ class DatabaseManager:
             "order_requests": {
                 "mt5_ticket": "BIGINT",
                 "expires_at": "DATETIME",
+                "fingerprint": "VARCHAR(64)",
+            },
+            "trading_signals": {
+                "fingerprint": "VARCHAR(64)",
             },
         }
 
@@ -428,22 +457,26 @@ class DatabaseManager:
         added_columns: List[str] = []
 
         with self.engine.begin() as connection:
+            # 1. Additive column migrations.
             for table, columns in migrations_map.items():
                 if table not in table_names:
                     continue
 
                 existing = {
-                    c["name"] for c in inspector.get_columns(table)
+                    col["name"] for col in inspector.get_columns(table)
                 }
-                for col_name, col_def in columns.items():
-                    if col_name not in existing:
-                        connection.exec_driver_sql(
-                            f'ALTER TABLE "{table}" ADD COLUMN '
-                            f'"{col_name}" {col_def}'
-                        )
-                        added_columns.append(f"{table}.{col_name}")
 
-            # Backfill open_positions (unchanged).
+                for col_name, col_def in columns.items():
+                    if col_name in existing:
+                        continue
+
+                    connection.exec_driver_sql(
+                        f'ALTER TABLE "{table}" ADD COLUMN '
+                        f'"{col_name}" {col_def}'
+                    )
+                    added_columns.append(f"{table}.{col_name}")
+
+            # 2. Backfill defaults for the new columns.
             if "open_positions" in table_names:
                 connection.execute(text("""
                     UPDATE open_positions
@@ -466,6 +499,37 @@ class DatabaseManager:
                     WHERE initial_risk_distance = 0
                       AND initial_sl != 0
                 """))
+
+            # 3. Optional compound index for daily-loss queries.
+            if "account_snapshots" in table_names:
+                try:
+                    connection.exec_driver_sql(
+                        "CREATE INDEX IF NOT EXISTS ix_snapshots_env_ts "
+                        "ON account_snapshots (environment, timestamp)"
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not create ix_snapshots_env_ts (non-fatal)"
+                    )
+                    
+            # 4. Indexes for duplicate-order prevention
+            if "trading_signals" in table_names:
+                try:
+                    connection.exec_driver_sql(
+                        "CREATE INDEX IF NOT EXISTS ix_trading_signals_fp "
+                        "ON trading_signals (fingerprint)"
+                    )
+                except Exception:
+                    logger.exception("Could not create trading_signals_fp index (non-fatal)")
+
+            if "order_requests" in table_names:
+                try:
+                    connection.exec_driver_sql(
+                        "CREATE INDEX IF NOT EXISTS ix_order_requests_fp "
+                        "ON order_requests (fingerprint)"
+                    )
+                except Exception:
+                    logger.exception("Could not create order_requests_fp index (non-fatal)")
 
         if added_columns:
             logger.info(

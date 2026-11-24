@@ -1,27 +1,29 @@
-
 """Main trading agent - DEMO and LIVE orchestration with account safeguards."""
 
 import asyncio
 import os
 import signal
 import time
-from datetime import datetime, timezone
+import psutil
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import src.logger as logger_module
 
 from src.config_loader import config
 from src.logger import setup_logging, get_logger
-from src.database_manager import db_manager, AccountSnapshot
+from src.database_manager import db_manager, AccountSnapshot, TradePlan
 from src.mt5_connector import mt5_connector, mt5
 from src.market_data import market_data
-from src.smc_strategy import smc_engine
+from src.smc_strategy import smc_engine, SignalDirection, StrategyType, TradeSignal
 from src.risk_manager import risk_manager
 from src.trade_manager import trade_manager
 from src.order_executor import order_executor
 from src.session_filter import session_filter
 from src.news_filter import news_filter
 from src.telegram_bot import telegram_bot
+from src.signal_validator import signal_validator
 
 
 logger = get_logger(__name__)
@@ -62,6 +64,10 @@ class TradingAgent:
         self._telegram_logging_started = False
         self._market_data_started = False
         self._mt5_started = False
+        
+        # MILESTONE 11: Single-Instance Lock
+        self._lock_file = Path("bot.lock")
+        self._lock_acquired = False
 
     # =========================================================
     # MODE AND ACCOUNT VERIFICATION
@@ -167,6 +173,11 @@ class TradingAgent:
     def _verify_current_connection(self):
         if not mt5_connector.is_connected():
             raise RuntimeError("MT5 is disconnected.")
+
+        if not mt5_connector.update_account_info():
+            raise RuntimeError(
+                "Could not refresh MT5 account information."
+            )
 
         account = mt5_connector.get_account_info()
         self._verify_connected_account(account)
@@ -317,6 +328,21 @@ class TradingAgent:
     # =========================================================
 
     async def start(self):
+        # --- MILESTONE 11: SINGLE-INSTANCE LOCK ---
+        if self._lock_file.exists():
+            try:
+                pid = int(self._lock_file.read_text().strip())
+                # Check if the process is actually still running
+                if psutil.pid_exists(pid):
+                    logger.critical(f"ABORTING: Another bot instance is already running (PID: {pid}).")
+                    return False
+            except Exception:
+                pass  # If the file is corrupt or psutil fails, overwrite it
+                
+        self._lock_file.write_text(str(os.getpid()))
+        self._lock_acquired = True
+        # ------------------------------------------
+
         logger.info("=" * 65)
         logger.info("Starting XAU/USD SMC Trading Agent")
         logger.info("=" * 65)
@@ -353,8 +379,6 @@ class TradingAgent:
                     "Continuing without Telegram."
                 )
 
-            # Start the managed Telegram logging worker only after
-            # Telegram initialization has configured its bot instance.
             if self._telegram_ready:
                 handler = logger_module.telegram_handler
 
@@ -405,10 +429,7 @@ class TradingAgent:
             self._market_data_started = True
 
             logger.info("Market data engine started.")
-            # Reconcile any pending orders from a previous run BEFORE
-            # trade_manager.sync_with_mt5() runs. If a pending order filled
-            # while the bot was offline, reconciliation creates the
-            # ExecutedOrder / OpenPosition rows that sync_with_mt5 needs.
+
             try:
                 order_executor.reconcile_pending_orders()
             except Exception:
@@ -418,10 +439,7 @@ class TradingAgent:
 
             self._recover_state()
 
-            self._recover_state()
-
             self._last_health_check = time.time()
-
             self._last_daily_report_date = datetime.now(
                 timezone.utc
             ).date()
@@ -484,9 +502,7 @@ class TradingAgent:
 
         positions = self._get_positions_or_raise()
 
-        result = trade_manager.sync_with_mt5()
-
-        if result is False:
+        if not trade_manager.sync_with_mt5():
             raise RuntimeError(
                 "Trade manager failed to synchronize MT5 positions."
             )
@@ -524,19 +540,13 @@ class TradingAgent:
                     continue
 
                 market_data.update_live_data()
-                market_data.update_live_data()
 
-                # Reconcile pending order state BEFORE position management.
-                # This promotes filled orders to open positions and marks
-                # expired/cancelled orders as gone.
                 try:
                     order_executor.reconcile_pending_orders()
                 except Exception:
                     logger.exception(
                         "Pending-order reconciliation failed."
                     )
-
-                today = datetime.now(timezone.utc).date()
 
                 today = datetime.now(timezone.utc).date()
 
@@ -549,8 +559,9 @@ class TradingAgent:
                 if not self._paused and self._should_analyze():
                     await self._trading_cycle()
 
-                # Continue managing existing bot positions even when
-                # new entries are paused, provided MT5 is connected.
+                if not self._paused:
+                    await self._process_trade_plans()
+
                 await self._manage_positions()
 
                 self._error_count = max(
@@ -596,10 +607,11 @@ class TradingAgent:
         )
 
     # =========================================================
-    # SIGNAL GENERATION AND EXECUTION
+    # SIGNAL GENERATION AND TRADE PLAN CREATION
     # =========================================================
 
     async def _trading_cycle(self):
+        """Phase 1 & 2: Market Analysis and Trade Plan Creation."""
         self._last_analysis_time = time.time()
 
         if not self._check_entry_permission():
@@ -635,80 +647,149 @@ class TradingAgent:
         )
 
         for trading_signal in signals:
-            if not self._check_entry_permission():
-                logger.warning(
-                    "SIGNAL EXECUTION | Stopped because entry permission failed."
-                )
+            try:
+                with db_manager.get_session() as session:
+                    existing = session.query(TradePlan).filter(
+                        TradePlan.environment == self._current_mode.lower(),
+                        TradePlan.symbol == trading_signal.symbol,
+                        TradePlan.direction == trading_signal.direction.value,
+                        TradePlan.strategy == trading_signal.strategy.value,
+                        TradePlan.entry_price == trading_signal.entry_price,
+                        TradePlan.status == "WAITING"
+                    ).first()
+
+                    if existing:
+                        continue
+
+                    plan = TradePlan(
+                        timestamp=datetime.now(timezone.utc),
+                        symbol=trading_signal.symbol,
+                        direction=trading_signal.direction.value,
+                        strategy=trading_signal.strategy.value,
+                        entry_price=trading_signal.entry_price,
+                        sl_price=trading_signal.sl_price,
+                        tp_price=trading_signal.tp_price,
+                        risk_reward=trading_signal.risk_reward,
+                        status="WAITING",
+                        expiry_time=datetime.now(timezone.utc) + timedelta(hours=config.trading.pending_expiry_hours),
+                        reason=str([c.details for c in trading_signal.confirmations]),
+                        environment=self._current_mode.lower()
+                    )
+                    session.add(plan)
+                    logger.info(
+                        "TRADE PLAN CREATED | %s %s @ %.5f | Strategy: %s",
+                        plan.direction,
+                        plan.symbol,
+                        plan.entry_price,
+                        plan.strategy
+                    )
+            except Exception:
+                logger.exception("Failed to create TradePlan")
+
+    # =========================================================
+    # TRADE PLAN PROCESSING
+    # =========================================================
+
+    async def _process_trade_plans(self):
+        """Phase 3, 4, 5 & 6: Wait for price, Reconfirm setup, Risk Validation, Execution."""
+        try:
+            now = datetime.now(timezone.utc)
+            current_tick = market_data.get_current_tick()
+            if not current_tick:
                 return
+            
+            bid = current_tick["bid"]
+            ask = current_tick["ask"]
 
-            logger.info(
-                "SIGNAL EXECUTION | Submitting signal to order executor."
-            )
+            with db_manager.get_session() as session:
+                plans = session.query(TradePlan).filter(
+                    TradePlan.environment == self._current_mode.lower(),
+                    TradePlan.status == "WAITING"
+                ).all()
 
-            result = order_executor.execute_signal(
-                trading_signal
-            )
+                for plan in plans:
+                    if now >= plan.expiry_time:
+                        plan.status = "EXPIRED"
+                        plan.invalidated_reason = "Time expired"
+                        logger.info(
+                            "TRADE PLAN EXPIRED | %s %s", 
+                            plan.direction, 
+                            plan.entry_price
+                        )
+                        continue
 
-            if result.success:
-                if result.error:
-                    logger.critical(
-                        "ORDER RECONCILIATION ERROR | %s",
-                        result.error
-                    )
-                    self._pause_trading()
-                    if self._telegram_ready:
-                        await telegram_bot.notify_error(result.error)
-                    return
+                    entry_reached = False
+                    if plan.direction == "BUY":
+                        if ask <= plan.entry_price:
+                            entry_reached = True
+                    elif plan.direction == "SELL":
+                        if bid >= plan.entry_price:
+                            entry_reached = True
 
-                if result.pending:
-                    logger.info(
-                        "ORDER PLACED (PENDING LIMIT) | ticket=%s | "
-                        "Signal ID: %s | waiting for price to return.",
-                        result.pending_order_ticket,
-                        result.signal_id,
-                    )
-                    if self._telegram_ready:
-                        try:
-                            notifier = getattr(
-                                telegram_bot,
-                                "notify_order_pending",
-                                None,
-                            )
-                            if notifier is not None:
-                                await notifier(trading_signal, result)
-                            else:
-                                logger.debug(
-                                    "telegram_bot has no notify_order_pending; "
-                                    "skipping notification"
-                                )
-                        except Exception:
-                            logger.exception(
-                                "Pending-order Telegram notification failed."
-                            )
-                else:
-                    # Immediate fill (rare for limit orders).
-                    logger.info(
-                        "ORDER FILLED IMMEDIATELY | Signal ID: %s",
-                        result.signal_id,
-                    )
-                    if self._telegram_ready:
-                        await telegram_bot.notify_new_trade(
-                            trading_signal, result
+                    if entry_reached:
+                        logger.info(
+                            "TRADE PLAN READY | Price reached entry for %s %s @ %.5f",
+                            plan.direction,
+                            plan.symbol,
+                            plan.entry_price
+                        )
+                        
+                        signal = TradeSignal(
+                            timestamp=now,
+                            symbol=plan.symbol,
+                            direction=SignalDirection(plan.direction),
+                            entry_price=plan.entry_price,
+                            sl_price=plan.sl_price,
+                            tp_price=plan.tp_price,
+                            lot_size=0.0,
+                            risk_percent=config.risk.default_risk_percent,
+                            risk_reward=plan.risk_reward,
+                            strategy=StrategyType(plan.strategy),
+                            confirmations=[],
+                            timeframe_analysis={},
+                            entry_tf="m5",
+                            setup_tf="m15",
+                            structure_tf="h1",
+                            bias_tf="h4"
                         )
 
-                # One order placement per analysis cycle.
-                break
+                        validation = signal_validator.validate_signal(signal, market_entry=True)
+                        if not validation.valid:
+                            plan.status = "INVALIDATED"
+                            plan.invalidated_reason = validation.reason
+                            logger.warning(
+                                "TRADE PLAN INVALIDATED AT ENTRY | %s",
+                                validation.reason
+                            )
+                            continue
 
-            logger.warning(
-                "ORDER REJECTED | %s",
-                result.error or "Unknown execution error"
-            )
+                        result = order_executor.execute_signal(signal, market_entry=True)
+                        
+                        if result.success:
+                            plan.status = "EXECUTED"
+                            logger.info(
+                                "TRADE PLAN EXECUTED | %s %s @ %.5f",
+                                plan.direction,
+                                plan.symbol,
+                                plan.entry_price
+                            )
+                            if self._telegram_ready:
+                                await telegram_bot.notify_new_trade(signal, result)
+                        else:
+                            plan.status = "INVALIDATED"
+                            plan.invalidated_reason = result.error
+                            logger.warning(
+                                "TRADE PLAN EXECUTION FAILED | %s",
+                                result.error
+                            )
+                            if self._telegram_ready:
+                                await telegram_bot.notify_order_rejected(
+                                    signal,
+                                    result.error or "Unknown error"
+                                )
 
-            if self._telegram_ready:
-                await telegram_bot.notify_order_rejected(
-                    trading_signal,
-                    result.error or "Unknown execution error"
-                )
+        except Exception:
+            logger.exception("Failed to process trade plans.")
 
     # =========================================================
     # POSITION MANAGEMENT
@@ -750,11 +831,29 @@ class TradingAgent:
         return price if price > 0 else None
 
     async def _manage_positions(self):
+        try:
+            risk_status = risk_manager.check_risk_limits()
+            checks = risk_status.get("checks", {})
+            
+            if checks.get("emergency") is False:
+                logger.critical(
+                    "EMERGENCY DRAWDOWN BREACHED. Closing all positions and activating kill switch."
+                )
+                order_executor.close_all_positions(reason="EMERGENCY_DRAWDOWN")
+                risk_manager.set_kill_switch(True, "Emergency drawdown threshold breached")
+                self._pause_trading()
+                
+                if self._telegram_ready:
+                    await telegram_bot.notify_error(
+                        "EMERGENCY: Maximum drawdown breached. All positions closed. Kill switch activated."
+                    )
+                return
+        except Exception:
+            logger.exception("Failed to check emergency drawdown status.")
+
         positions = self._get_positions_or_raise()
 
         for position in positions:
-            # Only manage positions positively identified as belonging
-            # to this bot. Never manage unknown/manual positions.
             position_magic = position.get("magic")
 
             if position_magic is None:
@@ -764,16 +863,11 @@ class TradingAgent:
                 )
                 continue
 
-            if int(position_magic) != int(
-                config.trading.magic_number
-            ):
+            if int(position_magic) != int(config.trading.magic_number):
                 continue
 
             ticket = int(position["ticket"])
-
-            current_price = self._get_management_price(
-                position
-            )
+            current_price = self._get_management_price(position)
 
             if current_price is None:
                 logger.warning(
@@ -813,13 +907,8 @@ class TradingAgent:
             )
 
             if trail_action and trail_action.success:
-                state = trade_manager.get_position_state(
-                    ticket
-                )
-
-                highest_r = (
-                    state["highest_r"] if state else 0.0
-                )
+                state = trade_manager.get_position_state(ticket)
+                highest_r = state["highest_r"] if state else 0.0
 
                 logger.info(
                     "TRAILING STOP | Position %s | New SL: %s",
@@ -841,13 +930,8 @@ class TradingAgent:
 
             for action in partial_actions or []:
                 if action.success:
-                    state = trade_manager.get_position_state(
-                        ticket
-                    )
-
-                    highest_r = (
-                        state["highest_r"] if state else 0.0
-                    )
+                    state = trade_manager.get_position_state(ticket)
+                    highest_r = state["highest_r"] if state else 0.0
 
                     logger.info(
                         "PARTIAL TAKE PROFIT | Position %s",
@@ -874,15 +958,13 @@ class TradingAgent:
                     ticket
                 )
 
-                close_result = order_executor.close_position(
-                    ticket
-                )
+                close_result = order_executor.close_position(ticket)
 
-                if not close_result:
+                if not close_result or not close_result.success:
                     logger.error(
-                        "Could not close position %s after "
-                        "maximum holding time.",
-                        ticket
+                        "Could not close position %s after maximum holding time: %s",
+                        ticket,
+                        getattr(close_result, "error_message", "unknown error"),
                     )
 
                     self._pause_trading()
@@ -929,9 +1011,7 @@ class TradingAgent:
         self._save_account_snapshot()
 
         if self._paused and not self._shutdown_requested:
-            if self._check_entry_permission(
-                allow_paused=True
-            ):
+            if self._check_entry_permission(allow_paused=True):
                 self._paused = False
                 self._error_count = 0
 
@@ -945,9 +1025,7 @@ class TradingAgent:
 
     def _pause_trading(self):
         if not self._paused:
-            logger.warning(
-                "New trading entries paused."
-            )
+            logger.warning("New trading entries paused.")
 
         self._paused = True
 
@@ -958,21 +1036,14 @@ class TradingAgent:
             )
             return
 
-        if self._check_entry_permission(
-            allow_paused=True
-        ):
+        if self._check_entry_permission(allow_paused=True):
             self._paused = False
             self._error_count = 0
 
-            logger.info(
-                "Trading entries resumed through Telegram."
-            )
+            logger.info("Trading entries resumed through Telegram.")
         else:
             self._paused = True
-
-            logger.warning(
-                "Resume rejected. One or more entry checks failed."
-            )
+            logger.warning("Resume rejected. One or more entry checks failed.")
 
     def _request_shutdown(self):
         logger.info("Shutdown requested.")
@@ -992,77 +1063,56 @@ class TradingAgent:
 
         logger.info("Shutting down trading agent...")
 
-        # Save the final account state before disconnecting MT5.
-        if (
-            self._mt5_started
-            and mt5_connector.is_connected()
-        ):
+        if self._mt5_started and mt5_connector.is_connected():
             try:
                 self._save_account_snapshot()
             except Exception:
-                logger.exception(
-                    "Final account snapshot could not be saved."
-                )
+                logger.exception("Final account snapshot could not be saved.")
 
-        # Send the shutdown notification while Telegram is available.
         if self._telegram_ready:
             try:
                 await telegram_bot.notify_shutdown()
             except Exception:
-                logger.exception(
-                    "Shutdown notification failed."
-                )
+                logger.exception("Shutdown notification failed.")
 
-        # Stop market data before disconnecting MT5.
         if self._market_data_started:
             try:
                 market_data.stop()
             except Exception:
-                logger.exception(
-                    "Market data shutdown failed."
-                )
-
+                logger.exception("Market data shutdown failed.")
             self._market_data_started = False
 
-        # Disconnect MT5.
         if self._mt5_started:
             try:
                 mt5_connector.shutdown()
             except Exception:
-                logger.exception(
-                    "MT5 shutdown failed."
-                )
-
+                logger.exception("MT5 shutdown failed.")
             self._mt5_started = False
 
-        # CRITICAL: Drain Telegram logging messages before the
-        # Telegram HTTP client is closed.
         if self._telegram_logging_started:
             handler = logger_module.telegram_handler
-
             if handler:
                 try:
                     await handler.shutdown_async()
                 except Exception:
-                    logger.exception(
-                        "Telegram logging handler shutdown failed."
-                    )
-
+                    logger.exception("Telegram logging handler shutdown failed.")
             self._telegram_logging_started = False
 
-        # Close the Telegram bot only after the logging worker stops.
         try:
             await telegram_bot.shutdown()
         except Exception:
-            logger.exception(
-                "Telegram shutdown failed."
-            )
+            logger.exception("Telegram shutdown failed.")
 
         self._telegram_ready = False
-
-        logger.info(
-            "Trading agent shutdown complete."
-        )
+        
+        # MILESTONE 11: Release the lock
+        if getattr(self, '_lock_acquired', False) and self._lock_file.exists():
+            try:
+                self._lock_file.unlink()
+            except Exception:
+                pass
+                
+        logger.info("Trading agent shutdown complete.")
 
 
 # =============================================================
@@ -1071,26 +1121,15 @@ class TradingAgent:
 
 async def main():
     setup_logging()
-
     agent = TradingAgent()
 
     def signal_handler(signum, frame):
-        logger.info(
-            "Received operating-system signal: %s",
-            signum
-        )
+        logger.info("Received operating-system signal: %s", signum)
         agent._request_shutdown()
 
-    signal.signal(
-        signal.SIGINT,
-        signal_handler
-    )
-
+    signal.signal(signal.SIGINT, signal_handler)
     if hasattr(signal, "SIGTERM"):
-        signal.signal(
-            signal.SIGTERM,
-            signal_handler
-        )
+        signal.signal(signal.SIGTERM, signal_handler)
 
     await agent.start()
 

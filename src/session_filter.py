@@ -126,17 +126,26 @@ class SessionFilter:
         return opening, closing
 
     def _is_active(self, name: str, now: datetime) -> bool:
-        """Check today's and yesterday's session windows."""
+        """Check today's and yesterday's session windows.
+
+        FIX#19: refuse all sessions on Saturday and Sunday. XAU/USD spot
+        markets are closed, but hourly schedule windows would otherwise
+        report London/NY/Asia as active.
+        """
         item = self._schedule[name]
 
         if not item["enabled"]:
+            return False
+
+    # FIX #19: no weekend trading.
+        if now.weekday() >= 5:
             return False
 
         for offset in (-1, 0):
             session_date = (now + timedelta(days=offset)).date()
             opening, closing = self._session_datetimes(
                 name,
-                session_date
+                session_date,
             )
 
             if opening <= now < closing:

@@ -1,0 +1,75 @@
+﻿[DIR ] config
+[DIR ] dashboard
+[DIR ] dashboard\backend
+[DIR ] dashboard\frontend
+[DIR ] dashboard\frontend\src
+[DIR ] dashboard\frontend\src\components
+[DIR ] dashboard\frontend\src\hooks
+[DIR ] dashboard\frontend\src\pages
+[DIR ] dashboard\frontend\src\services
+[DIR ] dashboard\frontend\src\styles
+[DIR ] dashboard\frontend\src\utils
+[DIR ] data
+[DIR ] database
+[DIR ] logs
+[DIR ] src
+[DIR ] src\backtesting
+[DIR ] tests
+[FILE] .env
+[FILE] .env.example
+[FILE] .gitignore
+[FILE] config\logging.yaml
+[FILE] config\settings.yaml
+[FILE] dashboard\backend\main.py
+[FILE] dashboard\frontend\index.html
+[FILE] dashboard\frontend\package.json
+[FILE] dashboard\frontend\package-lock.json
+[FILE] dashboard\frontend\src\App.jsx
+[FILE] dashboard\frontend\src\components\DashboardComponents.jsx
+[FILE] dashboard\frontend\src\components\Layout.css
+[FILE] dashboard\frontend\src\components\Layout.jsx
+[FILE] dashboard\frontend\src\hooks\useLiveUpdate.js
+[FILE] dashboard\frontend\src\main.jsx
+[FILE] dashboard\frontend\src\pages\Backtesting.jsx
+[FILE] dashboard\frontend\src\pages\Dashboard.jsx
+[FILE] dashboard\frontend\src\pages\History.jsx
+[FILE] dashboard\frontend\src\pages\Performance.jsx
+[FILE] dashboard\frontend\src\pages\Positions.jsx
+[FILE] dashboard\frontend\src\pages\Settings.jsx
+[FILE] dashboard\frontend\src\services\api.js
+[FILE] dashboard\frontend\src\services\websocket.js
+[FILE] dashboard\frontend\src\styles\main.css
+[FILE] dashboard\frontend\src\utils\format.js
+[FILE] dashboard\frontend\vite.config.js
+[FILE] data\economic_calendar.json
+[FILE] database\trading.db
+[FILE] logs\errors.log
+[FILE] logs\trading.log
+[FILE] README.md
+[FILE] requirements.txt
+[FILE] src\backtesting\__init__.py
+[FILE] src\backtesting\engine.py
+[FILE] src\backtesting\metrics.py
+[FILE] src\backtesting\reports.py
+[FILE] src\config_loader.py
+[FILE] src\database_manager.before_final_fix.py
+[FILE] src\database_manager.py
+[FILE] src\fair_value_gaps.py
+[FILE] src\indicators.py
+[FILE] src\liquidity.py
+[FILE] src\logger.py
+[FILE] src\main.py
+[FILE] src\market_data.py
+[FILE] src\market_structure.py
+[FILE] src\mt5_connector.py
+[FILE] src\news_filter.py
+[FILE] src\order_blocks.py
+[FILE] src\order_executor.py
+[FILE] src\premium_discount.py
+[FILE] src\risk_manager.py
+[FILE] src\session_filter.py
+[FILE] src\signal_validator.py
+[FILE] src\smc_strategy.py
+[FILE] src\telegram_bot.py
+[FILE] src\trade_manager.py
+[FILE] tests\test_mt5_connector.py

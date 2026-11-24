@@ -3,12 +3,13 @@
 All external dependencies (MT5, config, market_data, DB) are mocked.
 """
 
+from pathlib import Path
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import Mock, patch
 
 import numpy as np
-
+import tempfile
 from src.config_loader import config
 from src.mt5_connector import AccountInfo, MT5Connector, OrderResult
 from src.risk_manager import RiskManager
@@ -211,16 +212,69 @@ class TestMT5Connector(unittest.TestCase):
 
         _apply_mt5_constants(mock_mt5)
 
+        real_login = int(config.mt5.login) if config.mt5.login else 12345
+        real_server = config.mt5.server or "XMGlobal-MT5 5"
+
         self.connector._initialized = True
         mock_mt5.terminal_info.return_value = Mock()
         mock_mt5.account_info.return_value = _make_account_mock(
+            login=real_login,
+            server=real_server,
             trade_mode=mock_mt5.ACCOUNT_TRADE_MODE_REAL,
         )
 
         result = self.connector.verify_connection()
 
         self.assertFalse(result)
-        self.assertIn("Real account", self.connector.get_last_error() or "")
+        err = (self.connector.get_last_error() or "").lower()
+    # The new mode<->account-type gate fires before demo_only, so accept
+    # either message; both correctly refuse a real account in DEMO mode.
+        self.assertTrue(
+            "real" in err or "mismatch" in err,
+            f"Unexpected rejection reason: {err!r}",
+        )
+
+    @patch("src.mt5_connector.mt5")
+    def test_live_mode_rejects_demo_account(self, mock_mt5):
+        """LIVE mode must never accept a DEMO account."""
+        _apply_mt5_constants(mock_mt5)
+
+        real_login = int(config.mt5.login) if config.mt5.login else 12345
+        real_server = config.mt5.server or "XMGlobal-MT5 5"
+
+        self.connector._initialized = True
+        mock_mt5.terminal_info.return_value = Mock()
+        mock_mt5.account_info.return_value = _make_account_mock(
+            login=real_login,
+            server=real_server,
+            trade_mode=mock_mt5.ACCOUNT_TRADE_MODE_DEMO,
+        )
+
+        original_mode = config.trading.mode
+
+        with patch.object(
+            type(config), "trading_mode", return_value="LIVE"
+        ), patch.object(
+            type(config),
+            "trading",
+            new_callable=lambda: Mock(
+                mode="LIVE", symbol="XAUUSD",
+                risk_percent=1.0, min_risk_reward=2.0,
+                magic_number=123456789, max_positions=3,
+                max_daily_trades=20, max_daily_loss_percent=5.0,
+                max_drawdown_percent=10.0, max_consecutive_losses=5,
+                max_holding_hours=48, entry_order_type="limit",
+                pending_expiry_hours=4, max_pending_orders=5,
+            ),
+        ):
+            result = self.connector.verify_connection()
+
+        self.assertFalse(result)
+        err = (self.connector.get_last_error() or "").lower()
+        self.assertTrue(
+            "live" in err and "demo" in err,
+            f"LIVE mode should reject a DEMO account, got: {err!r}",
+        )
 
     # --- order submission ---
 
@@ -228,11 +282,16 @@ class TestMT5Connector(unittest.TestCase):
         """Set up connector + mock_mt5 so _trading_precheck passes."""
         _apply_mt5_constants(mock_mt5)
 
+    # Use the actual configured credentials so the connector's
+    # new account-identity checks (login + server + mode) pass.
+        real_login = int(config.mt5.login) if config.mt5.login else 12345
+        real_server = config.mt5.server or "XMGlobal-MT5 5"
+
         self.connector._initialized = True
         self.connector._symbol_name = "XAUUSD"
         self.connector._account_info = AccountInfo(
-            login=12345,
-            server="XMGlobal-MT5 5",
+            login=real_login,
+            server=real_server,
             name="Test",
             company="XM",
             currency="USD",
@@ -251,6 +310,8 @@ class TestMT5Connector(unittest.TestCase):
 
         mock_mt5.terminal_info.return_value = Mock()
         mock_mt5.account_info.return_value = _make_account_mock(
+            login=real_login,
+            server=real_server,
             trade_mode=mock_mt5.ACCOUNT_TRADE_MODE_DEMO,
         )
         mock_mt5.symbol_info.return_value = _make_symbol_mock()
@@ -335,12 +396,17 @@ class TestRiskManager(unittest.TestCase):
             volume_min=volume_min,
             volume_max=volume_max,
             volume_step=volume_step,
+            margin_initial=0.0,
         )
 
     @patch("src.risk_manager.mt5_connector")
     def test_calculate_position_size_buy(self, mock_mt5):
         mock_mt5.is_connected.return_value = True
-        mock_mt5.get_account_info.return_value = Mock(equity=10000.0)
+        mock_mt5.get_account_info.return_value = Mock(
+            equity=10000.0,
+            free_margin=10000.0,
+            leverage=100
+        )
         mock_mt5.get_symbol_info.return_value = self._symbol_info()
         mock_mt5.get_positions.return_value = []
 
@@ -358,7 +424,11 @@ class TestRiskManager(unittest.TestCase):
     @patch("src.risk_manager.mt5_connector")
     def test_calculate_position_size_sell(self, mock_mt5):
         mock_mt5.is_connected.return_value = True
-        mock_mt5.get_account_info.return_value = Mock(equity=10000.0)
+        mock_mt5.get_account_info.return_value = Mock(
+            equity=10000.0,
+            free_margin=10000.0,
+            leverage=100,
+        )
         mock_mt5.get_symbol_info.return_value = self._symbol_info()
         mock_mt5.get_positions.return_value = []
 
@@ -564,6 +634,34 @@ class TestSignalValidator(unittest.TestCase):
             print(f"Checks: {result.checks}")
 
         self.assertTrue(result.valid, f"Validation failed: {result.reason}")
+
+    # ---------------------------------------------------------------------------
+# Database migration
+# ---------------------------------------------------------------------------
+
+class TestDatabaseMigration(unittest.TestCase):
+
+    def test_create_tables_is_idempotent(self):
+        """FIX #27: create_tables must run twice on the same DB."""
+        import tempfile
+        from pathlib import Path
+        from src.database_manager import DatabaseManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_url = f"sqlite:///{Path(tmp) / 'test.db'}"
+
+            manager = DatabaseManager(database_url=db_url)
+
+            # First call: full create + migrate.
+            manager.create_tables()
+
+            # Second call: must be a no-op, not ResourceClosedError.
+            manager.create_tables()
+
+            # Third call, just to be sure.
+            manager.create_tables()
+
+            manager.close()
 
 
 if __name__ == "__main__":

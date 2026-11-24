@@ -7,6 +7,7 @@ orders expire or are cancelled. This module reconciles MT5 pending order
 state with the database every cycle.
 """
 
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
@@ -47,15 +48,15 @@ class OrderExecutor:
     def __init__(self):
         self.trading_config = config.trading
         self.magic_number = self.trading_config.magic_number
-        # NEW: derive environment from config so LIVE trades are recorded as LIVE
+        # derive environment from config so LIVE trades are recorded as LIVE
         self.ENVIRONMENT = config.trading.mode.lower()
 
     # ==================================================================
     # 1. Public entry point
     # ==================================================================
 
-    def execute_signal(self, signal) -> ExecutionResult:
-        """Validate, size, place a pending limit order, and persist it."""
+    def execute_signal(self, signal, market_entry: bool = False) -> ExecutionResult:
+        """Validate, size, place a pending limit order or market order, and persist it."""
 
         if not mt5_connector.is_connected():
             return ExecutionResult(success=False, error="MT5 is not connected.")
@@ -67,7 +68,7 @@ class OrderExecutor:
             )
 
         try:
-            validation = signal_validator.validate_signal(signal)
+            validation = signal_validator.validate_signal(signal, market_entry=market_entry)
         except Exception as exc:
             logger.exception("Signal validation raised an exception.")
             return ExecutionResult(
@@ -111,7 +112,17 @@ class OrderExecutor:
 
         signal.lot_size = position_size.lot_size
 
-        # Persist signal BEFORE talking to the broker.
+        fingerprint = self._generate_fingerprint(signal)
+        signal.fingerprint = fingerprint
+
+        if self._is_duplicate(fingerprint):
+            logger.warning("Duplicate signal rejected: fingerprint %s", fingerprint)
+            return ExecutionResult(
+                success=False,
+                validation=validation,
+                error="Duplicate signal already active or recently executed.",
+            )
+
         try:
             signal_id = self._save_signal(signal, position_size, validation)
         except Exception as exc:
@@ -123,9 +134,8 @@ class OrderExecutor:
                 error=f"Could not save signal. Order was not submitted: {exc}",
             )
 
-        # Build pending request and persist BEFORE submission.
         try:
-            order_request = self._prepare_order_request(signal, position_size)
+            order_request = self._prepare_order_request(signal, position_size, market_entry=market_entry)
             request_id = self._save_order_request(signal_id, order_request)
         except Exception as exc:
             logger.exception("Could not prepare or persist order request.")
@@ -137,14 +147,11 @@ class OrderExecutor:
                 error=f"Could not prepare order request: {exc}",
             )
 
-        # Submit exactly once — never auto-retry an uncertain broker response.
         try:
             order_result = mt5_connector.send_order(order_request)
         except Exception as exc:
             logger.exception("MT5 order submission raised an exception.")
-            self._update_order_request_error(
-                request_id, f"Submission exception: {exc}"
-            )
+            self._update_order_request_error(request_id, f"Submission exception: {exc}")
             return ExecutionResult(
                 success=False,
                 signal_id=signal_id,
@@ -156,9 +163,7 @@ class OrderExecutor:
         try:
             self._update_order_request(request_id, order_result)
         except Exception:
-            logger.exception(
-                "Could not update order-request record after MT5 response."
-            )
+            logger.exception("Could not update order-request record after MT5 response.")
 
         if not order_result.success:
             error = (
@@ -176,24 +181,38 @@ class OrderExecutor:
                 error=error,
             )
 
-        # Limit order accepted. It is now WAITING in MT5 — not yet filled.
         pending_ticket = (
             getattr(order_result, "order_id", None)
             or getattr(order_result, "ticket", None)
         )
 
+        is_pending = not market_entry
+        position_ticket = pending_ticket or 0
+
         logger.info(
-            "PENDING ORDER PLACED | ticket=%s | %s %s @ %.5f | vol=%.2f | "
-            "SL=%.5f | TP=%.5f | expires in %sh",
-            pending_ticket,
+            "%s | ticket=%s | %s %s @ %.5f | vol=%.2f | SL=%.5f | TP=%.5f",
+            "PENDING ORDER PLACED" if is_pending else "MARKET ORDER FILLED",
+            position_ticket,
             signal.direction.value,
             signal.symbol,
             signal.entry_price,
             position_size.lot_size,
             signal.sl_price,
             signal.tp_price,
-            config.trading.pending_expiry_hours,
         )
+
+        if not is_pending:
+            # Immediate fill bookkeeping
+            positions = mt5_connector.get_positions()
+            if positions:
+                for pos in positions:
+                    if pos["ticket"] == position_ticket or (pos["symbol"] == signal.symbol and pos["magic"] == self.magic_number):
+                        fake_request = Mock()
+                        fake_request.id = signal_id
+                        fake_request.symbol = signal.symbol
+                        fake_request.comment = f"SMC_{signal.strategy.value}"
+                        self._handle_filled_pending(fake_request, pos)
+                        break
 
         return ExecutionResult(
             success=True,
@@ -201,11 +220,59 @@ class OrderExecutor:
             order_result=order_result,
             position_size=position_size,
             validation=validation,
-            pending=True,
-            pending_order_ticket=(
-                int(pending_ticket) if pending_ticket else None
-            ),
+            pending=is_pending,
+            pending_order_ticket=(int(pending_ticket) if (is_pending and pending_ticket) else None),
         )
+
+    def _generate_fingerprint(self, signal) -> str:
+        """Create a durable hash of the setup to prevent duplicate orders."""
+        # Quantize prices to 5 decimal places to avoid float noise
+        parts = [
+            signal.symbol,
+            signal.direction.value,
+            signal.strategy.value,
+            f"{signal.entry_price:.5f}",
+            f"{signal.sl_price:.5f}",
+            f"{signal.tp_price:.5f}",
+        ]
+        return hashlib.sha256("|".join(parts).encode()).hexdigest()
+
+    def _is_duplicate(self, fingerprint: str) -> bool:
+        """Check if this exact setup is already active or recently filled."""
+        if not fingerprint:
+            return False
+
+        try:
+            with db_manager.get_session() as session:
+                # 1. Check for active pending orders with this fingerprint
+                active_request = session.query(OrderRequest).filter(
+                    OrderRequest.environment == self.ENVIRONMENT,
+                    OrderRequest.fingerprint == fingerprint,
+                    OrderRequest.status.in_(["placed", "pending", "sent"])
+                ).first()
+
+                if active_request:
+                    logger.info("Duplicate check: active request found for fingerprint %s", fingerprint)
+                    return True
+
+                # 2. Check for recent filled orders (within 24h) to avoid re-entering
+                cutoff = datetime.utcnow() - timedelta(hours=24)
+                recent_filled = session.query(OrderRequest).filter(
+                    OrderRequest.environment == self.ENVIRONMENT,
+                    OrderRequest.fingerprint == fingerprint,
+                    OrderRequest.status == "filled",
+                    OrderRequest.timestamp >= cutoff
+                ).first()
+
+                if recent_filled:
+                    logger.info("Duplicate check: recent filled order found for fingerprint %s", fingerprint)
+                    return True
+
+        except Exception:
+            logger.exception("Duplicate check failed; failing closed.")
+            return True  # Fail closed! If DB is down, do not trade.
+
+        return False
 
     # ==================================================================
     # 2. Pending-order reconciliation (called every cycle from main)
@@ -480,15 +547,16 @@ class OrderExecutor:
         return results
 
     # ==================================================================
-    # 4. Order request preparation (THE KEY CHANGE)
+    # 4. Order request preparation
     # ==================================================================
 
     def _prepare_order_request(
         self,
         signal,
         position_size: PositionSizeResult,
+        market_entry: bool = False,
     ) -> Dict[str, Any]:
-        """Build a pending limit order at the planned entry price."""
+        """Build a market or pending limit order."""
 
         symbol = signal.symbol
         direction = signal.direction.value.upper()
@@ -500,9 +568,7 @@ class OrderExecutor:
         tick = mt5.symbol_info_tick(symbol)
 
         if symbol_info is None or tick is None:
-            raise RuntimeError(
-                f"Could not obtain broker symbol info or quote for {symbol}."
-            )
+            raise RuntimeError(f"Could not obtain broker symbol info or quote for {symbol}.")
 
         point = float(symbol_info.point)
         digits = int(symbol_info.digits)
@@ -513,44 +579,61 @@ class OrderExecutor:
         sl = round(float(signal.sl_price), digits)
         tp = round(float(signal.tp_price), digits)
 
-        if direction == "BUY":
-            order_type = mt5.ORDER_TYPE_BUY_LIMIT
-            current_price = float(tick.ask)
-            if entry >= current_price:
-                raise RuntimeError(
-                    f"BUY_LIMIT entry {entry} is at/above current ask "
-                    f"{current_price}; setup invalidated before placement."
-                )
-        else:
-            order_type = mt5.ORDER_TYPE_SELL_LIMIT
-            current_price = float(tick.bid)
-            if entry <= current_price:
-                raise RuntimeError(
-                    f"SELL_LIMIT entry {entry} is at/below current bid "
-                    f"{current_price}; setup invalidated before placement."
-                )
-
-        pip_size = point * 10 if digits in (3, 5) else point
+        symbol_info_dc = mt5_connector.get_symbol_info()
+        if symbol_info_dc is None:
+            raise RuntimeError(f"Could not obtain broker symbol info for {symbol}.")
+        pip_size = mt5_connector.pip_size_for(symbol_info_dc)
+        if pip_size <= 0:
+            raise RuntimeError(f"Broker pip size for {symbol} is invalid.")
+            
         configured_slippage = config.trade_management.max_slippage_pips
-        deviation = max(
-            1,
-            int(round(float(configured_slippage) * pip_size / point)),
-        )
+        deviation = max(1, int(round(float(configured_slippage) * pip_size / point)))
 
-        return {
-            "action": mt5.TRADE_ACTION_PENDING,
-            "symbol": symbol,
-            "type": order_type,
-            "volume": float(position_size.lot_size),
-            "price": entry,
-            "sl": sl,
-            "tp": tp,
-            "deviation": deviation,
-            "magic": self.magic_number,
-            "comment": f"SMC_{signal.strategy.value}"[:31],
-            "type_time": mt5.ORDER_TIME_GTC,
-        }
+        if market_entry:
+            if direction == "BUY":
+                order_type = mt5.ORDER_TYPE_BUY
+            else:
+                order_type = mt5.ORDER_TYPE_SELL
+                
+            return {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": symbol,
+                "type": order_type,
+                "volume": float(position_size.lot_size),
+                "sl": sl,
+                "tp": tp,
+                "deviation": deviation,
+                "magic": self.magic_number,
+                "comment": f"SMC_{signal.strategy.value}"[:31],
+                "fingerprint": signal.fingerprint,
+            }
+        
+        else:
+            if direction == "BUY":
+                order_type = mt5.ORDER_TYPE_BUY_LIMIT
+                current_price = float(tick.ask)
+                if entry >= current_price:
+                    raise RuntimeError(f"BUY_LIMIT entry {entry} is at/above current ask {current_price}; setup invalidated before placement.")
+            else:
+                order_type = mt5.ORDER_TYPE_SELL_LIMIT
+                current_price = float(tick.bid)
+                if entry <= current_price:
+                    raise RuntimeError(f"SELL_LIMIT entry {entry} is at/below current bid {current_price}; setup invalidated before placement.")
 
+            return {
+                "action": mt5.TRADE_ACTION_PENDING,
+                "symbol": symbol,
+                "type": order_type,
+                "volume": float(position_size.lot_size),
+                "price": entry,
+                "sl": sl,
+                "tp": tp,
+                "deviation": deviation,
+                "magic": self.magic_number,
+                "comment": f"SMC_{signal.strategy.value}"[:31],
+                "type_time": mt5.ORDER_TIME_GTC,
+                "fingerprint": signal.fingerprint,
+            }
     # ==================================================================
     # 5. Position reconciliation (unchanged, kept for filled positions)
     # ==================================================================
@@ -602,7 +685,7 @@ class OrderExecutor:
             "magic", position.get("magic_number")
         )
         if position_magic is None:
-            return False  # NEW: reject positions without a magic number
+            return False  # reject positions without a magic number
         if int(position_magic) != int(self.magic_number):
             return False
         if position.get("symbol") != signal.symbol:
@@ -646,6 +729,7 @@ class OrderExecutor:
             ],
             status="validated",
             environment=self.ENVIRONMENT,
+            fingerprint=signal.fingerprint,
         )
 
         saved_id = db_manager.add(db_signal)
@@ -670,6 +754,7 @@ class OrderExecutor:
             comment=request.get("comment"),
             request_data=request,
             environment=self.ENVIRONMENT,
+            fingerprint=request.get("fingerprint"),
         )
 
         saved_id = db_manager.add(db_request)
@@ -706,7 +791,7 @@ class OrderExecutor:
                 "error_code": result.error_code,
                 "error_message": result.error_message,
             }
-            # NEW: 'placed' signals a live pending order not yet filled.
+            # 'placed' signals a live pending order not yet filled.
             request.status = "placed" if result.success else "rejected"
             request.error_code = result.error_code
             request.error_message = result.error_message
@@ -804,7 +889,7 @@ class OrderExecutor:
         db_manager.add(db_position)
 
     # ==================================================================
-    # 7. Close / modify (unchanged from before)
+    # 7. Close / modify
     # ==================================================================
 
     def close_position(
