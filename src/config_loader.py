@@ -155,6 +155,8 @@ class TradingConfig:
     entry_order_type: str
     pending_expiry_hours: int
     max_pending_orders: int
+    pending_orders_on_shutdown: str = "keep"
+
 
 
 @dataclass
@@ -595,6 +597,9 @@ class Config:
             max_pending_orders=_safe_int(
                 c.get("max_pending_orders"), 5
             ),
+            pending_orders_on_shutdown=_safe_str(
+                c.get("pending_orders_on_shutdown"), "keep"
+            ).lower(),
         )
 
     @property

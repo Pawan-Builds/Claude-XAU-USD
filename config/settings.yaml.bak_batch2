@@ -1,0 +1,164 @@
+
+# XAU/USD SMC Trading Agent Configuration
+
+telegram:
+  bot_token: ${TELEGRAM_BOT_TOKEN}
+  chat_id: ${TELEGRAM_CHAT_ID}
+  parse_mode: "HTML"
+
+# Trading mode: DEMO or LIVE
+trading:
+  mode: ${TRADING_MODE}
+  symbol: "GOLD"
+  risk_percent: ${RISK_PERCENT}
+  min_risk_reward: ${MIN_RISK_REWARD}
+  magic_number: 123456789
+  max_positions: 3
+  max_daily_trades: 20
+  max_daily_loss_percent: 5.0
+  max_drawdown_percent: 10.0
+  max_consecutive_losses: 5
+  max_holding_hours: 48
+  entry_order_type: "limit"     # "limit" (planned) or "market" (reactive)
+  pending_expiry_hours: 4       # cancel unfilled limit orders after N hours
+  max_pending_orders: 5  
+  pending_orders_on_shutdown: "keep" 
+
+# DEMO account
+demo:
+  mt5_login: ${DEMO_MT5_LOGIN}
+  mt5_password: ${DEMO_MT5_PASSWORD}
+  mt5_server: ${DEMO_MT5_SERVER}
+  mt5_path: ${DEMO_MT5_PATH}
+
+# LIVE account and activation controls
+live:
+  mt5_login: ${LIVE_MT5_LOGIN}
+  mt5_password: ${LIVE_MT5_PASSWORD}
+  mt5_server: ${LIVE_MT5_SERVER}
+  mt5_path: ${LIVE_MT5_PATH}
+  enabled: ${LIVE_TRADING_ENABLED}
+  allowed_account: ${LIVE_ALLOWED_ACCOUNT}
+
+timeframes:
+  h4: 240
+  h1: 60
+  m15: 15
+  m5: 5
+  bias_tf: "h4"
+  structure_tf: "h1"
+  setup_tf: "m15"
+  entry_tf: "m5"
+
+smc:
+  strategies:
+    - "liquidity_sweep_fvg"
+    - "liquidity_sweep_choch"
+    - "bos_order_block"
+    - "choch_order_block"
+    - "displacement_fvg"
+    - "liquidity_sweep_ob_fvg"
+  swing_lookback: 50
+  fvg_min_size_pips: 5
+  ob_lookback: 20
+  liquidity_lookback: 100
+  displacement_threshold: 1.5
+  equal_high_low_tolerance: 2
+
+risk:
+  default_risk_percent: ${RISK_PERCENT}
+  min_risk_reward: ${MIN_RISK_REWARD}
+  demo_default_risk_percent: 1.0
+  demo_max_risk_percent: 2.0
+  live_default_risk_percent: 0.5
+  live_max_risk_percent: 1.0
+  daily_loss_limit_percent: 5.0
+  max_account_drawdown_percent: 10.0
+  max_consecutive_losses: 5
+  max_open_positions: 3
+  max_total_open_risk_percent: 4.0
+  emergency_drawdown_percent: 10.0
+  compound_enabled: true
+  compound_method: "equity_based"
+
+trade_management:
+  break_even_enabled: true
+  break_even_trigger_r: 1.0
+  break_even_buffer_pips: 5
+  trailing_stop_enabled: true
+  trailing_stop_start_r: 1.5
+  trailing_stop_step_pips: 10
+  trailing_stop_method: "structure"
+  partial_tp_enabled: true
+  partial_tp_levels:
+    - r: 1.0
+      percent: 0.3
+    - r: 2.0
+      percent: 0.3
+  max_slippage_pips: 3
+  max_spread_pips: 5
+
+sessions:
+  london:
+    enabled: true
+    open: "08:00"
+    close: "17:00"
+  new_york:
+    enabled: true
+    open: "13:00"
+    close: "22:00"
+  asian:
+    enabled: true
+    open: "00:00"
+    close: "09:00"
+  timezone: "UTC"
+  weekend_protection: true
+  close_before_weekend_hours: 4
+
+news:
+  enabled: false
+  high_impact_only: true
+  buffer_minutes_before: 30
+  buffer_minutes_after: 30
+  source: "forexfactory"
+
+backtesting:
+  default_start_date: "2023-01-01"
+  default_end_date: "2024-12-31"
+  default_balance: 10000
+  default_risk_percent: 2.0
+  spread_pips: 2.0
+  slippage_pips: 1.0
+  commission_per_lot: 7.0
+  swap_enabled: true
+  data_source: "mt5"
+
+dashboard:
+  host: ${DASHBOARD_HOST}
+  port: ${DASHBOARD_PORT}
+  secret_key: ${DASHBOARD_SECRET_KEY}
+  cors_origins:
+    - "http://127.0.0.1:3000"
+    - "http://localhost:3000"
+  websocket_ping_interval: 30
+
+database:
+  url: "sqlite:///database/trading.db"
+  echo: false
+  pool_size: 5
+  max_overflow: 10
+
+logging:
+  level: "INFO"
+  file: "logs/trading.log"
+  max_size_mb: 50
+  backup_count: 5
+  format: "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+  date_format: "%Y-%m-%d %H:%M:%S"
+
+safety:
+  demo_only: true
+  verify_demo_on_startup: true
+  kill_switch_enabled: true
+  max_errors_before_pause: 10
+  health_check_interval: 60

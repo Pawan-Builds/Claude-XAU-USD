@@ -24,7 +24,8 @@ from src.session_filter import session_filter
 from src.news_filter import news_filter
 from src.telegram_bot import telegram_bot
 from src.signal_validator import signal_validator
-
+from src.entry_gate import EntryGate
+from src.trading_controller import trading_controller
 
 logger = get_logger(__name__)
 
@@ -68,6 +69,10 @@ class TradingAgent:
         # MILESTONE 11: Single-Instance Lock
         self._lock_file = Path("bot.lock")
         self._lock_acquired = False
+        self._entry_gate = EntryGate(
+            is_paused_getter=lambda: self._paused,
+            is_shutdown_getter=lambda: self._shutdown_requested,
+        )
 
     # =========================================================
     # MODE AND ACCOUNT VERIFICATION
@@ -183,99 +188,7 @@ class TradingAgent:
         self._verify_connected_account(account)
 
         return account
-
-    # =========================================================
-    # ENTRY PERMISSION CHECKS
-    # =========================================================
-
-    def _check_news_permission(self) -> bool:
-        try:
-            result = news_filter.should_block_trading()
-        except Exception:
-            logger.exception("News filter execution failed.")
-            return False
-
-        if not isinstance(result, dict):
-            logger.error(
-                "News filter returned an invalid result."
-            )
-            return False
-
-        if result.get("block", True):
-            logger.warning(
-                "Entry blocked by news filter: %s",
-                result.get("reason", "News filter blocked trading.")
-            )
-            return False
-
-        return True
-
-    def _check_risk_permission(self) -> bool:
-        try:
-            result = risk_manager.check_risk_limits()
-        except Exception:
-            logger.exception("Risk manager execution failed.")
-            return False
-
-        if not isinstance(result, dict):
-            logger.error(
-                "Risk manager returned an invalid result."
-            )
-            return False
-
-        if not result.get("ok", False):
-            logger.warning(
-                "Risk checks failed: %s",
-                result.get("checks")
-            )
-            return False
-
-        return True
-
-    def _check_entry_permission(
-        self,
-        allow_paused: bool = False
-    ) -> bool:
-        """Check every restriction before permitting new entries."""
-
-        if self._shutdown_requested:
-            return False
-
-        if self._paused and not allow_paused:
-            return False
-
-        try:
-            self._verify_current_connection()
-        except Exception:
-            logger.exception(
-                "Entry blocked: MT5 account verification failed."
-            )
-            self._pause_trading()
-            return False
-
-        try:
-            if not session_filter.is_trading_allowed():
-                return False
-        except Exception:
-            logger.exception("Session filter failed.")
-            return False
-
-        try:
-            if market_data.is_weekend_protection_active():
-                return False
-        except Exception:
-            logger.exception("Weekend protection check failed.")
-            return False
-
-        if not self._check_news_permission():
-            return False
-
-        if not self._check_risk_permission():
-            return False
-
-        logger.debug("All entry-permission checks passed.")
-        return True
-
+    
     # =========================================================
     # ACCOUNT SNAPSHOTS
     # =========================================================
@@ -444,7 +357,8 @@ class TradingAgent:
                 timezone.utc
             ).date()
 
-            if self._check_entry_permission(allow_paused=True):
+            startup_gate = self._entry_gate.probe()
+            if startup_gate.ok:
                 self._paused = False
                 logger.info(
                     "Startup checks passed. New entries enabled."
@@ -453,9 +367,13 @@ class TradingAgent:
                 self._paused = True
                 logger.warning(
                     "Startup completed, but new entries remain paused. "
-                    "The health monitor will retry permission checks."
+                    "Reason: %s. The health monitor will retry checks.",
+                    startup_gate.reason,
                 )
-
+            trading_controller.register_agent(self, self._entry_gate)
+            logger.info(
+                "TradingController registered with live TradingAgent."
+            )
             self._running = True
 
             logger.info(
@@ -614,7 +532,12 @@ class TradingAgent:
         """Phase 1 & 2: Market Analysis and Trade Plan Creation."""
         self._last_analysis_time = time.time()
 
-        if not self._check_entry_permission():
+        gate_result = self._entry_gate.check()
+        if not gate_result.ok:
+            logger.debug(
+                "Skipping signal generation; entry gate blocked: %s",
+                gate_result.reason,
+            )
             return
 
         try:
@@ -734,6 +657,22 @@ class TradingAgent:
                             plan.entry_price
                         )
                         
+                        # F-01 FIX: Independent fail-closed permission check
+                        # F-01: fail-closed gate. Pause is honoured here.
+                        gate_result = self._entry_gate.check()
+                        if not gate_result.ok:
+                            logger.warning(
+                                "TRADE PLAN BLOCKED AT ENTRY | %s | %s %s",
+                                gate_result.reason,
+                                plan.direction,
+                                plan.symbol,
+                            )
+                            plan.status = "INVALIDATED"
+                            plan.invalidated_reason = (
+                                f"Entry gate: {gate_result.reason}"
+                            )
+                            continue
+
                         signal = TradeSignal(
                             timestamp=now,
                             symbol=plan.symbol,
@@ -763,8 +702,12 @@ class TradingAgent:
                             )
                             continue
 
-                        result = order_executor.execute_signal(signal, market_entry=True)
-                        
+                        result = order_executor.execute_signal(
+                            signal,
+                            market_entry=True,
+                            gate=self._entry_gate,
+                        )
+
                         if result.success:
                             plan.status = "EXECUTED"
                             logger.info(
@@ -1010,13 +953,25 @@ class TradingAgent:
 
         self._save_account_snapshot()
 
+        # F-05: periodic reconciliation so a position closed while the
+        # agent was looking elsewhere is finalised as a ClosedTrade.
+        if not self._shutdown_requested:
+            try:
+                trade_manager.reconcile_with_broker()
+            except Exception:
+                logger.exception(
+                    "Periodic broker reconciliation failed."
+                )
+
         if self._paused and not self._shutdown_requested:
-            if self._check_entry_permission(allow_paused=True):
+            probe = self._entry_gate.probe()
+            if probe.ok:
                 self._paused = False
                 self._error_count = 0
-
-                logger.info(
-                    "Health checks passed. New entries resumed."
+                logger.info("Health checks passed. New entries resumed.")
+            else:
+                logger.debug(
+                    "Health probe: still blocked - %s", probe.reason
                 )
 
     # =========================================================
@@ -1036,14 +991,16 @@ class TradingAgent:
             )
             return
 
-        if self._check_entry_permission(allow_paused=True):
+        probe = self._entry_gate.probe()
+        if probe.ok:
             self._paused = False
             self._error_count = 0
-
             logger.info("Trading entries resumed through Telegram.")
         else:
             self._paused = True
-            logger.warning("Resume rejected. One or more entry checks failed.")
+            logger.warning(
+                "Resume rejected. Reason: %s", probe.reason
+            )
 
     def _request_shutdown(self):
         logger.info("Shutdown requested.")
@@ -1060,7 +1017,10 @@ class TradingAgent:
         self._shutdown_started = True
         self._running = False
         self._paused = True
-
+        try:
+            trading_controller.unregister_agent()
+        except Exception:
+            logger.exception("TradingController.unregister_agent failed.")
         logger.info("Shutting down trading agent...")
 
         if self._mt5_started and mt5_connector.is_connected():
@@ -1081,6 +1041,25 @@ class TradingAgent:
             except Exception:
                 logger.exception("Market data shutdown failed.")
             self._market_data_started = False
+
+        # F-07: configurable pending-order shutdown policy.
+        policy = str(
+            getattr(config.trading, "pending_orders_on_shutdown", "keep")
+        ).lower()
+        if policy == "cancel" and self._mt5_started:
+            try:
+                cancelled = order_executor.cancel_all_pending(
+                    reason="SHUTDOWN"
+                )
+                logger.info(
+                    "Shutdown policy: cancelled %d bot-owned pending "
+                    "order(s).",
+                    len(cancelled),
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to cancel bot-owned pending orders at shutdown."
+                )
 
         if self._mt5_started:
             try:

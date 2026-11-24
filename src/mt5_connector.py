@@ -867,8 +867,9 @@ class MT5Connector:
                 "magic": deal.magic,
                 "symbol": deal.symbol,
                 "type": self._deal_type_to_str(deal.type),
-                "entry": getattr(deal, "entry", None),
-                "volume": deal.volume,
+                "entry": self._deal_entry_to_str(
+                    getattr(deal, "entry", None)
+                ),                "volume": deal.volume,
                 "price": deal.price,
                 "commission": deal.commission,
                 "swap": deal.swap,
@@ -902,6 +903,16 @@ class MT5Connector:
             mt5.DEAL_TYPE_CREDIT: "CREDIT",
         }
         return types.get(type_id, "UNKNOWN")
+
+    @staticmethod
+    def _deal_entry_to_str(type_id) -> str:
+        mapping = {
+            mt5.DEAL_ENTRY_IN: "IN",
+            mt5.DEAL_ENTRY_OUT: "OUT",
+            mt5.DEAL_ENTRY_INOUT: "INOUT",
+            mt5.DEAL_ENTRY_OUT_BY: "OUT_BY",
+        }
+        return mapping.get(type_id, "UNKNOWN")
 
     # ---------------------------------------------------------
     # Trading safety and execution helpers

@@ -18,7 +18,6 @@ from src.mt5_connector import mt5_connector
 from src.database_manager import db_manager, AccountSnapshot, ClosedTrade, OpenPosition
 from src.risk_manager import risk_manager
 from src import logger as app_logger
-from src import logger as app_logger
 from src.logger import get_logger
 
 logger = get_logger(__name__)
@@ -182,9 +181,11 @@ class TelegramBot:
         from datetime import datetime, timezone
         today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 
+        env = config.trading.mode.lower()
+
         with db_manager.get_session() as session:
             trades = session.query(ClosedTrade).filter(
-                ClosedTrade.environment == "demo",
+                ClosedTrade.environment == env,
                 ClosedTrade.time_close >= today_start
             ).all()
 
@@ -228,9 +229,11 @@ class TelegramBot:
             await update.message.reply_text("❌ Unauthorized")
             return
 
+        env = config.trading.mode.lower()
+
         with db_manager.get_session() as session:
             trades = session.query(ClosedTrade).filter(
-                ClosedTrade.environment == "demo"
+                ClosedTrade.environment == env
             ).order_by(ClosedTrade.time_close.desc()).limit(10).all()
 
         if not trades:
@@ -260,9 +263,11 @@ class TelegramBot:
             await update.message.reply_text("❌ Unauthorized")
             return
 
+        env = config.trading.mode.lower()
+
         with db_manager.get_session() as session:
             trades = session.query(ClosedTrade).filter(
-                ClosedTrade.environment == "demo"
+                ClosedTrade.environment == env
             ).all()
 
         if not trades:
@@ -504,9 +509,11 @@ class TelegramBot:
         from datetime import datetime, timezone
         today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 
+        env = config.trading.mode.lower()
+
         with db_manager.get_session() as session:
             trades = session.query(ClosedTrade).filter(
-                ClosedTrade.environment == "demo",
+                ClosedTrade.environment == env,
                 ClosedTrade.time_close >= today_start
             ).all()
 

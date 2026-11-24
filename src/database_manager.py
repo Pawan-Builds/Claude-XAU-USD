@@ -530,6 +530,18 @@ class DatabaseManager:
                     )
                 except Exception:
                     logger.exception("Could not create order_requests_fp index (non-fatal)")
+            if "order_requests" in table_names:
+                try:
+                    connection.exec_driver_sql(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "ix_order_requests_mt5_ticket "
+                        "ON order_requests (mt5_ticket)"
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not create order_requests_mt5_ticket "
+                        "index (non-fatal)"
+                    )
 
         if added_columns:
             logger.info(

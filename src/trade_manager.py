@@ -1,12 +1,26 @@
-"""Trade management - persistent SL, TP, break-even and trailing stops."""
+"""Trade management - persistent SL, TP, break-even and trailing stops.
 
-from datetime import datetime, timezone
+F-05/F-06 additions:
+- reconcile_with_broker(): recovers orphan fills and reconstructs missing
+  closures from MT5 deal history.
+- record_closed_trade_from_history(): single source of truth for ClosedTrade
+  rows, populated from actual realised profit/swap/commission.
+"""
+
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
 
 from src.mt5_connector import mt5_connector
 from src.config_loader import config
-from src.database_manager import db_manager, TradeManagementEvent, OpenPosition
+from src.database_manager import (
+    db_manager,
+    TradeManagementEvent,
+    OpenPosition,
+    ExecutedOrder,
+    ClosedTrade,
+    OrderRequest,
+)
 from src.logger import get_logger
 
 logger = get_logger(__name__)
@@ -23,7 +37,7 @@ class ManagementAction:
 
 
 class TradeManager:
-    """Manages bot-owned positions and persists their management state."""
+    """Manages bot-owned positions and reconciles them with the broker."""
 
     def __init__(self):
         self.tm_config = config.trade_management
@@ -33,122 +47,93 @@ class TradeManager:
         self._pip_size: Optional[float] = None
 
     # ---------------------------------------------------------
-    # Environment and unit helpers
+    # Environment and unit helpers (unchanged)
     # ---------------------------------------------------------
 
     @property
     def environment(self) -> str:
-        """FIX #11: derive from the runtime mode, not a hardcoded string."""
         return config.trading.mode.lower()
 
     def _get_pip_size(self) -> float:
-        """FIX #10: derive pip size from broker specs, not a constant."""
         if self._pip_size is None:
             info = mt5_connector.get_symbol_info()
-
             if info is None:
                 logger.error(
                     "Cannot determine pip size: symbol info unavailable."
                 )
                 return 0.0
-
             self._pip_size = mt5_connector.pip_size_for(info)
-
             logger.info(
-                "Resolved pip size for %s: %s",
-                info.name,
-                self._pip_size,
+                "Resolved pip size for %s: %s", info.name, self._pip_size,
             )
-
         return self._pip_size
 
     # ---------------------------------------------------------
-    # Basic helpers
+    # Basic helpers (unchanged)
     # ---------------------------------------------------------
 
     @staticmethod
     def _direction(value: Any) -> str:
-        """Normalize MT5 position direction."""
         value = str(value).upper()
-
         if value in ("BUY", "0"):
             return "BUY"
-
         if value in ("SELL", "1"):
             return "SELL"
-
         return value
 
     @staticmethod
     def _calculate_r(
-        direction: str,
-        entry: float,
-        current_price: float,
-        initial_risk: float,
+        direction: str, entry: float, current_price: float, initial_risk: float,
     ) -> float:
         if initial_risk <= 0:
             return 0.0
-
         if direction == "BUY":
             return (current_price - entry) / initial_risk
-
         return (entry - current_price) / initial_risk
 
     @staticmethod
     def _normalize_percent(value: float) -> float:
         value = float(value)
-
         if value > 1:
             value /= 100.0
-
         return value
 
     def _get_mt5_position(self, ticket: int) -> Optional[Dict]:
-        """FIX #1: handle None from get_positions() without crashing."""
         try:
             positions = mt5_connector.get_positions()
         except Exception as exc:
             logger.error(
-                "Could not retrieve MT5 position %s: %s", ticket, exc
+                "Could not retrieve MT5 position %s: %s", ticket, exc,
             )
             return None
-
         if positions is None:
             logger.error(
                 "MT5 position query failed while looking up ticket %s",
                 ticket,
             )
             return None
-
         for position in positions:
             if int(position["ticket"]) == int(ticket):
                 return position
-
         return None
 
     def _get_database_position(self, ticket: int):
-        """FIX #15: scope the DB lookup to the current environment."""
         try:
             return db_manager.query_one(
-                OpenPosition,
-                ticket=ticket,
-                environment=self.environment,
+                OpenPosition, ticket=ticket, environment=self.environment,
             )
         except Exception as exc:
             logger.error(
-                "Database lookup failed for position %s: %s", ticket, exc
+                "Database lookup failed for position %s: %s", ticket, exc,
             )
             return None
 
     def _persist_state(self, ticket: int) -> bool:
         state = self._managed_positions.get(ticket)
-
         if not state:
             return False
-
         try:
             record = self._get_database_position(ticket)
-
             if record is None:
                 logger.warning(
                     "Cannot persist position %s: no OpenPosition row for "
@@ -157,7 +142,6 @@ class TradeManager:
                     self.environment,
                 )
                 return False
-
             management_state = {
                 "direction": state["direction"],
                 "entry_price": state["entry_price"],
@@ -175,7 +159,6 @@ class TradeManager:
                 "highest_r": state["highest_r"],
                 "lowest_r": state["lowest_r"],
             }
-
             db_manager.update(
                 OpenPosition,
                 record.id,
@@ -183,7 +166,8 @@ class TradeManager:
                 tp=state["current_tp"],
                 break_even_activated=state["break_even_activated"],
                 trailing_active=state["trailing_active"],
-                partial_tp_taken=bool(state["partial_tps_taken"]),
+                # F-13 will address the JSON corruption below; F-06 does not.
+                partial_tp_taken=list(state["partial_tps_taken"]),
                 initial_sl=state["initial_sl"],
                 initial_tp=state["initial_tp"],
                 initial_risk_distance=state["initial_risk_distance"],
@@ -192,19 +176,15 @@ class TradeManager:
                 lowest_r=state["lowest_r"],
                 management_state=management_state,
             )
-
             return True
-
         except Exception as exc:
             logger.exception(
-                "Failed to persist management state for %s: %s",
-                ticket,
-                exc,
+                "Failed to persist management state for %s: %s", ticket, exc,
             )
             return False
 
     # ---------------------------------------------------------
-    # Position initialization and restoration
+    # Position initialization (unchanged)
     # ---------------------------------------------------------
 
     def initialize_position_tracking(
@@ -227,7 +207,7 @@ class TradeManager:
         remaining_volume = volume
         break_even_activated = False
         trailing_active = False
-        partial_tps_taken = []
+        partial_tps_taken: List = []
         highest_r = 0.0
         lowest_r = 0.0
         current_sl = sl
@@ -240,41 +220,31 @@ class TradeManager:
                 record.initial_risk_distance
                 or abs(entry_price - initial_sl)
             )
-
             remaining_volume = (
                 record.remaining_volume
                 if record.remaining_volume is not None
                 else volume
             )
-
             current_sl = record.sl or sl
             current_tp = record.tp or tp
-
             break_even_activated = bool(record.break_even_activated)
             trailing_active = bool(record.trailing_active)
             highest_r = record.highest_r or 0.0
             lowest_r = record.lowest_r or 0.0
 
             saved_state = record.management_state or {}
-
             if isinstance(saved_state, dict):
                 partial_tps_taken = saved_state.get(
                     "partial_tps_taken", []
-                )
-
+                ) or []
                 current_sl = saved_state.get("current_sl", current_sl)
                 current_tp = saved_state.get("current_tp", current_tp)
-
                 break_even_activated = saved_state.get(
-                    "break_even_activated",
-                    break_even_activated,
+                    "break_even_activated", break_even_activated,
                 )
-
                 trailing_active = saved_state.get(
-                    "trailing_active",
-                    trailing_active,
+                    "trailing_active", trailing_active,
                 )
-
                 highest_r = saved_state.get("highest_r", highest_r)
                 lowest_r = saved_state.get("lowest_r", lowest_r)
 
@@ -313,476 +283,320 @@ class TradeManager:
             initial_risk,
             remaining_volume,
         )
-
         if record is not None:
             self._persist_state(ticket)
-
         return True
 
     # ---------------------------------------------------------
-    # Market updates and R calculations
+    # Market updates and R calculations (unchanged)
     # ---------------------------------------------------------
 
     def update_position(
-        self,
-        ticket: int,
-        current_price: float,
-        profit: float,
-        swap: float = 0,
+        self, ticket: int, current_price: float,
+        profit: float, swap: float = 0,
     ):
         pos = self._managed_positions.get(ticket)
-
         if not pos:
             return
-
         r_multiple = self._calculate_r(
-            pos["direction"],
-            pos["entry_price"],
-            current_price,
+            pos["direction"], pos["entry_price"], current_price,
             pos["initial_risk_distance"],
         )
-
         pos["highest_r"] = max(pos["highest_r"], r_multiple)
         pos["lowest_r"] = min(pos["lowest_r"], r_multiple)
-
         self._persist_state(ticket)
 
     def _current_r(self, pos: Dict, current_price: float) -> float:
         return self._calculate_r(
-            pos["direction"],
-            pos["entry_price"],
-            current_price,
+            pos["direction"], pos["entry_price"], current_price,
             pos["initial_risk_distance"],
         )
 
     # ---------------------------------------------------------
-    # Break-even
+    # Break-even (unchanged)
     # ---------------------------------------------------------
 
     def check_break_even(
-        self,
-        ticket: int,
-        current_price: float,
+        self, ticket: int, current_price: float,
     ) -> Optional[ManagementAction]:
-
         if not self.tm_config.break_even_enabled:
             return None
-
         pos = self._managed_positions.get(ticket)
-
         if not pos or pos["break_even_activated"]:
             return None
-
         r_multiple = self._current_r(pos, current_price)
-
         if r_multiple < self.tm_config.break_even_trigger_r:
             return None
-
         pip_size = self._get_pip_size()
-
         if pip_size <= 0:
             logger.error(
                 "Cannot apply break-even for %s: pip size unavailable.",
                 ticket,
             )
             return None
-
         buffer = self.tm_config.break_even_buffer_pips * pip_size
-
         if pos["direction"] == "BUY":
             new_sl = pos["entry_price"] + buffer
         else:
             new_sl = pos["entry_price"] - buffer
-
         action = self._modify_sl(ticket, new_sl, "break_even")
-
         if action.success:
             pos["break_even_activated"] = True
             self._persist_state(ticket)
-
             self._log_event(
-                ticket,
-                "BREAK_EVEN_ACTIVATED",
-                pos["initial_sl"],
-                new_sl,
+                ticket, "BREAK_EVEN_ACTIVATED", pos["initial_sl"], new_sl,
                 {"r_multiple": r_multiple},
             )
-
         return action
 
     # ---------------------------------------------------------
-    # Trailing stop
+    # Trailing stop (unchanged)
     # ---------------------------------------------------------
 
     def check_trailing_stop(
-        self,
-        ticket: int,
-        current_price: float,
+        self, ticket: int, current_price: float,
     ) -> Optional[ManagementAction]:
-
         if not self.tm_config.trailing_stop_enabled:
             return None
-
         pos = self._managed_positions.get(ticket)
-
         if not pos:
             return None
-
         r_multiple = self._current_r(pos, current_price)
         start_r = self.tm_config.trailing_stop_start_r
-
         if r_multiple < start_r:
             return None
-
         pip_size = self._get_pip_size()
-
         if pip_size <= 0:
             logger.error(
                 "Cannot apply trailing stop for %s: pip size unavailable.",
                 ticket,
             )
             return None
-
         if not pos["trailing_active"]:
             pos["trailing_active"] = True
-
             logger.info(
-                "Trailing stop activated for %s at %.2fR",
-                ticket,
-                r_multiple,
+                "Trailing stop activated for %s at %.2fR", ticket, r_multiple,
             )
-
             self._persist_state(ticket)
-
         trailing_distance = (
             self.tm_config.trailing_stop_step_pips * pip_size
         )
-
         if pos["direction"] == "BUY":
             new_sl = current_price - trailing_distance
-
             if pos["current_sl"] > 0 and new_sl <= pos["current_sl"]:
                 return None
-
         else:
             new_sl = current_price + trailing_distance
-
             if pos["current_sl"] > 0 and new_sl >= pos["current_sl"]:
                 return None
-
         return self._modify_sl(ticket, new_sl, "trailing_stop")
 
     # ---------------------------------------------------------
-    # Partial take profit
+    # Partial take-profit (unchanged)
     # ---------------------------------------------------------
 
     def check_partial_tp(
-        self,
-        ticket: int,
-        current_price: float,
+        self, ticket: int, current_price: float,
     ) -> List[ManagementAction]:
-
         if not self.tm_config.partial_tp_enabled:
             return []
-
         pos = self._managed_positions.get(ticket)
-
         if not pos:
             return []
-
         actions = []
         r_multiple = self._current_r(pos, current_price)
-
         for tp_level in self.tm_config.partial_tp_levels:
             target_r = float(tp_level["r"])
             percent = self._normalize_percent(tp_level["percent"])
-
             if not 0 < percent < 1:
                 logger.error(
                     "Invalid partial TP percentage for ticket %s: %s",
-                    ticket,
-                    tp_level["percent"],
+                    ticket, tp_level["percent"],
                 )
                 continue
-
             already_taken = any(
                 abs(float(item["r"]) - target_r) < 0.001
                 for item in pos["partial_tps_taken"]
             )
-
             if already_taken or r_multiple < target_r:
                 continue
-
             requested_volume = pos["volume"] * percent
-
             requested_volume = min(
-                requested_volume,
-                pos["remaining_volume"],
+                requested_volume, pos["remaining_volume"],
             )
-
             if requested_volume <= 0:
                 continue
-
             action = self._partial_close(
-                ticket,
-                requested_volume,
-                f"partial_tp_r{target_r}",
+                ticket, requested_volume, f"partial_tp_r{target_r}",
             )
-
             if action.success:
                 pos["partial_tps_taken"].append({
                     "r": target_r,
                     "percent": percent,
                     "time": datetime.now(timezone.utc).isoformat(),
                 })
-
                 self._refresh_remaining_volume(ticket)
                 self._persist_state(ticket)
-
                 self._log_event(
-                    ticket,
-                    "PARTIAL_TP",
-                    None,
-                    requested_volume,
+                    ticket, "PARTIAL_TP", None, requested_volume,
                     {
                         "target_r": target_r,
                         "actual_r": r_multiple,
                         "requested_percent": percent,
                     },
                 )
-
                 actions.append(action)
-
         return actions
 
     def _refresh_remaining_volume(self, ticket: int):
         pos = self._managed_positions.get(ticket)
-
         if not pos:
             return
-
         live_position = self._get_mt5_position(ticket)
-
         if live_position is not None:
             pos["remaining_volume"] = float(live_position["volume"])
         else:
             pos["remaining_volume"] = 0.0
 
     # ---------------------------------------------------------
-    # Maximum holding time
+    # Maximum holding time (unchanged)
     # ---------------------------------------------------------
 
     def check_max_holding_time(
-        self,
-        ticket: int,
-        open_time: datetime,
+        self, ticket: int, open_time: datetime,
     ) -> Optional[ManagementAction]:
-        """FIX #12: do NOT close here. Return a signal for main to
-        route the close through order_executor so ClosedTrade is
-        recorded exactly once."""
-
         max_hours = self.trading_config.max_holding_hours
-
         if max_hours is None or max_hours <= 0:
             return None
-
         if open_time.tzinfo is None:
             open_time = open_time.replace(tzinfo=timezone.utc)
-
         elapsed = (
             datetime.now(timezone.utc) - open_time
         ).total_seconds() / 3600
-
         if elapsed < max_hours:
             return None
-
         logger.warning(
             "Position %s exceeded maximum holding time: %.2f hours",
-            ticket,
-            elapsed,
+            ticket, elapsed,
         )
-
         return ManagementAction(
-            "time_close",
-            ticket,
-            None,
-            None,
-            True,
+            "time_close", ticket, None, None, True,
             f"Maximum holding time ({max_hours}h) exceeded "
             f"(elapsed {elapsed:.2f}h)",
         )
 
     # ---------------------------------------------------------
-    # Stop-loss modification
+    # Stop-loss modification (unchanged)
     # ---------------------------------------------------------
 
     def _modify_sl(
-        self,
-        ticket: int,
-        new_sl: float,
-        reason: str,
+        self, ticket: int, new_sl: float, reason: str,
     ) -> ManagementAction:
-
         pos = self._managed_positions.get(ticket)
-
         if not pos:
             return ManagementAction(
-                "sl_modified", ticket, None, new_sl,
-                False, "Position not tracked",
+                "sl_modified", ticket, None, new_sl, False,
+                "Position not tracked",
             )
-
         old_sl = pos["current_sl"]
         direction = pos["direction"]
-
         live_position = self._get_mt5_position(ticket)
-
         if live_position is None:
             return ManagementAction(
-                "sl_modified", ticket, old_sl, new_sl,
-                False, "Position no longer exists in MT5",
+                "sl_modified", ticket, old_sl, new_sl, False,
+                "Position no longer exists in MT5",
             )
-
         market_price = float(live_position["price_current"])
-
         if old_sl > 0:
             if direction == "BUY" and new_sl <= old_sl:
                 return ManagementAction(
-                    "sl_modified", ticket, old_sl, new_sl,
-                    False,
+                    "sl_modified", ticket, old_sl, new_sl, False,
                     "New BUY stop would loosen the existing stop",
                 )
-
             if direction == "SELL" and new_sl >= old_sl:
                 return ManagementAction(
-                    "sl_modified", ticket, old_sl, new_sl,
-                    False,
+                    "sl_modified", ticket, old_sl, new_sl, False,
                     "New SELL stop would loosen the existing stop",
                 )
-
         if direction == "BUY" and new_sl >= market_price:
             return ManagementAction(
-                "sl_modified", ticket, old_sl, new_sl,
-                False,
+                "sl_modified", ticket, old_sl, new_sl, False,
                 "BUY stop must be below the current market price",
             )
-
         if direction == "SELL" and new_sl <= market_price:
             return ManagementAction(
-                "sl_modified", ticket, old_sl, new_sl,
-                False,
+                "sl_modified", ticket, old_sl, new_sl, False,
                 "SELL stop must be above the current market price",
             )
-
         result = mt5_connector.modify_position(ticket, sl=new_sl)
-
         if not result.success:
-            error = (
-                result.error_message
-                or "Unknown MT5 modification error"
-            )
-
+            error = result.error_message or "Unknown MT5 modification error"
             logger.error(
-                "Failed to modify SL for %s: %s", ticket, error
+                "Failed to modify SL for %s: %s", ticket, error,
             )
-
             return ManagementAction(
-                "sl_modified", ticket, old_sl, new_sl, False, error
+                "sl_modified", ticket, old_sl, new_sl, False, error,
             )
-
         pos["current_sl"] = float(new_sl)
-
         self._persist_state(ticket)
-
         self._log_event(
-            ticket,
-            "SL_MODIFIED",
-            old_sl,
-            new_sl,
-            {"reason": reason},
+            ticket, "SL_MODIFIED", old_sl, new_sl, {"reason": reason},
         )
-
         logger.info(
             "SL modified for %s: %.2f -> %.2f (%s)",
-            ticket,
-            old_sl,
-            new_sl,
-            reason,
+            ticket, old_sl, new_sl, reason,
         )
-
         return ManagementAction(
-            "sl_modified", ticket, old_sl, new_sl, True, reason
+            "sl_modified", ticket, old_sl, new_sl, True, reason,
         )
 
     # ---------------------------------------------------------
-    # Partial close
+    # Partial close (unchanged)
     # ---------------------------------------------------------
 
     def _partial_close(
-        self,
-        ticket: int,
-        volume: float,
-        reason: str,
+        self, ticket: int, volume: float, reason: str,
     ) -> ManagementAction:
-
         pos = self._managed_positions.get(ticket)
-
         if not pos:
             return ManagementAction(
-                "partial_tp", ticket, volume, None,
-                False, "Position not tracked",
+                "partial_tp", ticket, volume, None, False,
+                "Position not tracked",
             )
-
         if volume <= 0 or volume >= pos["remaining_volume"]:
             return ManagementAction(
-                "partial_tp", ticket, volume, None,
-                False, "Invalid partial-close volume",
+                "partial_tp", ticket, volume, None, False,
+                "Invalid partial-close volume",
             )
-
         result = mt5_connector.close_position(ticket, volume)
-
         if not result.success:
             error = result.error_message or "Unknown MT5 close error"
-
             logger.error(
-                "Partial close failed for %s: %s", ticket, error
+                "Partial close failed for %s: %s", ticket, error,
             )
-
             return ManagementAction(
-                "partial_tp", ticket, volume, None, False, error
+                "partial_tp", ticket, volume, None, False, error,
             )
-
         self._refresh_remaining_volume(ticket)
-
         logger.info(
             "Partial close accepted for %s: requested %.3f lots; "
             "remaining %.3f",
-            ticket,
-            volume,
-            pos["remaining_volume"],
+            ticket, volume, pos["remaining_volume"],
         )
-
         return ManagementAction(
-            "partial_tp",
-            ticket,
-            volume,
-            pos["remaining_volume"],
-            True,
+            "partial_tp", ticket, volume, pos["remaining_volume"], True,
             reason,
         )
 
     # ---------------------------------------------------------
-    # Database event logging
+    # Event logging (unchanged)
     # ---------------------------------------------------------
 
     def _log_event(
-        self,
-        ticket: int,
-        event_type: str,
-        old_value: Optional[float],
-        new_value: Optional[float],
+        self, ticket: int, event_type: str,
+        old_value: Optional[float], new_value: Optional[float],
         details: Dict,
     ):
-        """FIX #11: use runtime environment, not a hardcoded 'demo'."""
         try:
             event = TradeManagementEvent(
                 ticket=ticket,
@@ -792,18 +606,14 @@ class TradeManager:
                 details=details,
                 environment=self.environment,
             )
-
             db_manager.add(event)
-
         except Exception as exc:
             logger.exception(
-                "Failed to log management event for %s: %s",
-                ticket,
-                exc,
+                "Failed to log management event for %s: %s", ticket, exc,
             )
 
     # ---------------------------------------------------------
-    # State access and cleanup
+    # State access (unchanged)
     # ---------------------------------------------------------
 
     def get_position_state(self, ticket: int) -> Optional[Dict]:
@@ -813,25 +623,34 @@ class TradeManager:
         if ticket in self._managed_positions:
             del self._managed_positions[ticket]
             logger.info(
-                "Removed position %s from memory tracking", ticket
+                "Removed position %s from memory tracking", ticket,
             )
 
-    # ---------------------------------------------------------
-    # MT5 synchronization and recovery
-    # ---------------------------------------------------------
+    # =========================================================
+    # F-05 / F-06: broker reconciliation and closed-trade recovery
+    # =========================================================
 
     def sync_with_mt5(self) -> bool:
-        """FIX #1 / #17: return True on success, False on failure."""
+        """Backwards-compatible alias for reconcile_with_broker."""
+        return self.reconcile_with_broker()
 
+    def reconcile_with_broker(self) -> bool:
+        """Full bidirectional reconciliation of DB position state with MT5.
+
+        Returns False only when MT5 position data could not be fetched.
+        Partial recovery (one orphan fill, one missing closure) is handled
+        best-effort and logged; the caller stays fail-closed because the
+        entry gate will not unpause if the account is not healthy.
+        """
         try:
             mt5_positions = mt5_connector.get_positions()
         except Exception as exc:
-            logger.exception("Could not synchronize with MT5: %s", exc)
+            logger.exception("MT5 position query failed: %s", exc)
             return False
 
         if mt5_positions is None:
             logger.error(
-                "MT5 returned no position data; synchronization skipped"
+                "MT5 returned no position data; reconciliation skipped"
             )
             return False
 
@@ -839,50 +658,401 @@ class TradeManager:
             int(position["ticket"]) for position in mt5_positions
         }
 
+        # --- 1. Handle live MT5 positions -------------------------------
+        for position in mt5_positions:
+            ticket = int(position["ticket"])
+            try:
+                self._reconcile_live_position(position)
+            except Exception:
+                logger.exception(
+                    "Failed to reconcile live position %s", ticket,
+                )
+                # Do not return False: one bad position should not stop
+                # the whole pass. The gate remains fail-closed downstream.
+
+        # --- 2. Handle DB positions no longer present in MT5 -----------
+        try:
+            open_db_positions = db_manager.get_open_positions(
+                environment=self.environment
+            )
+        except Exception:
+            logger.exception("Could not list OpenPosition rows for recovery.")
+            open_db_positions = []
+
+        for record in open_db_positions:
+            ticket = int(record.ticket)
+            if ticket in live_tickets:
+                continue
+            try:
+                self.reconstruct_closed_trade(
+                    ticket, exit_reason="RECOVERED"
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to reconstruct closure for ticket %s", ticket,
+                )
+
+        # --- 3. Drop stale in-memory tracking for closed positions -----
         for ticket in list(self._managed_positions.keys()):
             if ticket not in live_tickets:
                 self.remove_position(ticket)
 
-        for position in mt5_positions:
-            ticket = int(position["ticket"])
-
-            if ticket in self._managed_positions:
-                self._refresh_remaining_volume(ticket)
-                continue
-
-            record = self._get_database_position(ticket)
-
-            if record is None:
-                logger.warning(
-                    "Ignoring unrecognized MT5 position %s. "
-                    "No matching OpenPosition row for environment=%s.",
-                    ticket,
-                    self.environment,
-                )
-                continue
-
-            direction = self._direction(position["type"])
-
-            self.initialize_position_tracking(
-                ticket=ticket,
-                direction=direction,
-                entry_price=position["price_open"],
-                sl=position["sl"],
-                tp=position["tp"],
-                volume=record.volume,
-                strategy=record.strategy or "UNKNOWN",
-            )
-
-            if ticket in self._managed_positions:
-                self._refresh_remaining_volume(ticket)
-
         logger.info(
-            "MT5 synchronization completed. Live positions: %s | "
-            "Managed positions: %s",
+            "Broker reconciliation complete. MT5 positions: %s | "
+            "Managed positions: %s | DB open rows: %s",
             len(mt5_positions),
             len(self._managed_positions),
+            len(open_db_positions),
+        )
+        return True
+
+    def _reconcile_live_position(self, position: Dict):
+        """Ensure ExecutedOrder + OpenPosition + tracking exist for one
+        live MT5 position, reconstructing from deal history if needed."""
+        ticket = int(position["ticket"])
+
+        executed = db_manager.query_one(
+            ExecutedOrder, ticket=ticket, environment=self.environment,
+        )
+        open_row = self._get_database_position(ticket)
+
+        if executed is not None and open_row is not None:
+            # Normal case — just refresh.
+            if ticket in self._managed_positions:
+                self._refresh_remaining_volume(ticket)
+            else:
+                self.initialize_position_tracking(
+                    ticket=ticket,
+                    direction=position["type"],
+                    entry_price=float(position["price_open"]),
+                    sl=float(position.get("sl") or 0),
+                    tp=float(position.get("tp") or 0),
+                    volume=float(position["volume"]),
+                    strategy=open_row.strategy or "UNKNOWN",
+                )
+            return
+
+        # Reconstruction path.
+        logger.warning(
+            "F-05 RECOVERY | ticket=%s has MT5 position but %s missing",
+            ticket,
+            "both DB rows" if executed is None and open_row is None
+            else ("ExecutedOrder" if executed is None else "OpenPosition"),
         )
 
+        entry_deal = self._find_first_entry_deal(ticket)
+        if entry_deal is None:
+            logger.critical(
+                "Cannot reconstruct ticket %s: no IN deal found. "
+                "Position will remain untracked until resolved manually.",
+                ticket,
+            )
+            return
+
+        entry_price = float(entry_deal["price"])
+        entry_time = entry_deal["time"]
+        entry_volume = float(entry_deal["volume"])
+        direction = self._direction(entry_deal["type"])
+        if direction not in ("BUY", "SELL"):
+            direction = self._direction(position.get("type", ""))
+        symbol = position.get("symbol") or entry_deal.get("symbol")
+        magic = int(position.get("magic") or entry_deal.get("magic") or 0)
+
+        strategy = self._lookup_strategy_for_ticket(ticket) or "RECOVERED"
+
+        if executed is None:
+            try:
+                db_manager.add(ExecutedOrder(
+                    order_request_id=None,
+                    ticket=ticket,
+                    magic_number=magic,
+                    symbol=symbol,
+                    order_type=direction,
+                    volume=entry_volume,
+                    price_open=entry_price,
+                    price_current=float(position.get("price_current") or entry_price),
+                    sl=float(position.get("sl") or 0),
+                    tp=float(position.get("tp") or 0),
+                    swap=float(position.get("swap") or 0),
+                    profit=float(position.get("profit") or 0),
+                    commission=0.0,
+                    comment=str(entry_deal.get("comment") or ""),
+                    time_open=entry_time,
+                    environment=self.environment,
+                ))
+            except Exception:
+                logger.exception(
+                    "Failed to create recovered ExecutedOrder for %s", ticket,
+                )
+
+        if open_row is None:
+            current_sl = float(position.get("sl") or 0)
+            current_tp = float(position.get("tp") or 0)
+            initial_risk = abs(entry_price - current_sl) if current_sl else 0.0
+            try:
+                db_manager.add(OpenPosition(
+                    ticket=ticket,
+                    magic_number=magic,
+                    symbol=symbol,
+                    direction=direction,
+                    volume=entry_volume,
+                    price_open=entry_price,
+                    price_current=float(position.get("price_current") or entry_price),
+                    sl=current_sl,
+                    tp=current_tp,
+                    swap=float(position.get("swap") or 0),
+                    profit=float(position.get("profit") or 0),
+                    commission=0.0,
+                    strategy=strategy,
+                    time_open=entry_time,
+                    environment=self.environment,
+                    initial_sl=current_sl,
+                    initial_tp=current_tp,
+                    initial_risk_distance=initial_risk,
+                    remaining_volume=float(position["volume"]),
+                    highest_r=0.0,
+                    lowest_r=0.0,
+                    break_even_activated=False,
+                    trailing_active=False,
+                    partial_tp_taken=[],
+                    management_state={},
+                ))
+            except Exception:
+                logger.exception(
+                    "Failed to create recovered OpenPosition for %s", ticket,
+                )
+                return
+
+        self.initialize_position_tracking(
+            ticket=ticket,
+            direction=direction,
+            entry_price=entry_price,
+            sl=float(position.get("sl") or 0),
+            tp=float(position.get("tp") or 0),
+            volume=float(position["volume"]),
+            strategy=strategy,
+        )
+        logger.info(
+            "F-05 RECOVERY completed | ticket=%s entry=%.5f vol=%.3f "
+            "strategy=%s",
+            ticket, entry_price, entry_volume, strategy,
+        )
+
+    def _lookup_strategy_for_ticket(self, ticket: int) -> Optional[str]:
+        req = db_manager.query_one(
+            OrderRequest, mt5_ticket=ticket, environment=self.environment,
+        )
+        if req is not None and req.comment:
+            return req.comment.replace("SMC_", "").strip() or None
+        return None
+
+    # ---------------------------------------------------------
+    # Deal-history access helpers
+    # ---------------------------------------------------------
+
+    def _deals_for_ticket(self, ticket: int) -> List[Dict]:
+        """Query MT5 deal history for one position. Returns [] on failure."""
+        try:
+            deals = mt5_connector.get_history_deals(
+                from_date=datetime.now(timezone.utc) - timedelta(days=90),
+                to_date=datetime.now(timezone.utc) + timedelta(minutes=1),
+            )
+        except Exception:
+            logger.exception(
+                "Could not fetch deal history while reconciling %s", ticket,
+            )
+            return []
+        if deals is None:
+            return []
+        return [
+            d for d in deals
+            if int(d.get("position_id") or 0) == int(ticket)
+        ]
+
+    def _find_first_entry_deal(self, ticket: int) -> Optional[Dict]:
+        for deal in self._deals_for_ticket(ticket):
+            if deal.get("entry") == "IN":
+                return deal
+        return None
+
+    # =========================================================
+    # F-06: closed-trade reconstruction
+    # =========================================================
+
+    def reconstruct_closed_trade(
+        self, ticket: int, exit_reason: str = "RECOVERED",
+    ) -> bool:
+        """Create or complete a ClosedTrade row for one ticket.
+
+        Idempotent: if a ClosedTrade already exists, this returns True
+        and does nothing.
+        """
+        existing = db_manager.query_one(
+            ClosedTrade, ticket=ticket, environment=self.environment,
+        )
+        if existing is not None:
+            return True
+
+        deals = self._deals_for_ticket(ticket)
+        if not deals:
+            logger.warning(
+                "Cannot reconstruct ClosedTrade for ticket %s: no deals "
+                "returned by history query.", ticket,
+            )
+            return False
+
+        entry_deals = [d for d in deals if d.get("entry") == "IN"]
+        exit_deals = [
+            d for d in deals
+            if d.get("entry") in ("OUT", "OUT_BY", "INOUT")
+        ]
+        if not entry_deals or not exit_deals:
+            logger.warning(
+                "Cannot reconstruct ClosedTrade for ticket %s: deals "
+                "incomplete (entries=%d, exits=%d).",
+                ticket, len(entry_deals), len(exit_deals),
+            )
+            return False
+
+        total_profit = sum(float(d.get("profit") or 0) for d in deals)
+        total_swap = sum(float(d.get("swap") or 0) for d in deals)
+        total_commission = sum(float(d.get("commission") or 0) for d in deals)
+        net_profit = total_profit + total_swap + total_commission
+
+        # Entry price: first IN deal.
+        first_entry = entry_deals[0]
+        entry_time = first_entry["time"]
+        entry_price = float(first_entry["price"])
+        entry_volume = float(first_entry["volume"])
+        direction = self._direction(first_entry["type"])
+        if direction not in ("BUY", "SELL"):
+            direction = "BUY"
+        symbol = first_entry.get("symbol") or ""
+        magic = int(first_entry.get("magic") or 0)
+
+        # Close price: volume-weighted average of OUT deals.
+        total_exit_volume = sum(
+            float(d["volume"]) for d in exit_deals if d["volume"]
+        )
+        if total_exit_volume > 0:
+            close_price = sum(
+                float(d["price"]) * float(d["volume"]) for d in exit_deals
+            ) / total_exit_volume
+        else:
+            close_price = float(exit_deals[-1]["price"])
+
+        close_time = exit_deals[-1]["time"]
+        duration = max(
+            0.0,
+            (close_time - entry_time).total_seconds() / 3600.0,
+        )
+
+        executed = db_manager.query_one(
+            ExecutedOrder, ticket=ticket, environment=self.environment,
+        )
+        original_sl = float(executed.sl or 0) if executed else 0.0
+        original_tp = float(executed.tp or 0) if executed else 0.0
+        initial_risk = abs(entry_price - original_sl) if original_sl else 0.0
+
+        if initial_risk > 0:
+            if direction == "BUY":
+                realized_r = (close_price - entry_price) / initial_risk
+            else:
+                realized_r = (entry_price - close_price) / initial_risk
+        else:
+            realized_r = 0.0
+            logger.warning(
+                "ClosedTrade ticket %s: initial_risk unavailable; "
+                "realized_r set to 0.",
+                ticket,
+            )
+
+        strategy = (
+            (executed.comment.replace("SMC_", "").strip() or "UNKNOWN")
+            if executed and executed.comment
+            else (self._lookup_strategy_for_ticket(ticket) or "RECOVERED")
+        )
+
+        try:
+            db_manager.add(ClosedTrade(
+                ticket=ticket,
+                magic_number=magic,
+                symbol=symbol,
+                direction=direction,
+                volume=entry_volume,
+                price_open=entry_price,
+                price_close=close_price,
+                sl=original_sl,
+                tp=original_tp,
+                profit=total_profit,
+                swap=total_swap,
+                commission=total_commission,
+                net_profit=net_profit,
+                risk_percent=0.0,
+                realized_r=realized_r,
+                strategy=strategy,
+                entry_reason=None,
+                exit_reason=exit_reason,
+                time_open=entry_time,
+                time_close=close_time,
+                duration_hours=duration,
+                environment=self.environment,
+            ))
+        except Exception:
+            logger.exception(
+                "Failed to insert reconstructed ClosedTrade for %s", ticket,
+            )
+            return False
+
+        # Update ExecutedOrder with actual realised values.
+        if executed is not None:
+            try:
+                db_manager.update(
+                    ExecutedOrder,
+                    executed.id,
+                    profit=total_profit,
+                    swap=total_swap,
+                    commission=total_commission,
+                    time_close=close_time,
+                    price_current=close_price,
+                    reason=exit_reason,
+                )
+            except Exception:
+                logger.exception(
+                    "Could not update ExecutedOrder %s after reconstruction.",
+                    ticket,
+                )
+        # Clean up OpenPosition and tracking.
+        try:
+            with db_manager.get_session() as session:
+                session.query(OpenPosition).filter(
+                    OpenPosition.ticket == ticket,
+                    OpenPosition.environment == self.environment,
+                ).delete()
+        except Exception:
+            logger.exception(
+                "Could not delete OpenPosition row for %s", ticket,
+            )
+
+        try:
+            with db_manager.get_session() as session:
+                session.query(OpenPosition).filter(
+                    OpenPosition.ticket == ticket,
+                    OpenPosition.environment == self.environment,
+                ).delete()
+        except Exception:
+            logger.exception(
+                "Could not delete OpenPosition row for %s", ticket,
+            )
+
+        self.remove_position(ticket)
+
+        logger.info(
+            "F-06 RECOVERY | ClosedTrade reconstructed | ticket=%s "
+            "profit=%.2f swap=%.2f comm=%.2f net=%.2f R=%.2f reason=%s",
+            ticket, total_profit, total_swap, total_commission,
+            net_profit, realized_r, exit_reason,
+        )
         return True
 
 

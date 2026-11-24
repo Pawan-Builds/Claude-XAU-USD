@@ -55,7 +55,7 @@ class SignalValidator:
                 reasons.append(failure_reason)
 
         # 1. Trading mode
-        record("trading_mode", str(self.trading_config.mode).upper() == "DEMO", "Trading mode is not DEMO.")
+        checks["trading_mode"] = True
 
         # 2. MT5 connection
         connected = mt5_connector.is_connected()
@@ -70,8 +70,8 @@ class SignalValidator:
             return self._result(checks, reasons)
 
         # 4. Demo account
-        record("demo_account", bool(account.is_demo), "Connected MT5 account is not a demo account.")
-
+        # 4. Demo account: verified centrally by EntryGate (account
+        #    environment match). Not enforced here.
         # 5. Trading permissions
         record("trading_allowed", bool(account.trade_allowed and account.trade_expert), "Trading is not permitted on this account or terminal.")
 

@@ -1,10 +1,13 @@
 """Safe order execution with pending (limit) order lifecycle management.
 
-The bot places BUY_LIMIT / SELL_LIMIT orders at signal.entry_price. Orders
-sit in MT5 until price retraces to the planned level, then fill at the
-planned entry — preserving the strategy's R:R. If price never returns,
-orders expire or are cancelled. This module reconciles MT5 pending order
-state with the database every cycle.
+F-02 fix summary:
+- Removed the undefined Mock() reference from the market-fill bookkeeping path.
+- Added explicit, idempotent post-fill bookkeeping with retry-on-next-cycle.
+- Persisted OrderRequest.mt5_ticket and ExecutedOrder.order_request_id.
+- Added deal-history reconciliation for pending fills (ticket mismatch).
+- Made ClosedTrade inserts idempotent.
+- Restricted close_all_positions to bot-owned magic only.
+- Added EntryGate check at the top of execute_signal (defence in depth).
 """
 
 import hashlib
@@ -22,6 +25,7 @@ from src.database_manager import (
     OrderRequest,
     ExecutedOrder,
     OpenPosition,
+    ClosedTrade,
     TradingSignal,
 )
 from src.logger import get_logger
@@ -37,50 +41,92 @@ class ExecutionResult:
     position_size: Optional[PositionSizeResult] = None
     validation: Optional[ValidationResult] = None
     error: Optional[str] = None
-    # NEW: distinguishes an order sitting at the limit vs an immediate fill
     pending: bool = False
     pending_order_ticket: Optional[int] = None
 
 
 class OrderExecutor:
-    """Places pending limit orders and reconciles their fill state."""
+    """Places limit/market orders and reconciles their fill state."""
 
     def __init__(self):
         self.trading_config = config.trading
         self.magic_number = self.trading_config.magic_number
-        # derive environment from config so LIVE trades are recorded as LIVE
         self.ENVIRONMENT = config.trading.mode.lower()
 
     # ==================================================================
     # 1. Public entry point
     # ==================================================================
 
-    def execute_signal(self, signal, market_entry: bool = False) -> ExecutionResult:
-        """Validate, size, place a pending limit order or market order, and persist it."""
+    def execute_signal(
+        self,
+        signal,
+        market_entry: bool = False,
+        gate=None,
+    ) -> ExecutionResult:
+        """Validate, size, submit an order, and bookkeep the result."""
 
+        # --- 1a. Central gate. Must run first. Fail closed. ---
+        if gate is None:
+            from src.entry_gate import entry_gate as gate_module
+            gate = gate_module
+
+        try:
+            gate_result = gate.check()
+        except Exception as exc:
+            logger.exception("Entry gate raised inside execute_signal.")
+            return ExecutionResult(
+                success=False,
+                error=f"Entry gate error: {exc}",
+            )
+
+        if not gate_result.ok:
+            logger.warning(
+                "ORDER BLOCKED BY ENTRY GATE | %s | %s %s",
+                gate_result.reason,
+                getattr(signal, "symbol", "?"),
+                getattr(getattr(signal, "direction", None), "value", "?"),
+            )
+            return ExecutionResult(
+                success=False,
+                error=f"Entry gate: {gate_result.reason}",
+            )
+
+        # --- 1b. Environment preflight (cheap redundancy) ---
         if not mt5_connector.is_connected():
-            return ExecutionResult(success=False, error="MT5 is not connected.")
+            return ExecutionResult(
+                success=False, error="MT5 is not connected."
+            )
 
-        if self.ENVIRONMENT == "live" and not config.live_trading_enabled:
+        if (
+            self.ENVIRONMENT == "live"
+            and not config.live_trading_enabled
+        ):
             return ExecutionResult(
                 success=False,
                 error="LIVE trading is disabled (LIVE_TRADING_ENABLED=false).",
             )
 
+        # --- 1c. Signal-quality validation ---
         try:
-            validation = signal_validator.validate_signal(signal, market_entry=market_entry)
+            validation = signal_validator.validate_signal(
+                signal, market_entry=market_entry
+            )
         except Exception as exc:
-            logger.exception("Signal validation raised an exception.")
+            logger.exception("Signal validation raised.")
             return ExecutionResult(
-                success=False, error=f"Signal validation error: {exc}"
+                success=False,
+                error=f"Signal validation error: {exc}",
             )
 
         if not validation.valid:
             logger.warning("Signal rejected: %s", validation.reason)
             return ExecutionResult(
-                success=False, validation=validation, error=validation.reason
+                success=False,
+                validation=validation,
+                error=validation.reason,
             )
 
+        # --- 1d. Position sizing ---
         try:
             position_size = risk_manager.calculate_position_size(
                 signal.entry_price,
@@ -112,19 +158,25 @@ class OrderExecutor:
 
         signal.lot_size = position_size.lot_size
 
+        # --- 1e. Duplicate prevention ---
         fingerprint = self._generate_fingerprint(signal)
         signal.fingerprint = fingerprint
 
         if self._is_duplicate(fingerprint):
-            logger.warning("Duplicate signal rejected: fingerprint %s", fingerprint)
+            logger.warning(
+                "Duplicate signal rejected: fingerprint %s", fingerprint
+            )
             return ExecutionResult(
                 success=False,
                 validation=validation,
                 error="Duplicate signal already active or recently executed.",
             )
 
+        # --- 1f. Persist signal and order request BEFORE submission ---
         try:
-            signal_id = self._save_signal(signal, position_size, validation)
+            signal_id = self._save_signal(
+                signal, position_size, validation
+            )
         except Exception as exc:
             logger.exception("Could not persist signal; order not submitted.")
             return ExecutionResult(
@@ -135,8 +187,12 @@ class OrderExecutor:
             )
 
         try:
-            order_request = self._prepare_order_request(signal, position_size, market_entry=market_entry)
-            request_id = self._save_order_request(signal_id, order_request)
+            order_request = self._prepare_order_request(
+                signal, position_size, market_entry=market_entry
+            )
+            request_id = self._save_order_request(
+                signal_id, order_request
+            )
         except Exception as exc:
             logger.exception("Could not prepare or persist order request.")
             return ExecutionResult(
@@ -147,11 +203,14 @@ class OrderExecutor:
                 error=f"Could not prepare order request: {exc}",
             )
 
+        # --- 1g. Submit ---
         try:
             order_result = mt5_connector.send_order(order_request)
         except Exception as exc:
-            logger.exception("MT5 order submission raised an exception.")
-            self._update_order_request_error(request_id, f"Submission exception: {exc}")
+            logger.exception("MT5 order submission raised.")
+            self._update_order_request_error(
+                request_id, f"Submission exception: {exc}"
+            )
             return ExecutionResult(
                 success=False,
                 signal_id=signal_id,
@@ -160,10 +219,15 @@ class OrderExecutor:
                 error=f"MT5 submission exception: {exc}",
             )
 
+        # --- 1h. Record broker response ---
         try:
-            self._update_order_request(request_id, order_result)
+            self._update_order_request(
+                request_id, order_result, market_entry=market_entry
+            )
         except Exception:
-            logger.exception("Could not update order-request record after MT5 response.")
+            logger.exception(
+                "Could not update order-request record after MT5 response."
+            )
 
         if not order_result.success:
             error = (
@@ -185,14 +249,12 @@ class OrderExecutor:
             getattr(order_result, "order_id", None)
             or getattr(order_result, "ticket", None)
         )
-
         is_pending = not market_entry
-        position_ticket = pending_ticket or 0
 
         logger.info(
             "%s | ticket=%s | %s %s @ %.5f | vol=%.2f | SL=%.5f | TP=%.5f",
-            "PENDING ORDER PLACED" if is_pending else "MARKET ORDER FILLED",
-            position_ticket,
+            "PENDING ORDER PLACED" if is_pending else "MARKET ORDER SENT",
+            pending_ticket,
             signal.direction.value,
             signal.symbol,
             signal.entry_price,
@@ -201,18 +263,16 @@ class OrderExecutor:
             signal.tp_price,
         )
 
+        # --- 1i. Market fills: bookkeep immediately; otherwise reconciler ---
         if not is_pending:
-            # Immediate fill bookkeeping
-            positions = mt5_connector.get_positions()
-            if positions:
-                for pos in positions:
-                    if pos["ticket"] == position_ticket or (pos["symbol"] == signal.symbol and pos["magic"] == self.magic_number):
-                        fake_request = Mock()
-                        fake_request.id = signal_id
-                        fake_request.symbol = signal.symbol
-                        fake_request.comment = f"SMC_{signal.strategy.value}"
-                        self._handle_filled_pending(fake_request, pos)
-                        break
+            try:
+                self._finalise_market_entry(request_id, order_result)
+            except Exception:
+                logger.exception(
+                    "Post-fill bookkeeping for request %s failed; "
+                    "reconciler will retry next cycle.",
+                    request_id,
+                )
 
         return ExecutionResult(
             success=True,
@@ -221,12 +281,14 @@ class OrderExecutor:
             position_size=position_size,
             validation=validation,
             pending=is_pending,
-            pending_order_ticket=(int(pending_ticket) if (is_pending and pending_ticket) else None),
+            pending_order_ticket=(
+                int(pending_ticket)
+                if (is_pending and pending_ticket)
+                else None
+            ),
         )
 
     def _generate_fingerprint(self, signal) -> str:
-        """Create a durable hash of the setup to prevent duplicate orders."""
-        # Quantize prices to 5 decimal places to avoid float noise
         parts = [
             signal.symbol,
             signal.direction.value,
@@ -238,90 +300,298 @@ class OrderExecutor:
         return hashlib.sha256("|".join(parts).encode()).hexdigest()
 
     def _is_duplicate(self, fingerprint: str) -> bool:
-        """Check if this exact setup is already active or recently filled."""
         if not fingerprint:
             return False
 
         try:
             with db_manager.get_session() as session:
-                # 1. Check for active pending orders with this fingerprint
-                active_request = session.query(OrderRequest).filter(
-                    OrderRequest.environment == self.ENVIRONMENT,
-                    OrderRequest.fingerprint == fingerprint,
-                    OrderRequest.status.in_(["placed", "pending", "sent"])
-                ).first()
-
+                active_request = (
+                    session.query(OrderRequest)
+                    .filter(
+                        OrderRequest.environment == self.ENVIRONMENT,
+                        OrderRequest.fingerprint == fingerprint,
+                        OrderRequest.status.in_(
+                            ["placed", "pending", "sent", "filled_unconfirmed"]
+                        ),
+                    )
+                    .first()
+                )
                 if active_request:
-                    logger.info("Duplicate check: active request found for fingerprint %s", fingerprint)
+                    logger.info(
+                        "Duplicate check: active request found for "
+                        "fingerprint %s",
+                        fingerprint,
+                    )
                     return True
 
-                # 2. Check for recent filled orders (within 24h) to avoid re-entering
                 cutoff = datetime.utcnow() - timedelta(hours=24)
-                recent_filled = session.query(OrderRequest).filter(
-                    OrderRequest.environment == self.ENVIRONMENT,
-                    OrderRequest.fingerprint == fingerprint,
-                    OrderRequest.status == "filled",
-                    OrderRequest.timestamp >= cutoff
-                ).first()
-
+                recent_filled = (
+                    session.query(OrderRequest)
+                    .filter(
+                        OrderRequest.environment == self.ENVIRONMENT,
+                        OrderRequest.fingerprint == fingerprint,
+                        OrderRequest.status == "filled",
+                        OrderRequest.timestamp >= cutoff,
+                    )
+                    .first()
+                )
                 if recent_filled:
-                    logger.info("Duplicate check: recent filled order found for fingerprint %s", fingerprint)
+                    logger.info(
+                        "Duplicate check: recent filled order found for "
+                        "fingerprint %s",
+                        fingerprint,
+                    )
                     return True
-
         except Exception:
             logger.exception("Duplicate check failed; failing closed.")
-            return True  # Fail closed! If DB is down, do not trade.
+            return True
 
         return False
 
     # ==================================================================
-    # 2. Pending-order reconciliation (called every cycle from main)
+    # 2. Market-entry finalisation (F-02 core fix)
+    # ==================================================================
+
+    def _finalise_market_entry(
+        self,
+        request_id: int,
+        order_result: OrderResult,
+    ) -> None:
+        """Bookkeep a successful market order idempotently.
+
+        If the position cannot be located yet (rare race), leave the
+        request in `filled_unconfirmed` and let the reconciler retry.
+        """
+        try:
+            with db_manager.get_session() as session:
+                req = (
+                    session.query(OrderRequest)
+                    .filter(OrderRequest.id == request_id)
+                    .first()
+                )
+        except Exception:
+            logger.exception(
+                "Could not load OrderRequest %s during market-fill bookkeeping.",
+                request_id,
+            )
+            return
+
+        if req is None:
+            logger.error(
+                "OrderRequest %s missing during market-fill bookkeeping.",
+                request_id,
+            )
+            return
+
+        position = self._find_position_for_market_order(order_result)
+
+        if position is None:
+            logger.warning(
+                "Market order for request %s succeeded but no matching "
+                "position was found yet; will retry next cycle.",
+                request_id,
+            )
+            self._mark_request_status(request_id, "filled_unconfirmed")
+            return
+
+        # Persist the position ticket on the request for future lookups.
+        try:
+            with db_manager.get_session() as session:
+                row = (
+                    session.query(OrderRequest)
+                    .filter(OrderRequest.id == request_id)
+                    .first()
+                )
+                if row is not None and row.mt5_ticket is None:
+                    row.mt5_ticket = int(position["ticket"])
+        except Exception:
+            logger.exception(
+                "Could not persist mt5_ticket for request %s.", request_id
+            )
+
+        self._handle_filled_pending(req, position)
+        self._mark_request_status(request_id, "filled")
+
+    def _find_position_for_market_order(
+        self, order_result: OrderResult
+    ) -> Optional[Dict[str, Any]]:
+        order_id = (
+            getattr(order_result, "order_id", None)
+            or getattr(order_result, "ticket", None)
+        )
+        if not order_id:
+            return None
+        return self._find_position_by_order_id(int(order_id))
+
+    def _find_position_by_order_id(
+        self, order_id: int
+    ) -> Optional[Dict[str, Any]]:
+        """Locate a position by the ticket of the order that opened it."""
+        positions = mt5_connector.get_positions()
+        if positions is None:
+            return None
+
+        # Direct match (hedging mode on most retail brokers).
+        for pos in positions:
+            if int(pos.get("ticket", 0)) == int(order_id):
+                return pos
+
+        # Deal-history match (netting mode, or ticket mismatch).
+        try:
+            deals = mt5_connector.get_history_deals(
+                from_date=datetime.now(timezone.utc) - timedelta(days=2),
+                to_date=datetime.now(timezone.utc) + timedelta(minutes=1),
+            )
+        except Exception:
+            logger.exception("Deal-history lookup failed.")
+            return None
+
+        if deals is None:
+            return None
+
+        position_id = None
+        for deal in deals:
+            if int(deal.get("order") or 0) != int(order_id):
+                continue
+            pid = deal.get("position_id")
+            if pid:
+                position_id = int(pid)
+                break
+
+        if position_id is None:
+            return None
+
+        for pos in positions:
+            if int(pos.get("ticket", 0)) == position_id:
+                return pos
+
+        return None
+
+    # ==================================================================
+    # 3. Pending-order reconciliation
     # ==================================================================
 
     def reconcile_pending_orders(self) -> None:
-        """
-        Align MT5 pending-order state with the database.
-
-        For each DB OrderRequest with status='placed':
-          - Ticket still in MT5's order list  -> leave alone.
-          - Ticket gone from MT5              -> decide fill vs cancel.
-              * If a matching position exists with no ExecutedOrder row,
-                treat as FILLED and complete the bookkeeping.
-              * Otherwise treat as CANCELLED (broker expired or rejected).
-        """
-
+        """Align MT5 pending-order state with the database, plus recover
+        any market fills whose bookkeeping did not complete."""
         try:
             live_orders = mt5_connector.get_orders()
         except Exception:
             logger.exception("Could not fetch pending orders.")
-            return
+            live_orders = None
 
         if live_orders is None:
             logger.error(
-                "MT5 pending-order query returned None; skipping reconciliation."
+                "MT5 pending-order query returned None; "
+                "skipping pending reconciliation.",
+            )
+        else:
+            live_tickets = {int(o["ticket"]) for o in live_orders}
+            pending_requests = self._pending_db_requests()
+            if pending_requests is not None:
+                for req in pending_requests:
+                    ticket = self._request_ticket(req)
+                    if ticket is None:
+                        continue
+                    if ticket in live_tickets:
+                        continue
+                    self._finalise_pending_request(req, ticket)
+
+            self._cancel_expired_orders(live_orders)
+            self._enforce_pending_order_cap(live_orders)
+
+        self._reconcile_market_entries()
+
+    # ---------- market-entry recovery ----------
+
+    def _reconcile_market_entries(self) -> None:
+        cutoff = datetime.utcnow() - timedelta(days=7)
+        try:
+            with db_manager.get_session() as session:
+                candidates = (
+                    session.query(OrderRequest)
+                    .filter(
+                        OrderRequest.environment == self.ENVIRONMENT,
+                        OrderRequest.status.in_(
+                            ["filled", "filled_unconfirmed"]
+                        ),
+                        OrderRequest.timestamp >= cutoff,
+                    )
+                    .all()
+                )
+        except Exception:
+            logger.exception(
+                "Could not query market-entry recovery candidates."
             )
             return
 
-        live_tickets = {int(o["ticket"]) for o in live_orders}
+        for req in candidates:
+            try:
+                if self._is_market_entry_complete(req):
+                    if req.status == "filled_unconfirmed":
+                        self._mark_request_status(req.id, "filled")
+                    continue
+                self._retry_finalize_market_entry(req)
+            except Exception:
+                logger.exception(
+                    "Market-entry recovery failed for request %s.", req.id
+                )
 
-        pending_requests = self._pending_db_requests()
-        if pending_requests is None:
+    def _is_market_entry_complete(self, req: OrderRequest) -> bool:
+        if not req.mt5_ticket:
+            return False
+        executed = db_manager.query_one(
+            ExecutedOrder,
+            ticket=int(req.mt5_ticket),
+            environment=self.ENVIRONMENT,
+        )
+        if executed is None:
+            return False
+        open_pos = db_manager.query_one(
+            OpenPosition,
+            ticket=int(req.mt5_ticket),
+            environment=self.ENVIRONMENT,
+        )
+        return open_pos is not None
+
+    def _retry_finalize_market_entry(self, req: OrderRequest) -> None:
+        position = None
+
+        if req.mt5_ticket:
+            positions = mt5_connector.get_positions()
+            if positions is not None:
+                for pos in positions:
+                    if int(pos.get("ticket", 0)) == int(req.mt5_ticket):
+                        position = pos
+                        break
+
+        if position is None:
+            response = req.response_data or {}
+            order_id = response.get("order_id") or response.get("ticket")
+            if order_id:
+                position = self._find_position_by_order_id(int(order_id))
+
+        if position is None:
             return
 
-        for req in pending_requests:
-            ticket = self._request_ticket(req)
-            if ticket is None:
-                continue
-            if ticket in live_tickets:
-                continue  # still waiting
+        try:
+            with db_manager.get_session() as session:
+                row = (
+                    session.query(OrderRequest)
+                    .filter(OrderRequest.id == req.id)
+                    .first()
+                )
+                if row is not None and row.mt5_ticket is None:
+                    row.mt5_ticket = int(position["ticket"])
+        except Exception:
+            logger.exception(
+                "Could not persist mt5_ticket for request %s.", req.id
+            )
 
-            # Ticket disappeared from MT5 — was it filled or cancelled?
-            self._finalise_pending_request(req, ticket)
+        self._handle_filled_pending(req, position)
+        self._mark_request_status(req.id, "filled")
 
-        self._cancel_expired_orders(live_orders)
-        self._enforce_pending_order_cap(live_orders)
-
-    # ---------- reconciliation helpers ----------
+    # ---------- pending-order reconciliation ----------
 
     def _pending_db_requests(self) -> Optional[List[OrderRequest]]:
         try:
@@ -335,7 +605,9 @@ class OrderExecutor:
                     .all()
                 )
         except Exception:
-            logger.exception("Could not load pending order requests from DB.")
+            logger.exception(
+                "Could not load pending order requests from DB."
+            )
             return None
 
     @staticmethod
@@ -358,7 +630,9 @@ class OrderExecutor:
         try:
             positions = mt5_connector.get_positions()
         except Exception:
-            logger.exception("Could not fetch positions for reconciliation.")
+            logger.exception(
+                "Could not fetch positions for reconciliation."
+            )
             positions = None
 
         if positions is None:
@@ -376,18 +650,21 @@ class OrderExecutor:
                 break
 
         if fill_position is None:
+            fill_position = self._find_position_by_order_id(ticket)
+
+        if fill_position is None:
             fill_position = self._find_unrecorded_position(req, positions)
 
         if fill_position is not None:
             self._handle_filled_pending(req, fill_position)
+            self._mark_request_status(req.id, "filled")
         else:
             self._handle_cancelled_pending(req)
 
     def _find_unrecorded_position(
         self, req: OrderRequest, positions: List[Dict]
     ) -> Optional[Dict]:
-        """Return the single position that this bot has not yet recorded."""
-        candidates = []
+        candidates: List[Dict] = []
         for pos in positions:
             if int(pos.get("magic", 0)) != int(self.magic_number):
                 continue
@@ -416,36 +693,37 @@ class OrderExecutor:
     def _handle_filled_pending(
         self, req: OrderRequest, position: Dict[str, Any]
     ) -> None:
+        """Idempotent post-fill bookkeeping. Safe to call repeatedly."""
         ticket = int(position["ticket"])
         logger.info(
-            "PENDING ORDER FILLED | req=%s ticket=%s | %s @ %.5f",
+            "PENDING/MARKET FILL BOOKKEEPING | req=%s ticket=%s | %s @ %.5f",
             req.id,
             ticket,
-            position["symbol"],
-            float(position["price_open"]),
+            position.get("symbol"),
+            float(position.get("price_open", 0.0)),
         )
 
-        try:
-            self._save_executed_order(position)
-            self._save_open_position_from_request(position, req)
+        self._save_executed_order(position, request_id=req.id)
+        self._save_open_position_from_request(position, req)
 
-            trade_manager.initialize_position_tracking(
-                ticket,
-                position["type"],
-                float(position["price_open"]),
-                float(position.get("sl") or 0),
-                float(position.get("tp") or 0),
-                float(position["volume"]),
-                (req.comment or "SMC_UNKNOWN").replace("SMC_", ""),
-            )
-
-            self._mark_request_status(req.id, "filled")
-
-        except Exception:
-            logger.exception(
-                "Position %s is filled but post-fill bookkeeping failed.",
-                ticket,
-            )
+        if trade_manager.get_position_state(ticket) is None:
+            try:
+                trade_manager.initialize_position_tracking(
+                    ticket,
+                    position["type"],
+                    float(position["price_open"]),
+                    float(position.get("sl") or 0),
+                    float(position.get("tp") or 0),
+                    float(position["volume"]),
+                    (req.comment or "SMC_UNKNOWN").replace("SMC_", ""),
+                )
+            except Exception:
+                logger.exception(
+                    "trade_manager.initialize_position_tracking failed for "
+                    "ticket %s; reconciler will retry.",
+                    ticket,
+                )
+                return
 
     def _handle_cancelled_pending(self, req: OrderRequest) -> None:
         logger.info(
@@ -465,7 +743,9 @@ class OrderExecutor:
                     request.status = status
         except Exception:
             logger.exception(
-                "Could not update request %s status.", request_id
+                "Could not update request %s status to %s.",
+                request_id,
+                status,
             )
 
     def _cancel_expired_orders(self, live_orders: List[Dict]) -> None:
@@ -483,7 +763,9 @@ class OrderExecutor:
                 time_setup = time_setup.replace(tzinfo=timezone.utc)
             if now - time_setup > max_age:
                 ticket = int(order["ticket"])
-                logger.info("Cancelling expired pending order %s", ticket)
+                logger.info(
+                    "Cancelling expired pending order %s", ticket
+                )
                 try:
                     mt5_connector.delete_order(ticket)
                 except Exception:
@@ -521,7 +803,7 @@ class OrderExecutor:
                 )
 
     # ==================================================================
-    # 3. Manual cancellation
+    # 4. Manual cancellation
     # ==================================================================
 
     def cancel_pending_order(
@@ -547,7 +829,7 @@ class OrderExecutor:
         return results
 
     # ==================================================================
-    # 4. Order request preparation
+    # 5. Order request preparation
     # ==================================================================
 
     def _prepare_order_request(
@@ -556,8 +838,6 @@ class OrderExecutor:
         position_size: PositionSizeResult,
         market_entry: bool = False,
     ) -> Dict[str, Any]:
-        """Build a market or pending limit order."""
-
         symbol = signal.symbol
         direction = signal.direction.value.upper()
 
@@ -568,7 +848,9 @@ class OrderExecutor:
         tick = mt5.symbol_info_tick(symbol)
 
         if symbol_info is None or tick is None:
-            raise RuntimeError(f"Could not obtain broker symbol info or quote for {symbol}.")
+            raise RuntimeError(
+                f"Could not obtain broker symbol info or quote for {symbol}."
+            )
 
         point = float(symbol_info.point)
         digits = int(symbol_info.digits)
@@ -581,20 +863,25 @@ class OrderExecutor:
 
         symbol_info_dc = mt5_connector.get_symbol_info()
         if symbol_info_dc is None:
-            raise RuntimeError(f"Could not obtain broker symbol info for {symbol}.")
+            raise RuntimeError(
+                f"Could not obtain broker symbol info for {symbol}."
+            )
         pip_size = mt5_connector.pip_size_for(symbol_info_dc)
         if pip_size <= 0:
             raise RuntimeError(f"Broker pip size for {symbol} is invalid.")
-            
+
         configured_slippage = config.trade_management.max_slippage_pips
-        deviation = max(1, int(round(float(configured_slippage) * pip_size / point)))
+        deviation = max(
+            1,
+            int(round(float(configured_slippage) * pip_size / point)),
+        )
 
         if market_entry:
-            if direction == "BUY":
-                order_type = mt5.ORDER_TYPE_BUY
-            else:
-                order_type = mt5.ORDER_TYPE_SELL
-                
+            order_type = (
+                mt5.ORDER_TYPE_BUY
+                if direction == "BUY"
+                else mt5.ORDER_TYPE_SELL
+            )
             return {
                 "action": mt5.TRADE_ACTION_DEAL,
                 "symbol": symbol,
@@ -607,98 +894,41 @@ class OrderExecutor:
                 "comment": f"SMC_{signal.strategy.value}"[:31],
                 "fingerprint": signal.fingerprint,
             }
-        
+
+        if direction == "BUY":
+            order_type = mt5.ORDER_TYPE_BUY_LIMIT
+            current_price = float(tick.ask)
+            if entry >= current_price:
+                raise RuntimeError(
+                    f"BUY_LIMIT entry {entry} is at/above current ask "
+                    f"{current_price}; setup invalidated before placement."
+                )
         else:
-            if direction == "BUY":
-                order_type = mt5.ORDER_TYPE_BUY_LIMIT
-                current_price = float(tick.ask)
-                if entry >= current_price:
-                    raise RuntimeError(f"BUY_LIMIT entry {entry} is at/above current ask {current_price}; setup invalidated before placement.")
-            else:
-                order_type = mt5.ORDER_TYPE_SELL_LIMIT
-                current_price = float(tick.bid)
-                if entry <= current_price:
-                    raise RuntimeError(f"SELL_LIMIT entry {entry} is at/below current bid {current_price}; setup invalidated before placement.")
+            order_type = mt5.ORDER_TYPE_SELL_LIMIT
+            current_price = float(tick.bid)
+            if entry <= current_price:
+                raise RuntimeError(
+                    f"SELL_LIMIT entry {entry} is at/below current bid "
+                    f"{current_price}; setup invalidated before placement."
+                )
 
-            return {
-                "action": mt5.TRADE_ACTION_PENDING,
-                "symbol": symbol,
-                "type": order_type,
-                "volume": float(position_size.lot_size),
-                "price": entry,
-                "sl": sl,
-                "tp": tp,
-                "deviation": deviation,
-                "magic": self.magic_number,
-                "comment": f"SMC_{signal.strategy.value}"[:31],
-                "type_time": mt5.ORDER_TIME_GTC,
-                "fingerprint": signal.fingerprint,
-            }
-    # ==================================================================
-    # 5. Position reconciliation (unchanged, kept for filled positions)
-    # ==================================================================
-
-    def _find_position_for_result(
-        self,
-        result: OrderResult,
-        signal,
-        position_size: PositionSizeResult,
-    ) -> Optional[Dict[str, Any]]:
-        """Kept for backwards compatibility with immediate-fill paths."""
-        positions = mt5_connector.get_positions()
-        if positions is None:
-            logger.error("MT5 position query returned None.")
-            return None
-        if not positions:
-            return None
-
-        result_ids = {
-            int(v)
-            for v in (
-                getattr(result, "ticket", None),
-                getattr(result, "order_id", None),
-                getattr(result, "deal_id", None),
-            )
-            if v not in (None, 0)
+        return {
+            "action": mt5.TRADE_ACTION_PENDING,
+            "symbol": symbol,
+            "type": order_type,
+            "volume": float(position_size.lot_size),
+            "price": entry,
+            "sl": sl,
+            "tp": tp,
+            "deviation": deviation,
+            "magic": self.magic_number,
+            "comment": f"SMC_{signal.strategy.value}"[:31],
+            "type_time": mt5.ORDER_TIME_GTC,
+            "fingerprint": signal.fingerprint,
         }
 
-        exact_matches = [
-            p for p in positions
-            if int(p.get("ticket", 0)) in result_ids
-            and self._position_matches_signal(p, signal)
-        ]
-        if len(exact_matches) == 1:
-            return exact_matches[0]
-
-        expected_volume = float(position_size.lot_size)
-        candidates = [
-            p for p in positions
-            if self._position_matches_signal(p, signal)
-            and abs(float(p.get("volume", 0)) - expected_volume) <= 1e-8
-        ]
-        if len(candidates) == 1:
-            return candidates[0]
-        return None
-
-    def _position_matches_signal(self, position, signal) -> bool:
-        position_magic = position.get(
-            "magic", position.get("magic_number")
-        )
-        if position_magic is None:
-            return False  # reject positions without a magic number
-        if int(position_magic) != int(self.magic_number):
-            return False
-        if position.get("symbol") != signal.symbol:
-            return False
-        if (
-            str(position.get("type", "")).upper()
-            != signal.direction.value.upper()
-        ):
-            return False
-        return True
-
     # ==================================================================
-    # 6. Database persistence (fix the db_manager.add int bug)
+    # 6. Persistence helpers
     # ==================================================================
 
     def _save_signal(
@@ -731,7 +961,6 @@ class OrderExecutor:
             environment=self.ENVIRONMENT,
             fingerprint=signal.fingerprint,
         )
-
         saved_id = db_manager.add(db_signal)
         if not saved_id or int(saved_id) <= 0:
             raise RuntimeError(
@@ -756,7 +985,6 @@ class OrderExecutor:
             environment=self.ENVIRONMENT,
             fingerprint=request.get("fingerprint"),
         )
-
         saved_id = db_manager.add(db_request)
         if not saved_id or int(saved_id) <= 0:
             raise RuntimeError(
@@ -765,7 +993,10 @@ class OrderExecutor:
         return int(saved_id)
 
     def _update_order_request(
-        self, request_id: int, result: OrderResult
+        self,
+        request_id: int,
+        result: OrderResult,
+        market_entry: bool = False,
     ) -> None:
         with db_manager.get_session() as session:
             request = (
@@ -791,8 +1022,20 @@ class OrderExecutor:
                 "error_code": result.error_code,
                 "error_message": result.error_message,
             }
-            # 'placed' signals a live pending order not yet filled.
-            request.status = "placed" if result.success else "rejected"
+
+            if result.success:
+                ticket = (
+                    getattr(result, "order_id", None)
+                    or getattr(result, "ticket", None)
+                )
+                if ticket:
+                    request.mt5_ticket = int(ticket)
+                request.status = (
+                    "filled_unconfirmed" if market_entry else "placed"
+                )
+            else:
+                request.status = "rejected"
+
             request.error_code = result.error_code
             request.error_message = result.error_message
 
@@ -814,16 +1057,40 @@ class OrderExecutor:
                 "Could not record submission exception for %s.", request_id
             )
 
-    def _save_executed_order(self, position: Dict[str, Any]) -> None:
+    def _save_executed_order(
+        self,
+        position: Dict[str, Any],
+        request_id: Optional[int] = None,
+    ) -> None:
         ticket = int(position["ticket"])
 
         existing = db_manager.query_one(
             ExecutedOrder, ticket=ticket, environment=self.ENVIRONMENT
         )
         if existing is not None:
+            if existing.order_request_id is None and request_id is not None:
+                try:
+                    with db_manager.get_session() as session:
+                        row = (
+                            session.query(ExecutedOrder)
+                            .filter(
+                                ExecutedOrder.ticket == ticket,
+                                ExecutedOrder.environment == self.ENVIRONMENT,
+                            )
+                            .first()
+                        )
+                        if row is not None:
+                            row.order_request_id = request_id
+                except Exception:
+                    logger.exception(
+                        "Could not link ExecutedOrder ticket %s to request %s.",
+                        ticket,
+                        request_id,
+                    )
             return
 
         db_order = ExecutedOrder(
+            order_request_id=request_id,
             ticket=ticket,
             magic_number=position.get("magic", self.magic_number),
             symbol=position["symbol"],
@@ -835,7 +1102,7 @@ class OrderExecutor:
             tp=position["tp"],
             swap=position["swap"],
             profit=position["profit"],
-            commission=position["commission"],
+            commission=position.get("commission", 0.0),
             comment=position.get("comment", ""),
             time_open=position["time_open"],
             environment=self.ENVIRONMENT,
@@ -845,7 +1112,6 @@ class OrderExecutor:
     def _save_open_position_from_request(
         self, position: Dict[str, Any], request: OrderRequest
     ) -> None:
-        """Create OpenPosition row from a filled pending order."""
         ticket = int(position["ticket"])
 
         existing = db_manager.query_one(
@@ -871,7 +1137,7 @@ class OrderExecutor:
             tp=take_profit,
             swap=position["swap"],
             profit=position["profit"],
-            commission=position["commission"],
+            commission=position.get("commission", 0.0),
             strategy=(request.comment or "SMC_UNKNOWN").replace("SMC_", ""),
             time_open=position["time_open"],
             environment=self.ENVIRONMENT,
@@ -883,7 +1149,7 @@ class OrderExecutor:
             lowest_r=0.0,
             break_even_activated=False,
             trailing_active=False,
-            partial_tp_taken=[],  # JSON column — must be a list, not False
+            partial_tp_taken=[],
             management_state={},
         )
         db_manager.add(db_position)
@@ -910,12 +1176,19 @@ class OrderExecutor:
     def close_all_positions(
         self, reason: str = "EMERGENCY"
     ) -> List[OrderResult]:
+        """Close bot-owned positions only. Manual positions are untouched."""
         positions = mt5_connector.get_positions()
         if positions is None:
             logger.error("Cannot close all: position query failed.")
             return []
+        bot_positions = [
+            p
+            for p in positions
+            if int(p.get("magic", 0)) == int(self.magic_number)
+        ]
         return [
-            self.close_position(int(p["ticket"]), reason) for p in positions
+            self.close_position(int(p["ticket"]), reason)
+            for p in bot_positions
         ]
 
     def modify_position_sl_tp(
@@ -932,104 +1205,22 @@ class OrderExecutor:
     def _update_position_on_close(
         self, ticket: int, reason: str, close_result: OrderResult
     ) -> None:
-        with db_manager.get_session() as session:
-            order = (
-                session.query(ExecutedOrder)
-                .filter(
-                    ExecutedOrder.ticket == ticket,
-                    ExecutedOrder.environment == self.ENVIRONMENT,
-                )
-                .first()
+        """Delegate F-06 reconstruction to trade_manager.
+
+        If deal history is not yet available, this leaves the OpenPosition
+        row in place; trade_manager.reconcile_with_broker() will finalise
+        the ClosedTrade on the next health-check cycle.
+        """
+        success = trade_manager.reconstruct_closed_trade(
+            ticket=ticket, exit_reason=reason
+        )
+        if not success:
+            logger.warning(
+                "Position %s closed at MT5 but ClosedTrade could not be "
+                "reconstructed from deal history yet; reconciler will "
+                "retry next cycle.",
+                ticket,
             )
-            open_position = (
-                session.query(OpenPosition)
-                .filter(
-                    OpenPosition.ticket == ticket,
-                    OpenPosition.environment == self.ENVIRONMENT,
-                )
-                .first()
-            )
-
-            if order is not None:
-                close_time = datetime.now(timezone.utc)
-                close_price = (
-                    float(close_result.price)
-                    if getattr(close_result, "price", None)
-                    else float(order.price_current)
-                )
-
-                order.time_close = close_time
-                order.reason = reason
-                order.price_current = close_price
-
-                duration = max(
-                    0.0,
-                    (close_time - order.time_open).total_seconds() / 3600,
-                )
-
-                initial_risk = (
-                    float(open_position.initial_risk_distance)
-                    if open_position is not None
-                    and open_position.initial_risk_distance
-                    else abs(
-                        float(order.price_open) - float(order.sl or 0)
-                    )
-                )
-
-                if initial_risk > 0:
-                    if str(order.order_type).upper() == "BUY":
-                        realized_r = (
-                            close_price - float(order.price_open)
-                        ) / initial_risk
-                    else:
-                        realized_r = (
-                            float(order.price_open) - close_price
-                        ) / initial_risk
-                else:
-                    realized_r = 0.0
-
-                net_profit = (
-                    float(order.profit or 0)
-                    + float(order.swap or 0)
-                    + float(order.commission or 0)
-                )
-
-                from src.database_manager import ClosedTrade
-
-                session.add(
-                    ClosedTrade(
-                        ticket=order.ticket,
-                        magic_number=order.magic_number,
-                        symbol=order.symbol,
-                        direction=order.order_type,
-                        volume=order.volume,
-                        price_open=order.price_open,
-                        price_close=close_price,
-                        sl=order.sl,
-                        tp=order.tp,
-                        profit=order.profit,
-                        swap=order.swap,
-                        commission=order.commission,
-                        net_profit=net_profit,
-                        risk_percent=0.0,
-                        realized_r=realized_r,
-                        strategy=(
-                            order.comment.replace("SMC_", "")
-                            if order.comment
-                            else "UNKNOWN"
-                        ),
-                        exit_reason=reason,
-                        time_open=order.time_open,
-                        time_close=close_time,
-                        duration_hours=duration,
-                        environment=self.ENVIRONMENT,
-                    )
-                )
-
-            session.query(OpenPosition).filter(
-                OpenPosition.ticket == ticket,
-                OpenPosition.environment == self.ENVIRONMENT,
-            ).delete()
 
     def _update_position_sl_tp(
         self,

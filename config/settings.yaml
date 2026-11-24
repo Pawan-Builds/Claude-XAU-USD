@@ -22,6 +22,7 @@ trading:
   entry_order_type: "limit"     # "limit" (planned) or "market" (reactive)
   pending_expiry_hours: 4       # cancel unfilled limit orders after N hours
   max_pending_orders: 5  
+  pending_orders_on_shutdown: "keep" 
 
 # DEMO account
 demo:
