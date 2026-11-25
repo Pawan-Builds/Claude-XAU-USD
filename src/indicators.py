@@ -609,6 +609,19 @@ class LiquidityLevel:
     timestamp: Any = None
     swept: bool = False
     sweep_index: Optional[int] = None
+    # M-01: classification of the event that consumed this level.
+    #   "sweep"    = wick pierced the level and the same closed candle
+    #                closed back on the origin side (genuine liquidity
+    #                sweep; eligible to trigger strategies).
+    #   "breakout" = wick pierced the level and the close stayed
+    #                beyond it (structural breakout; consumed, i.e.
+    #                excluded from active_levels, but MUST NOT be
+    #                reported as a sweep).
+    #   None       = level is still active.
+    #
+    # Added as the last field with a default so existing keyword-arg
+    # constructions in detect_liquidity_levels() are unchanged.
+    sweep_kind: Optional[str] = None
 
 
 def _cluster_price_levels(
@@ -716,41 +729,107 @@ def check_liquidity_sweep(
     sell_side: List[LiquidityLevel],
     highs: np.ndarray,
     lows: np.ndarray,
-    current_index: int
+    closes: np.ndarray,
+    current_index: int,
+    pierce_buffer: float = 0.0,
+    reclaim_buffer: float = 0.0,
 ) -> Tuple[List[LiquidityLevel], List[LiquidityLevel]]:
-    """Mark liquidity levels swept by the specified candle."""
+    """Classify the latest closed candle against liquidity levels.
+
+    A level is consumed when the candle wick pierces it strictly:
+
+      - buy-side  : high  > level.price + pierce_buffer
+      - sell-side : low   < level.price - pierce_buffer
+
+    An exact touch (high == level.price for buy-side, low ==
+    level.price for sell-side) does NOT consume the level.
+
+    A consumed level is classified by the same candle's close:
+
+      - buy-side  : sweep    if close < level.price - reclaim_buffer
+                    breakout if close >= level.price - reclaim_buffer
+      - sell-side : sweep    if close > level.price + reclaim_buffer
+                    breakout if close <= level.price + reclaim_buffer
+
+    Only "sweep"-classified levels are eligible to feed strategy
+    entry signals. "breakout"-classified levels are still excluded
+    from active_levels (they have been structurally consumed) but
+    do NOT trigger was_*_swept / _find_sweep_price.
+
+    The caller is responsible for supplying closed candles only;
+    the function reads closes[current_index] and will therefore
+    repaint if handed a forming candle. LiquidityAnalyzer already
+    enforces this by dropping the in-progress candle before calling.
+
+    Args:
+        pierce_buffer: minimum price distance beyond the level to
+            count as a pierce (price units, NOT pips).
+        reclaim_buffer: minimum price distance the close must return
+            beyond the level to count as a reclaim (price units).
+    """
 
     high_array = _as_float_array(highs, "highs")
     low_array = _as_float_array(lows, "lows")
+    close_array = _as_float_array(closes, "closes")
 
-    if len(high_array) != len(low_array):
-        raise ValueError("highs and lows must have equal lengths")
+    if not (
+        len(high_array) == len(low_array) == len(close_array)
+    ):
+        raise ValueError(
+            "highs, lows, and closes must have equal lengths"
+        )
 
     if len(high_array) == 0:
         return buy_side, sell_side
+
+    if not np.isfinite(pierce_buffer) or pierce_buffer < 0:
+        raise ValueError(
+            "pierce_buffer must be a non-negative finite number"
+        )
+
+    if not np.isfinite(reclaim_buffer) or reclaim_buffer < 0:
+        raise ValueError(
+            "reclaim_buffer must be a non-negative finite number"
+        )
 
     current_index = _validate_index(current_index, len(high_array))
 
     current_high = float(high_array[current_index])
     current_low = float(low_array[current_index])
+    current_close = float(close_array[current_index])
 
     for level in buy_side:
         if level.type != "buy_side" or level.swept:
             continue
-        if current_high >= level.price:
-            level.swept = True
-            level.sweep_index = current_index
+
+        # Strict pierce with buffer.
+        if current_high <= level.price + pierce_buffer:
+            continue
+
+        level.swept = True
+        level.sweep_index = current_index
+
+        if current_close < level.price - reclaim_buffer:
+            level.sweep_kind = "sweep"
+        else:
+            level.sweep_kind = "breakout"
 
     for level in sell_side:
         if level.type != "sell_side" or level.swept:
             continue
-        if current_low <= level.price:
-            level.swept = True
-            level.sweep_index = current_index
+
+        if current_low >= level.price - pierce_buffer:
+            continue
+
+        level.swept = True
+        level.sweep_index = current_index
+
+        if current_close > level.price + reclaim_buffer:
+            level.sweep_kind = "sweep"
+        else:
+            level.sweep_kind = "breakout"
 
     return buy_side, sell_side
-
-
 # ---------------------------------------------------------------------------
 # Premium and discount
 # ---------------------------------------------------------------------------
@@ -804,58 +883,171 @@ def calculate_premium_discount(
 # Displacement
 # ---------------------------------------------------------------------------
 
+def _compute_atr_series(
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+    period: int,
+) -> np.ndarray:
+    """Compute ATR[i] using true-range values from [i-period, i-1].
+
+    ATR[i] therefore reflects volatility strictly BEFORE candle i, so
+    the candidate candle never contributes to its own comparison
+    baseline. Returns an array of the same length as `closes` where
+    insufficient-history positions are NaN.
+    """
+    n = len(closes)
+    atr = np.full(n, np.nan, dtype=float)
+
+    if period < 1 or n < period + 1:
+        return atr
+
+    # TR[k] for k >= 1 (needs close[k-1]); TR[0] undefined -> NaN.
+    tr = np.full(n, np.nan, dtype=float)
+    for k in range(1, n):
+        h = float(highs[k])
+        l = float(lows[k])
+        prev_c = float(closes[k - 1])
+        tr[k] = max(h - l, abs(h - prev_c), abs(l - prev_c))
+
+    # ATR[i] = mean(tr[i-period : i]) — window ends at i-1.
+    for i in range(period + 1, n):
+        window = tr[i - period:i]
+        if np.all(np.isfinite(window)):
+            atr[i] = float(np.mean(window))
+
+    return atr
+
+
 def detect_displacement(
     opens: np.ndarray,
+    highs: np.ndarray,
+    lows: np.ndarray,
     closes: np.ndarray,
     lookback: int = 10,
-    threshold: float = 1.5
+    atr_period: int = 14,
+    atr_multiplier: float = 1.5,
+    min_body_pips: float = 5.0,
+    point_value: float = 0.01,
 ) -> List[Dict[str, Any]]:
-    """Detect unusually large candle bodies relative to prior candle bodies."""
+    """Detect displacement candles using ATR-relative volatility.
+
+    A candle i is classified as displacement only when BOTH hold:
+
+      1. body_size >= atr_multiplier * ATR(atr_period) at index i
+         (ATR is computed strictly from data before i, so the
+         candidate candle cannot inflate its own baseline)
+      2. body_size >= min_body_pips * point_value
+
+    Condition (1) ensures the body is unusual for the prevailing
+    volatility regime. An ordinary candle during a high-volatility
+    burst has a large body but a proportionally large ATR and is
+    therefore NOT flagged. Condition (2) is an absolute floor that
+    rejects tiny bodies during ultra-quiet regimes.
+
+    No lookahead: ATR[i] uses only candles at indices < i. The body
+    comparison uses candle i, which the caller must supply as a
+    closed candle.
+
+    Returns a list of dicts with keys:
+        index, direction, body_size, atr, atr_ratio,
+        avg_body (legacy), ratio (legacy — body/avg_body)
+
+    Raises ValueError for invalid parameters or non-finite inputs.
+    """
     open_array = _as_float_array(opens, "opens")
+    high_array = _as_float_array(highs, "highs")
+    low_array = _as_float_array(lows, "lows")
     close_array = _as_float_array(closes, "closes")
 
-    if len(open_array) != len(close_array):
-        raise ValueError("opens and closes must have equal lengths")
+    if not (
+        len(open_array) == len(high_array)
+        == len(low_array) == len(close_array)
+    ):
+        raise ValueError(
+            "opens, highs, lows, and closes must have equal lengths"
+        )
+
+    if np.any(high_array < low_array):
+        raise ValueError("A candle has a high below its low")
 
     lookback = _validate_lookback(lookback)
 
-    if not np.isfinite(threshold) or threshold <= 0:
-        raise ValueError("threshold must be greater than zero")
+    if isinstance(atr_period, bool) or not isinstance(
+        atr_period, (int, np.integer)
+    ):
+        raise ValueError("atr_period must be an integer")
+    atr_period = int(atr_period)
+    if atr_period < 1:
+        raise ValueError("atr_period must be at least 1")
+
+    if not np.isfinite(atr_multiplier) or atr_multiplier <= 0:
+        raise ValueError("atr_multiplier must be greater than zero")
+
+    if not np.isfinite(min_body_pips) or min_body_pips < 0:
+        raise ValueError("min_body_pips must be non-negative")
+
+    if not np.isfinite(point_value) or point_value <= 0:
+        raise ValueError("point_value must be greater than zero")
+
+    n = len(open_array)
+    if n == 0:
+        return []
+
+    atr_series = _compute_atr_series(
+        high_array, low_array, close_array, atr_period
+    )
+
+    min_body_price = float(min_body_pips) * float(point_value)
+    atr_multiplier = float(atr_multiplier)
 
     displacements: List[Dict[str, Any]] = []
 
-    for i in range(max(0, len(open_array) - lookback), len(open_array)):
-        body_size = abs(float(close_array[i] - open_array[i]))
+    start = max(0, n - lookback)
+    for i in range(start, n):
+        atr = float(atr_series[i])
+        if not np.isfinite(atr) or atr <= 0.0:
+            continue
 
-        baseline_start = max(0, i - 10)
-        previous_bodies = np.abs(
-            close_array[baseline_start:i] - open_array[baseline_start:i]
+        body_size = abs(float(close_array[i] - open_array[i]))
+        if body_size <= 0.0:
+            continue
+
+        if body_size < atr_multiplier * atr:
+            continue
+
+        if body_size < min_body_price:
+            continue
+
+        direction = (
+            "bullish"
+            if close_array[i] > open_array[i]
+            else "bearish"
         )
 
-        if len(previous_bodies) == 0:
-            continue
+        # Legacy fields preserved for backwards compat with existing
+        # logging and any downstream that reads them.
+        baseline_start = max(0, i - 10)
+        previous_bodies = np.abs(
+            close_array[baseline_start:i]
+            - open_array[baseline_start:i]
+        )
+        avg_body = (
+            float(np.mean(previous_bodies))
+            if len(previous_bodies) > 0
+            else 0.0
+        )
 
-        avg_body = float(np.mean(previous_bodies))
-        if avg_body <= 0:
-            continue
-
-        ratio = body_size / avg_body
-
-        if ratio > threshold:
-            direction = (
-                "bullish"
-                if close_array[i] > open_array[i]
-                else "bearish"
-            )
-            if close_array[i] == open_array[i]:
-                continue
-
-            displacements.append({
-                "index": i,
-                "direction": direction,
-                "body_size": body_size,
-                "avg_body": avg_body,
-                "ratio": float(ratio),
-            })
+        displacements.append({
+            "index": i,
+            "direction": direction,
+            "body_size": body_size,
+            "atr": atr,
+            "atr_ratio": body_size / atr,
+            "avg_body": avg_body,
+            "ratio": (
+                body_size / avg_body if avg_body > 0.0 else 0.0
+            ),
+        })
 
     return displacements

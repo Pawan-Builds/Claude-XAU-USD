@@ -609,6 +609,7 @@ class TradingAgent:
                         status="WAITING",
                         expiry_time=datetime.now(timezone.utc) + timedelta(hours=config.trading.pending_expiry_hours),
                         reason=str([c.details for c in trading_signal.confirmations]),
+                        setup_state=trading_signal.setup_state,   # H-03
                         environment=self._current_mode.lower()
                     )
                     session.add(plan)
@@ -1142,9 +1143,18 @@ class TradingAgent:
 
         # F-05 / H-05 / H-06: periodic reconciliation. Fail closed when
         # any bot-owned position remains unresolved.
+        #
+        # H-05: track whether reconciliation succeeded *this cycle*.
+        # The gate reads the persisted marker, which can be stale if
+        # the previous marker write failed — the gate alone is not
+        # sufficient to decide whether to un-pause. A fresh
+        # reconciliation (returning True) is what authorizes the
+        # un-pause below.
+        reconciliation_ok = False
         if not self._shutdown_requested:
             try:
                 reconciled = trade_manager.reconcile_with_broker()
+                reconciliation_ok = bool(reconciled)
 
                 if not reconciled:
                     self._pause_trading()
@@ -1176,15 +1186,28 @@ class TradingAgent:
             )
 
         if self._paused and not self._shutdown_requested:
-            probe = self._entry_gate.probe()
-            if probe.ok:
-                self._paused = False
-                self._error_count = 0
-                logger.info("Health checks passed. New entries resumed.")
-            else:
+            # H-05: the health monitor must not un-pause unless
+            # reconciliation succeeded *this cycle*. The gate's
+            # reconciliation check reads the persisted marker; if the
+            # most recent marker write failed, the marker can be stale,
+            # so the gate alone cannot authorize the un-pause.
+            if not reconciliation_ok:
                 logger.debug(
-                    "Health probe: still blocked - %s", probe.reason
+                    "Health probe skipped: reconciliation did not "
+                    "succeed this cycle; entries remain paused."
                 )
+            else:
+                probe = self._entry_gate.probe()
+                if probe.ok:
+                    self._paused = False
+                    self._error_count = 0
+                    logger.info(
+                        "Health checks passed. New entries resumed."
+                    )
+                else:
+                    logger.debug(
+                        "Health probe: still blocked - %s", probe.reason
+                    )
 
     # =========================================================
     # PAUSE AND RESUME

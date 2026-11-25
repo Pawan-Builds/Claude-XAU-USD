@@ -848,6 +848,204 @@ class MT5Connector:
 
         return result
 
+    # ---------------------------------------------------------
+    # H-01: account-wide exposure (manual + other-EA + other-symbol)
+    # ---------------------------------------------------------
+
+    def get_all_positions(self) -> Optional[List[Dict]]:
+        """Return ALL account positions (any symbol, any magic).
+
+        H-01: risk calculations must include manual positions and
+        positions opened by other EAs, on any symbol. This method does
+        NOT filter by configured symbol or magic number.
+
+        Returns None if the MT5 query failed or any position record
+        could not be normalised; callers MUST treat None as
+        "exposure unknown" and fail closed.
+        """
+        try:
+            positions = mt5.positions_get()
+        except Exception:
+            logger.exception("Account-wide position query raised.")
+            return None
+
+        if positions is None:
+            logger.error(
+                "Could not retrieve account-wide positions: %s",
+                mt5.last_error(),
+            )
+            return None
+
+        result: List[Dict] = []
+
+        for pos in positions:
+            try:
+                result.append({
+                    "ticket": pos.ticket,
+                    "magic": pos.magic,
+                    "magic_number": pos.magic,
+                    "symbol": pos.symbol,
+                    "type": (
+                        "BUY"
+                        if pos.type == mt5.POSITION_TYPE_BUY
+                        else "SELL"
+                    ),
+                    "volume": float(pos.volume),
+                    "price_open": float(pos.price_open),
+                    "price_current": float(pos.price_current),
+                    "sl": float(pos.sl),
+                    "tp": float(pos.tp),
+                    "swap": float(pos.swap),
+                    "profit": float(pos.profit),
+                    "commission": float(
+                        getattr(pos, "commission", 0.0) or 0.0
+                    ),
+                    "comment": pos.comment,
+                    "time_open": datetime.fromtimestamp(
+                        pos.time, tz=timezone.utc
+                    ),
+                    "time_update": (
+                        datetime.fromtimestamp(
+                            pos.time_update, tz=timezone.utc
+                        )
+                        if getattr(pos, "time_update", 0)
+                        else None
+                    ),
+                })
+            except Exception:
+                logger.exception(
+                    "Could not normalise account position "
+                    "ticket=%s.",
+                    getattr(pos, "ticket", None),
+                )
+                return None
+
+        return result
+
+    def get_all_orders(self) -> Optional[List[Dict]]:
+        """Return ALL account pending orders (any symbol, any magic).
+
+        H-01: pending orders — including manual orders and orders
+        placed by other EAs / on other symbols — must be counted in
+        exposure. Returns None on query or normalisation failure.
+        """
+        try:
+            orders = mt5.orders_get()
+        except Exception:
+            logger.exception("Account-wide order query raised.")
+            return None
+
+        if orders is None:
+            logger.error(
+                "Could not retrieve account-wide pending orders: %s",
+                mt5.last_error(),
+            )
+            return None
+
+        result: List[Dict] = []
+
+        for order in orders:
+            try:
+                result.append({
+                    "ticket": order.ticket,
+                    "magic": order.magic,
+                    "symbol": order.symbol,
+                    "type": self._order_type_to_str(order.type),
+                    "volume": float(order.volume_initial),
+                    "price_open": float(order.price_open),
+                    "sl": float(order.sl),
+                    "tp": float(order.tp),
+                    "comment": order.comment,
+                    "time_setup": datetime.fromtimestamp(
+                        order.time_setup, tz=timezone.utc
+                    ),
+                    "time_expiration": (
+                        datetime.fromtimestamp(
+                            order.time_expiration, tz=timezone.utc
+                        )
+                        if order.time_expiration
+                        else None
+                    ),
+                })
+            except Exception:
+                logger.exception(
+                    "Could not normalise account pending order "
+                    "ticket=%s.",
+                    getattr(order, "ticket", None),
+                )
+                return None
+
+        return result
+
+    def get_symbol_specs(
+        self, symbol: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return broker specs needed for exposure calculation.
+
+        H-01: risk for positions/orders on other symbols must be
+        computed with *that symbol's* broker economics, not the
+        configured symbol's. Returns None on any failure so the
+        caller can fail closed.
+
+        Notes:
+        - Calls symbol_select so that a pending order on a symbol not
+          currently in Market Watch can still be resolved.
+        - Returns None (not the raw object) so callers cannot
+          accidentally proceed on a partial spec.
+        """
+        if not symbol:
+            return None
+
+        try:
+            if not mt5.symbol_select(symbol, True):
+                # Not fatal: the symbol may already be selected; we
+                # still verify via symbol_info below.
+                logger.warning(
+                    "symbol_select returned False for %s; "
+                    "proceeding to symbol_info read.",
+                    symbol,
+                )
+            info = mt5.symbol_info(symbol)
+        except Exception:
+            logger.exception(
+                "Symbol spec query raised for %s.", symbol
+            )
+            return None
+
+        if info is None:
+            logger.error(
+                "Could not retrieve symbol spec for %s: %s",
+                symbol, mt5.last_error(),
+            )
+            return None
+
+        try:
+            tick_size = float(info.trade_tick_size)
+            tick_value = float(info.trade_tick_value)
+            point = float(info.point)
+            contract_size = float(info.trade_contract_size)
+        except (TypeError, ValueError):
+            logger.error(
+                "Symbol spec for %s has non-numeric fields.", symbol
+            )
+            return None
+
+        if tick_size <= 0 or tick_value <= 0:
+            logger.error(
+                "Symbol spec for %s has invalid tick size/value "
+                "(tick_size=%s, tick_value=%s).",
+                symbol, tick_size, tick_value,
+            )
+            return None
+
+        return {
+            "symbol": symbol,
+            "point": point,
+            "tick_size": tick_size,
+            "tick_value": tick_value,
+            "contract_size": contract_size,
+        }
+
     def get_history_deals(
         self,
         from_date: datetime,
@@ -1088,6 +1286,39 @@ class MT5Connector:
 
         return None
 
+    def _assert_reconciliation_clear(self) -> Optional[str]:
+        """H-05: enforce verified broker reconciliation at the opening
+        boundary, for both DEMO and LIVE.
+
+        Runs for every opening action (TRADE_ACTION_DEAL or
+        TRADE_ACTION_PENDING with no `position` key). Closing and
+        management actions (`position` set, TRADE_ACTION_SLTP,
+        TRADE_ACTION_REMOVE) bypass this entirely.
+
+        Returns None when reconciliation is verified clean, or a
+        blocking reason string otherwise. Fails closed on any
+        exception, missing marker, or unreadable state.
+        """
+        try:
+            from src.trade_manager import trade_manager as _tm
+            unresolved = _tm.get_unresolved_tickets_strict()
+        except Exception as exc:
+            logger.exception(
+                "Reconciliation state unreadable at opening boundary."
+            )
+            return f"Reconciliation state unreadable: {exc}"
+
+        if unresolved is None:
+            return "Reconciliation state unknown (fail-closed)."
+
+        if unresolved:
+            return (
+                f"Unresolved broker reconciliation: tickets "
+                f"{unresolved}."
+            )
+
+        return None
+
     def _get_raw_symbol_info(self, symbol: Optional[str] = None):
         symbol = symbol or self._symbol_name
 
@@ -1221,6 +1452,21 @@ class MT5Connector:
             and not payload.get("position")
         )
         if is_opening_action:
+            # H-05: verified reconciliation is mandatory for ALL opening
+            # actions (DEMO and LIVE). This is the actual submission
+            # boundary — an earlier gate check is insufficient.
+            recon_block = self._assert_reconciliation_clear()
+            if recon_block:
+                logger.critical(
+                    "Opening blocked at boundary: %s", recon_block,
+                )
+                return OrderResult(
+                    success=False,
+                    error_message=(
+                        f"Opening blocked at boundary: {recon_block}"
+                    ),
+                )
+
             live_block = self._assert_live_opening_authorized()
             if live_block:
                 logger.critical(

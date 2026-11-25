@@ -136,23 +136,26 @@ class TradingController:
             return {"ok": True, "state": self._state.value}
 
     def emergency_stop(self, reason: str = "dashboard") -> Dict[str, Any]:
-        """Activate kill switch + pause + close bot-owned positions.
+        """Activate kill switch + pause + cancel pending orders + close
+        bot-owned positions, then verify broker state.
 
         H-08: never reports success unless every sub-operation that
         could be verified was verified. Distinguishes four states:
-          * ``emergency``     — fully activated and verified
+          * ``emergency``     — procedure engaged and verified
           * ``partial``       — some sub-operations succeeded, some failed
-          * ``failed``        — could not activate; new entries may still
-                                be blocked by internal state, but the
-                                report is honest
-          * ``unverifiable``  — position query failed; cannot confirm
-                                whether positions remain open
-        The internal controller state is ALWAYS set to EMERGENCY so
-        resume is blocked regardless of the reported state.
+          * ``failed``        — could not activate
+          * ``unverifiable``  — close-all's position query failed
+        The internal controller state is ALWAYS set to EMERGENCY.
+
+        H-06: bot-owned pending orders are cancelled BEFORE close_all,
+        so no pending can fill during the close. A fresh broker query
+        after both operations confirms the flattening state via the
+        additive ``flattened`` boolean and ``unresolved_exposure`` dict.
+        ``state`` continues to mean "procedure engaged and verified";
+        ``flattened`` means "broker confirms zero bot-owned exposure".
         """
         with self._lock:
-            # 1. Kill switch: RiskManager does write + read-back and
-            #    returns an explicit result. No silent failure.
+            # 1. Kill switch.
             kill_written = False
             kill_verified = False
             kill_error = None
@@ -163,9 +166,6 @@ class TradingController:
                 )
 
                 if ks_result is None:
-                    # Defensive: legacy contract, or a mock without a
-                    # return value. A non-raising call means the write
-                    # path did not throw; confirm via read-back.
                     kill_written = True
                     try:
                         kill_verified = bool(
@@ -207,7 +207,7 @@ class TradingController:
                     "Emergency stop: kill switch write raised."
                 )
 
-            # 2. Pause agent (may be None).
+            # 2. Pause agent.
             paused = False
             if self._agent is not None:
                 try:
@@ -218,7 +218,10 @@ class TradingController:
                         "Emergency stop: could not pause agent."
                     )
 
-            # 3. Close bot-owned positions.
+            # 3. H-06: cancel bot-owned pending orders FIRST.
+            cancel_attempt = self._cancel_bot_pending_orders()
+
+            # 4. Close bot-owned positions.
             close_attempted = False
             query_ok = True
             closed = 0
@@ -239,14 +242,10 @@ class TradingController:
                     "Emergency stop: close_all_positions raised."
                 )
 
-            # 4. Classify state honestly.
-            #
-            # `state="emergency"` means the procedure engaged and was
-            # verified (kill switch written AND read back True; close-all
-            # attempted; position query OK). Per-close `failed` outcomes
-            # are reported in the payload for the operator to triage but
-            # do NOT downgrade the state — a broker rejecting one close
-            # is not the same failure as the kill switch failing to write.
+            # 5. H-06: post-attempt broker verification.
+            verification = self._verify_flattened()
+
+            # 6. Classify state (H-08 semantics preserved).
             if not query_ok:
                 state = "unverifiable"
                 ok = False
@@ -260,23 +259,57 @@ class TradingController:
                 state = "failed"
                 ok = False
 
-            # 5. Always enter EMERGENCY internally so resume is blocked.
+            # 7. H-06: flattened + unresolved exposure.
+            # `flattened` is True only when the broker query confirms
+            # zero bot-owned positions AND zero bot-owned pending orders
+            # AND no unconfirmed cancels. Trust the query, not the
+            # per-call success counts.
+            flattened = (
+                verification["query_ok"]
+                and verification["positions_remaining"] == 0
+                and verification["pending_remaining"] == 0
+                and not cancel_attempt["unconfirmed"]
+            )
+
+            unresolved_exposure = {
+                "positions_remaining": verification["positions_remaining"],
+                "pending_remaining": verification["pending_remaining"],
+                "unconfirmed_cancel_tickets": list(
+                    cancel_attempt["unconfirmed"]
+                ),
+            }
+
+            # 8. Always enter EMERGENCY internally so resume is blocked.
             self._state = ControllerState.EMERGENCY
 
-            error = kill_error or close_error
+            error = (
+                kill_error
+                or close_error
+                or cancel_attempt["error"]
+                or verification["error"]
+            )
+
             logger.critical(
                 "TradingController: EMERGENCY STOP | state=%s | "
-                "reason=%s | kill_verified=%s | closed=%d failed=%d "
-                "query_ok=%s",
-                state, reason, kill_verified, closed, failed, query_ok,
+                "reason=%s | kill_verified=%s | closed=%d failed=%d | "
+                "cancelled=%d cancel_failed=%d unconfirmed=%d | "
+                "positions_remaining=%s pending_remaining=%s | "
+                "flattened=%s",
+                state, reason, kill_verified, closed, failed,
+                cancel_attempt["cancelled"], cancel_attempt["failed"],
+                len(cancel_attempt["unconfirmed"]),
+                verification["positions_remaining"],
+                verification["pending_remaining"],
+                flattened,
             )
 
             return {
+                # Preserved from H-08
                 "state": state,
                 "ok": ok,
                 "kill_switch_written": kill_written,
                 "kill_switch_verified": kill_verified,
-                "kill_switch": kill_verified,  # back-compat
+                "kill_switch": kill_verified,
                 "paused": paused,
                 "close_attempted": close_attempted,
                 "closed": closed,
@@ -284,7 +317,176 @@ class TradingController:
                 "closed_count": closed,
                 "failed_count": failed,
                 "error": error,
+                # H-06 additions
+                "cancel_attempted": cancel_attempt["attempted"],
+                "cancel_query_ok": cancel_attempt["query_ok"],
+                "cancelled": cancel_attempt["cancelled"],
+                "cancel_failed": cancel_attempt["failed"],
+                "cancel_unconfirmed": list(
+                    cancel_attempt["unconfirmed"]
+                ),
+                "positions_remaining": verification["positions_remaining"],
+                "pending_remaining": verification["pending_remaining"],
+                "verification_query_ok": verification["query_ok"],
+                "flattened": flattened,
+                "unresolved_exposure": unresolved_exposure,
             }
+
+    # ---------------- H-06 helpers ----------------
+
+    def _cancel_bot_pending_orders(self) -> Dict[str, Any]:
+        """H-06: enumerate, cancel, and verify cancellation of
+        bot-owned pending orders.
+
+        Returns a dict with:
+            attempted:   bool — the cancel phase ran (enumeration succeeded)
+            query_ok:    bool — the unconfirmed list is authoritative
+                                (pre-cancel AND post-cancel queries both
+                                succeeded)
+            cancelled:   int
+            failed:      int
+            unconfirmed: List[int] — initial tickets still visible on the
+                                     broker after the cancel attempt
+            error:       Optional[str] — joined diagnostics
+        """
+        res: Dict[str, Any] = {
+            "attempted": False,
+            "query_ok": True,
+            "cancelled": 0,
+            "failed": 0,
+            "unconfirmed": [],
+            "error": None,
+        }
+        errors: list = []
+
+        # 1. Enumerate bot-owned pending orders.
+        try:
+            initial = mt5_connector.get_orders()
+        except Exception as exc:
+            logger.exception(
+                "Emergency stop: pre-cancel order query raised."
+            )
+            res["query_ok"] = False
+            res["error"] = f"pre-cancel order query raised: {exc}"
+            return res
+
+        if initial is None:
+            logger.error(
+                "Emergency stop: pre-cancel order query returned None; "
+                "cannot enumerate or verify pending orders."
+            )
+            res["query_ok"] = False
+            res["error"] = "pre-cancel order query returned None"
+            return res
+
+        initial_tickets = {int(o["ticket"]) for o in initial}
+        res["attempted"] = True
+
+        if not initial_tickets:
+            # Verified empty; nothing to cancel, nothing to verify.
+            return res
+
+        # 2. Cancel. Cancel's own query_ok is diagnostic; the post-cancel
+        # re-query below is authoritative.
+        try:
+            cancel_res = order_executor.cancel_all_pending("EMERGENCY")
+            res["cancelled"] = int(getattr(cancel_res, "succeeded", 0))
+            res["failed"] = int(getattr(cancel_res, "failed", 0))
+            if not bool(getattr(cancel_res, "query_ok", True)):
+                errors.append(
+                    "cancel_all_pending reported query_ok=False"
+                )
+        except Exception as exc:
+            logger.exception(
+                "Emergency stop: cancel_all_pending raised."
+            )
+            errors.append(f"cancel_all_pending raised: {exc}")
+
+        # 3. Verify via fresh broker query.
+        try:
+            remaining = mt5_connector.get_orders()
+        except Exception as exc:
+            logger.exception(
+                "Emergency stop: post-cancel order query raised."
+            )
+            res["query_ok"] = False
+            res["unconfirmed"] = sorted(initial_tickets)
+            errors.append(f"post-cancel query raised: {exc}")
+            res["error"] = "; ".join(errors) if errors else None
+            return res
+
+        if remaining is None:
+            res["query_ok"] = False
+            res["unconfirmed"] = sorted(initial_tickets)
+            errors.append("post-cancel query returned None")
+            res["error"] = "; ".join(errors) if errors else None
+            return res
+
+        remaining_tickets = {int(o["ticket"]) for o in remaining}
+        res["unconfirmed"] = sorted(
+            initial_tickets & remaining_tickets
+        )
+
+        if errors:
+            res["error"] = "; ".join(errors)
+
+        return res
+
+    def _verify_flattened(self) -> Dict[str, Any]:
+        """H-06: post-attempt broker verification of bot-owned exposure.
+
+        Fresh queries; not derived from the attempt's own success counts.
+
+        Returns:
+            query_ok:            bool — BOTH queries succeeded
+            positions_remaining: int  — -1 on query failure
+            pending_remaining:   int  — -1 on query failure
+            error:               Optional[str]
+        """
+        res: Dict[str, Any] = {
+            "query_ok": True,
+            "positions_remaining": 0,
+            "pending_remaining": 0,
+            "error": None,
+        }
+        errors: list = []
+
+        try:
+            positions = mt5_connector.get_positions()
+            if positions is None:
+                res["query_ok"] = False
+                res["positions_remaining"] = -1
+                errors.append("position query returned None")
+            else:
+                res["positions_remaining"] = len(positions)
+        except Exception as exc:
+            logger.exception(
+                "Emergency stop: post-close position query raised."
+            )
+            res["query_ok"] = False
+            res["positions_remaining"] = -1
+            errors.append(f"position query raised: {exc}")
+
+        try:
+            orders = mt5_connector.get_orders()
+            if orders is None:
+                res["query_ok"] = False
+                res["pending_remaining"] = -1
+                errors.append("order query returned None")
+            else:
+                res["pending_remaining"] = len(orders)
+        except Exception as exc:
+            logger.exception(
+                "Emergency stop: post-close order query raised."
+            )
+            res["query_ok"] = False
+            res["pending_remaining"] = -1
+            errors.append(f"order query raised: {exc}")
+
+        if errors:
+            res["error"] = "; ".join(errors)
+
+        return res
 
     def clear_emergency(self) -> Dict[str, Any]:
         with self._lock:

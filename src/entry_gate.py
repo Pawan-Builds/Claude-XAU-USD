@@ -12,7 +12,7 @@ and resume paths.
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Dict, Optional
-
+from src.trade_manager import trade_manager
 from src.config_loader import config
 from src.database_manager import db_manager, ClosedTrade, ExecutedOrder
 from src.market_data import market_data
@@ -188,6 +188,28 @@ class EntryGate:
             logger.exception("Kill switch check failed.")
             return fail("kill_switch", "Kill switch state unavailable.")
         step("kill_switch")
+        try:
+            unresolved = trade_manager.get_unresolved_tickets_strict()
+        except Exception:
+            logger.exception(
+                "Reconciliation state lookup raised in gate."
+            )
+            return fail(
+                "reconciliation",
+                "Reconciliation state unavailable.",
+            )
+        if unresolved is None:
+            return fail(
+                "reconciliation",
+                "Reconciliation state unknown (fail-closed).",
+            )
+        if unresolved:
+            return fail(
+                "reconciliation",
+                f"Unresolved broker reconciliation: "
+                f"tickets {unresolved}.",
+            )
+        step("reconciliation")
 
         # 6. Trading session (timezone-aware, weekend-safe)
         try:

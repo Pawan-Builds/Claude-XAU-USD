@@ -5,7 +5,7 @@ and exposes liquidity targets for the SMC strategy engine.
 """
 
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from dataclasses import dataclass, field
 
@@ -18,6 +18,7 @@ from src.indicators import (
 )
 from src.market_data import market_data
 from src.mt5_connector import mt5_connector, MT5Connector
+from src.config_loader import config
 from src.logger import get_logger
 
 logger = get_logger(__name__)
@@ -70,6 +71,57 @@ class LiquidityAnalyzer:
             "falling back to 0.01 price-per-pip."
         )
         return 0.01
+
+    def _get_sweep_buffers_pips(self) -> Tuple[float, float]:
+        """Read M-01 sweep classification buffers from config.
+
+        Returns (pierce_buffer_pips, reclaim_buffer_pips). Missing,
+        invalid, or negative values fall back to 0.0 so the sweep
+        logic remains active with zero buffers (strict pierce, any
+        reclaim), preserving the safe default.
+        """
+        pierce = 0.0
+        reclaim = 0.0
+
+        try:
+            section = getattr(config, "liquidity", None)
+            if section is not None:
+                pierce = self._coerce_non_negative_float(
+                    getattr(
+                        section,
+                        "sweep_pierce_buffer_pips",
+                        0.0,
+                    )
+                )
+                reclaim = self._coerce_non_negative_float(
+                    getattr(
+                        section,
+                        "sweep_reclaim_buffer_pips",
+                        0.0,
+                    )
+                )
+        except Exception:
+            logger.exception(
+                "Failed to read liquidity sweep buffer config; "
+                "using 0.0 defaults."
+            )
+            pierce = 0.0
+            reclaim = 0.0
+
+        return pierce, reclaim
+
+    @staticmethod
+    def _coerce_non_negative_float(value: Any) -> float:
+        """Return value as float if finite and >= 0, else 0.0."""
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+        if not np.isfinite(result) or result < 0:
+            return 0.0
+
+        return result
 
     # ------------------------------------------------------------------
     # Analysis
@@ -128,11 +180,18 @@ class LiquidityAnalyzer:
                 dtype=float
             )
 
+            closes = np.asarray(
+                [float(candle.close) for candle in candles],
+                dtype=float
+            )
+
             if (
                 not np.all(np.isfinite(highs))
                 or not np.all(np.isfinite(lows))
+                or not np.all(np.isfinite(closes))
                 or np.any(highs <= 0)
                 or np.any(lows <= 0)
+                or np.any(closes <= 0)
                 or np.any(highs < lows)
             ):
                 self.liquidity_cache.pop(timeframe, None)
@@ -149,6 +208,7 @@ class LiquidityAnalyzer:
             candles = candles[:-1]
             highs = highs[:-1]
             lows = lows[:-1]
+            closes = closes[:-1]
 
             if len(candles) < 10:
                 self.liquidity_cache.pop(timeframe, None)
@@ -166,22 +226,31 @@ class LiquidityAnalyzer:
                 self.liquidity_cache.pop(timeframe, None)
                 return None
 
+            pip_size = self.point_value
+
             buy_side, sell_side = detect_liquidity_levels(
                 historical_highs,
                 historical_lows,
                 lookback=self.lookback,
                 tolerance_pips=self.tolerance_pips,
-                point_value=self.point_value
+                point_value=pip_size
             )
 
-            # Test the latest confirmed candle against previously
-            # identified pools.
+            # M-01: classify the latest closed candle against the
+            # level pools with configurable pierce/reclaim buffers.
+            pierce_pips, reclaim_pips = self._get_sweep_buffers_pips()
+            pierce_buffer = pierce_pips * pip_size
+            reclaim_buffer = reclaim_pips * pip_size
+
             buy_side, sell_side = check_liquidity_sweep(
                 buy_side,
                 sell_side,
                 highs,
                 lows,
-                current_index
+                closes,
+                current_index,
+                pierce_buffer=pierce_buffer,
+                reclaim_buffer=reclaim_buffer,
             )
 
             current_candle = candles[current_index]
@@ -217,9 +286,6 @@ class LiquidityAnalyzer:
 
             self.liquidity_cache[timeframe] = state
 
-            # Quietly log sweeps at DEBUG — INFO would spam the console
-            # and the Telegram handler every cycle (sweeps persist for
-            # the entire sweep candle).
             for sweep in recent_sweeps:
                 logger.debug(
                     "Liquidity sweep: timeframe=%s type=%s "
@@ -239,6 +305,16 @@ class LiquidityAnalyzer:
                 "Liquidity analysis failed for timeframe %s.",
                 timeframe
             )
+            return None       
+
+
+        except Exception:
+            self.liquidity_cache.pop(timeframe, None)
+
+            logger.exception(
+                "Liquidity analysis failed for timeframe %s.",
+                timeframe
+            )
             return None
 
     def _collect_recent_sweeps(
@@ -248,13 +324,20 @@ class LiquidityAnalyzer:
         current_candle,
         current_index: int
     ) -> List[Dict]:
-        """Collect levels swept by the latest analyzed candle."""
+        """Collect genuine sweeps on the latest analyzed candle.
+
+        M-01: a "breakout" (pierced the level without reclaiming it)
+        is intentionally NOT included here. Breakouts are consumed
+        (removed from active_levels) but MUST NOT trigger the
+        was_*_swept helpers or _find_sweep_price.
+        """
 
         recent_sweeps = []
 
         for level in buy_side:
             if (
                 level.swept
+                and level.sweep_kind == "sweep"
                 and level.sweep_index == current_index
             ):
                 recent_sweeps.append({
@@ -267,6 +350,7 @@ class LiquidityAnalyzer:
         for level in sell_side:
             if (
                 level.swept
+                and level.sweep_kind == "sweep"
                 and level.sweep_index == current_index
             ):
                 recent_sweeps.append({
@@ -277,7 +361,6 @@ class LiquidityAnalyzer:
                 })
 
         return recent_sweeps
-
     # ------------------------------------------------------------------
     # Cached state
     # ------------------------------------------------------------------

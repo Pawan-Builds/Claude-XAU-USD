@@ -26,8 +26,13 @@ def ctrl_harness(monkeypatch):
 
     rm.set_kill_switch.side_effect = _set_kill
 
+    from src.order_executor import CancelAllResult
+
     oe = MagicMock(name="order_executor")
     oe.close_all_positions.return_value = CloseAllResult(
+        results=[], query_ok=True,
+    )
+    oe.cancel_all_pending.return_value = CancelAllResult(
         results=[], query_ok=True,
     )
     oe.close_position.return_value = SimpleNamespace(
@@ -39,6 +44,12 @@ def ctrl_harness(monkeypatch):
 
     mt5 = MagicMock(name="mt5_connector")
     mt5.is_connected.return_value = True
+    # H-06: emergency_stop queries both before and after cancel/close.
+    # Default to empty so tests that don't exercise H-06 behaviour are
+    # unaffected; individual tests override via .return_value or
+    # .side_effect.
+    mt5.get_positions.return_value = []
+    mt5.get_orders.return_value = []
 
     fake_config = SimpleNamespace(
         trading=SimpleNamespace(mode="DEMO"),
@@ -271,3 +282,184 @@ def test_manual_trade_uses_agent_gate(ctrl_harness):
     ctrl_harness.oe.execute_signal.assert_called_once()
     kwargs = ctrl_harness.oe.execute_signal.call_args.kwargs
     assert kwargs["gate"] is gate
+
+# ---------------- H-06: pending-order cancellation + flattening ----------------
+
+
+def test_emergency_stop_cancels_bot_pending_orders(ctrl_harness):
+    agent = _mock_agent()
+    ctrl_harness.controller.register_agent(agent, StubGate(ok=True))
+
+    from src.order_executor import CancelAllResult
+
+    ctrl_harness.mt5.get_orders.side_effect = [
+        [{"ticket": 100}, {"ticket": 101}],   # pre-cancel enumerate
+        [],                                    # post-cancel verify
+        [],                                    # _verify_flattened
+    ]
+    ctrl_harness.oe.cancel_all_pending.return_value = CancelAllResult(
+        results=[
+            SimpleNamespace(success=True, error_message=None),
+            SimpleNamespace(success=True, error_message=None),
+        ],
+        query_ok=True,
+    )
+
+    result = ctrl_harness.controller.emergency_stop(reason="test")
+
+    ctrl_harness.oe.cancel_all_pending.assert_called_once_with("EMERGENCY")
+    assert result["cancel_attempted"] is True
+    assert result["cancelled"] == 2
+    assert result["cancel_failed"] == 0
+    assert result["cancel_unconfirmed"] == []
+    assert result["cancel_query_ok"] is True
+
+
+def test_emergency_stop_verifies_via_fresh_query(ctrl_harness):
+    """Post-cancel verification must re-query the broker, not trust
+    cancel_all_pending's own report."""
+    agent = _mock_agent()
+    ctrl_harness.controller.register_agent(agent, StubGate(ok=True))
+
+    from src.order_executor import CancelAllResult
+
+    # Two initial orders, but one is STILL present after cancel.
+    # cancel_all_pending claims both succeeded — the reconciler catches
+    # the divergence.
+    ctrl_harness.mt5.get_orders.side_effect = [
+        [{"ticket": 100}, {"ticket": 101}],   # pre-cancel
+        [{"ticket": 101}],                     # post-cancel: 101 survived
+        [{"ticket": 101}],                     # _verify_flattened
+    ]
+    ctrl_harness.oe.cancel_all_pending.return_value = CancelAllResult(
+        results=[
+            SimpleNamespace(success=True, error_message=None),
+            SimpleNamespace(success=True, error_message=None),
+        ],
+        query_ok=True,
+    )
+
+    result = ctrl_harness.controller.emergency_stop(reason="test")
+
+    assert result["cancel_unconfirmed"] == [101]
+    assert result["flattened"] is False
+    assert result["pending_remaining"] == 1
+
+
+def test_emergency_stop_flattened_true_when_all_verified(ctrl_harness):
+    agent = _mock_agent()
+    ctrl_harness.controller.register_agent(agent, StubGate(ok=True))
+
+    # Clean state: nothing pending, nothing open.
+    result = ctrl_harness.controller.emergency_stop(reason="test")
+
+    assert result["flattened"] is True
+    assert result["positions_remaining"] == 0
+    assert result["pending_remaining"] == 0
+    assert result["unresolved_exposure"] == {
+        "positions_remaining": 0,
+        "pending_remaining": 0,
+        "unconfirmed_cancel_tickets": [],
+    }
+
+
+def test_emergency_stop_flattened_false_when_position_remains(ctrl_harness):
+    agent = _mock_agent()
+    ctrl_harness.controller.register_agent(agent, StubGate(ok=True))
+
+    # Position still open after close_all attempt.
+    ctrl_harness.mt5.get_positions.side_effect = [
+        [{"ticket": 200}],   # _verify_flattened
+    ]
+
+    result = ctrl_harness.controller.emergency_stop(reason="test")
+
+    assert result["flattened"] is False
+    assert result["positions_remaining"] == 1
+
+
+def test_emergency_stop_flattened_false_when_pending_remains(ctrl_harness):
+    agent = _mock_agent()
+    ctrl_harness.controller.register_agent(agent, StubGate(ok=True))
+
+    # Pending order that cancel could not clear.
+    ctrl_harness.mt5.get_orders.side_effect = [
+        [{"ticket": 300}],   # pre-cancel
+        [{"ticket": 300}],   # post-cancel: cancel failed
+        [{"ticket": 300}],   # _verify_flattened
+    ]
+
+    from src.order_executor import CancelAllResult
+    ctrl_harness.oe.cancel_all_pending.return_value = CancelAllResult(
+        results=[SimpleNamespace(success=False, error_message="rejected")],
+        query_ok=True,
+    )
+
+    result = ctrl_harness.controller.emergency_stop(reason="test")
+
+    assert result["flattened"] is False
+    assert result["pending_remaining"] == 1
+    assert 300 in result["cancel_unconfirmed"]
+
+
+def test_emergency_stop_handles_pre_cancel_query_failure(ctrl_harness):
+    agent = _mock_agent()
+    ctrl_harness.controller.register_agent(agent, StubGate(ok=True))
+
+    ctrl_harness.mt5.get_orders.side_effect = RuntimeError("broker down")
+
+    result = ctrl_harness.controller.emergency_stop(reason="test")
+
+    assert result["cancel_attempted"] is False
+    assert result["cancel_query_ok"] is False
+    assert result["flattened"] is False
+    # Close still ran despite the cancel failure.
+    ctrl_harness.oe.close_all_positions.assert_called_once()
+
+
+def test_emergency_stop_handles_post_cancel_query_failure(ctrl_harness):
+    agent = _mock_agent()
+    ctrl_harness.controller.register_agent(agent, StubGate(ok=True))
+
+    from src.order_executor import CancelAllResult
+
+    call_seq = iter([
+        [{"ticket": 400}],   # pre-cancel OK
+        RuntimeError("timeout"),   # post-cancel query fails
+    ])
+
+    def _get_orders():
+        v = next(call_seq)
+        if isinstance(v, Exception):
+            raise v
+        return v
+
+    ctrl_harness.mt5.get_orders.side_effect = _get_orders
+    ctrl_harness.oe.cancel_all_pending.return_value = CancelAllResult(
+        results=[SimpleNamespace(success=True, error_message=None)],
+        query_ok=True,
+    )
+
+    result = ctrl_harness.controller.emergency_stop(reason="test")
+
+    # Unknown post-cancel state → treat all initial tickets as
+    # unconfirmed; flattened must be False.
+    assert result["cancel_query_ok"] is False
+    assert result["cancel_unconfirmed"] == [400]
+    assert result["flattened"] is False
+
+
+def test_emergency_stop_preserves_existing_response_fields(ctrl_harness):
+    """H-08 back-compat: all fields that existed before H-06 must
+    still be present."""
+    agent = _mock_agent()
+    ctrl_harness.controller.register_agent(agent, StubGate(ok=True))
+
+    result = ctrl_harness.controller.emergency_stop(reason="test")
+
+    for key in (
+        "state", "ok", "kill_switch_written", "kill_switch_verified",
+        "kill_switch", "paused", "close_attempted", "closed", "failed",
+        "closed_count", "failed_count", "error",
+    ):
+        assert key in result, f"missing back-compat field: {key}"

@@ -71,7 +71,14 @@ def gate_harness(monkeypatch):
     # Replace the Config singleton itself, not its properties.
     fake_config = _make_fake_config()
     monkeypatch.setattr(eg_module, "config", fake_config)
-
+    # H-05: mock trade_manager so the new reconciliation check passes
+    # by default. Tests that want to exercise reconciliation failure
+    # override tm.get_unresolved_tickets_strict.return_value = None or
+    # [123].
+    tm = MagicMock(name="trade_manager")
+    tm.get_unresolved_tickets_strict.return_value = []
+    tm.has_unresolved_reconciliation.return_value = False
+    monkeypatch.setattr(eg_module, "trade_manager", tm)
     from src.entry_gate import EntryGate
 
     paused = {"v": False}

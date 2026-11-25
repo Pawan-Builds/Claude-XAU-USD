@@ -63,7 +63,23 @@ smc:
   ob_lookback: 20
   liquidity_lookback: 100
   displacement_threshold: 1.5
+  displacement_atr_period: 14
+  displacement_atr_multiplier: 1.5      # supersedes the legacy ratio threshold
+  displacement_min_body_pips: 5 
   equal_high_low_tolerance: 2
+
+liquidity:
+  # M-01: minimum distance price must pierce BEYOND a liquidity level
+  # before the level is considered consumed (in pips, converted via
+  # the broker's pip size for the current symbol). 0.0 means any
+  # strict pierce counts; the level is NOT consumed on an exact touch.
+  sweep_pierce_buffer_pips: 0.0
+  # M-01: minimum distance the same candle's close must return
+  # beyond the level (on the origin side) for the event to count as
+  # a genuine sweep. 0.0 means any close strictly back across the
+  # level counts as a reclaim. If the close does not return, the
+  # level is classified as a "breakout" and NOT reported as a sweep.
+  sweep_reclaim_buffer_pips: 0.0
 
 risk:
   default_risk_percent: ${RISK_PERCENT}

@@ -94,6 +94,8 @@ class TradePlan(Base):
     reason = Column(Text, nullable=True)
     invalidated_reason = Column(Text, nullable=True)
     environment = Column(String(20), default="demo")
+    setup_state = Column(JSON, nullable=True)
+
 
 
 class SMCDetection(Base):
@@ -449,6 +451,9 @@ class DatabaseManager:
             "trading_signals": {
                 "fingerprint": "VARCHAR(64)",
             },
+            "trade_plans": {
+                "setup_state": "JSON",
+            },
         }
 
         inspector = inspect(self.engine)
@@ -499,6 +504,30 @@ class DatabaseManager:
                     WHERE initial_risk_distance = 0
                       AND initial_sl != 0
                 """))
+
+            if "trade_plans" in table_names:
+                try:
+                    affected = connection.execute(text("""
+                        UPDATE trade_plans
+                           SET status = 'INVALIDATED',
+                               invalidated_reason =
+                                   'pre-H-03 plan (no setup_state)'
+                         WHERE status = 'WAITING'
+                           AND (setup_state IS NULL OR setup_state = '')
+                    """)).rowcount
+                    if affected:
+                        logger.warning(
+                            "H-03 migration: marked %d pre-existing "
+                            "WAITING plan(s) as INVALIDATED (no "
+                            "setup_state).",
+                            int(affected),
+                        )
+                except Exception:
+                    logger.exception(
+                        "H-03 migration: could not invalidate pre-H-03 "
+                        "plans (non-fatal; reconfirm_plan will fail "
+                        "closed on them)."
+                    )
 
             # 3. Optional compound index for daily-loss queries.
             if "account_snapshots" in table_names:

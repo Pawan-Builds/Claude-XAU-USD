@@ -674,13 +674,24 @@ class TradeManager:
     def reconcile_with_broker(self) -> bool:
         """Full bidirectional reconciliation of DB position state with MT5.
 
-        Returns True only when MT5 was reachable and no bot-owned
-        position remains unresolved. Any unresolved ticket causes
-        ``has_unresolved_reconciliation()`` to report True until the
-        position is resolved (H-05 / H-06).
+        Returns True only when:
+          - every mandatory query succeeded, AND
+          - no bot-owned position remains unresolved.
+
+        H-04: a database or broker query failure is a *distinct*
+        failure mode from "some ticket failed to reconcile". The two
+        are tracked separately, and either one forces a False return.
+        Before this fix, a failure of
+        ``db_manager.get_open_positions`` was substituted with ``[]``
+        and then masked by an empty ``unresolved`` list — reconciliation
+        reported success while the database was never read.
         """
         unresolved: List[int] = []
         errors: List[str] = []
+        # H-04: independent of `unresolved`. Set to False on any
+        # mandatory query failure so that an empty unresolved list
+        # cannot mask the failure.
+        mandatory_queries_ok = True
 
         try:
             mt5_positions = mt5_connector.get_positions()
@@ -723,6 +734,7 @@ class TradeManager:
             logger.exception("Could not list OpenPosition rows.")
             open_db_positions = []
             errors.append(f"DB open-position list failed: {exc}")
+            mandatory_queries_ok = False   # H-04
 
         for record in open_db_positions:
             ticket = int(record.ticket)
@@ -752,14 +764,21 @@ class TradeManager:
 
         logger.info(
             "Broker reconciliation complete. MT5 positions: %s | "
-            "Managed positions: %s | DB open rows: %s | unresolved: %s",
+            "Managed positions: %s | DB open rows: %s | "
+            "unresolved: %s | queries_ok: %s",
             len(mt5_positions),
             len(self._managed_positions),
             len(open_db_positions),
             len(unresolved),
+            mandatory_queries_ok,
         )
-        return len(unresolved) == 0
 
+        # H-04: mandatory-query failure overrides the empty-unresolved
+        # signal. A reconciliation that could not read the database is
+        # not a successful reconciliation, even if no tickets were
+        # outstanding at that moment.
+        return mandatory_queries_ok and len(unresolved) == 0
+   
     def _persist_unresolved(
         self, tickets: List[int], errors: str,
     ) -> None:
@@ -783,27 +802,101 @@ class TradeManager:
             )
 
     def has_unresolved_reconciliation(self) -> bool:
-        return len(self.get_unresolved_tickets()) > 0
+        """H-05: True when unresolved tickets exist OR the state is
+        unverifiable.
 
-    def get_unresolved_tickets(self) -> List[int]:
+        Unknown state is treated as unresolved — callers that cannot
+        verify the marker must assume the worst. This is the method
+        used by the LIVE opening boundary.
+        """
+        tickets = self.get_unresolved_tickets_strict()
+        if tickets is None:
+            return True
+        return len(tickets) > 0
+
+    def get_unresolved_tickets_strict(self) -> Optional[List[int]]:
+        """H-05: return unresolved tickets, or None when the state is
+        unverifiable.
+
+        Return values:
+            []              — verification succeeded, no unresolved tickets
+            [t1, t2, ...]   — these tickets remain unresolved
+            None            — state cannot be verified (fail closed):
+                              DB read error, marker missing, empty value,
+                              corrupt JSON, missing 'tickets' key, or
+                              non-integer ticket values.
+
+        Callers MUST NOT treat None as safe. Safety-critical consumers
+        (EntryGate, MT5Connector opening boundary,
+        has_unresolved_reconciliation) fail closed on None.
+        """
         key = f"unresolved_recon_{self.environment}"
+
         try:
             setting = db_manager.query_one(AppSettings, key=key)
         except Exception:
             logger.exception(
-                "Could not read unresolved-reconciliation marker."
+                "Could not read unresolved-reconciliation marker "
+                "(environment=%s); treating as unknown.",
+                self.environment,
             )
-            return []
-        if setting is None or not setting.value:
-            return []
+            return None
+
+        if setting is None:
+            logger.warning(
+                "Unresolved-reconciliation marker missing for "
+                "environment=%s; treating as unknown (fail closed).",
+                self.environment,
+            )
+            return None
+
+        if not setting.value:
+            logger.warning(
+                "Unresolved-reconciliation marker is empty for "
+                "environment=%s; treating as unknown (fail closed).",
+                self.environment,
+            )
+            return None
+
         try:
             payload = json.loads(setting.value)
-            return [int(t) for t in payload.get("tickets", [])]
-        except (json.JSONDecodeError, TypeError, ValueError):
+        except (json.JSONDecodeError, TypeError):
             logger.exception(
-                "Corrupt unresolved-reconciliation marker."
+                "Corrupt unresolved-reconciliation marker for "
+                "environment=%s; treating as unknown (fail closed).",
+                self.environment,
             )
-            return []
+            return None
+
+        if not isinstance(payload, dict) or "tickets" not in payload:
+            logger.error(
+                "Unresolved-reconciliation marker is malformed "
+                "(missing 'tickets' key) for environment=%s; "
+                "treating as unknown (fail closed).",
+                self.environment,
+            )
+            return None
+
+        try:
+            return [int(t) for t in payload["tickets"]]
+        except (TypeError, ValueError):
+            logger.exception(
+                "Unresolved-reconciliation marker has non-integer "
+                "tickets for environment=%s; treating as unknown "
+                "(fail closed).",
+                self.environment,
+            )
+            return None
+
+    def get_unresolved_tickets(self) -> List[int]:
+        """H-05: backwards-compatible accessor.
+
+        Returns [] when the state is unverifiable. Safety-critical
+        paths MUST use get_unresolved_tickets_strict() so that
+        'unknown' is distinguishable from 'no unresolved tickets'.
+        """
+        tickets = self.get_unresolved_tickets_strict()
+        return tickets if tickets is not None else []
 
     def _reconcile_live_position(self, position: Dict) -> bool:
         """Ensure ExecutedOrder + OpenPosition + tracking exist for one
@@ -953,8 +1046,17 @@ class TradeManager:
     # Deal-history access helpers
     # ---------------------------------------------------------
 
-    def _deals_for_ticket(self, ticket: int) -> List[Dict]:
-        """Query MT5 deal history for one position. Returns [] on failure."""
+    def _deals_for_ticket(self, ticket: int) -> Optional[List[Dict]]:
+        """Query MT5 deal history for one position.
+
+        H-04: returns None when the underlying MT5 history query fails,
+        so callers can distinguish "query failed" from "no deals
+        exist". The previous implementation returned [] for both and
+        caused a query outage to be diagnosed as "no deals" (masking
+        the broker failure). Returning None preserves diagnostic
+        accuracy; the caller's decision (ticket is unresolved) is the
+        same in both cases.
+        """
         try:
             deals = mt5_connector.get_history_deals(
                 from_date=datetime.now(timezone.utc) - timedelta(days=90),
@@ -962,18 +1064,32 @@ class TradeManager:
             )
         except Exception:
             logger.exception(
-                "Could not fetch deal history while reconciling %s", ticket,
+                "Could not fetch deal history while reconciling %s",
+                ticket,
             )
-            return []
+            return None
+
         if deals is None:
-            return []
+            logger.error(
+                "MT5 deal history returned None while reconciling %s: %s",
+                ticket, mt5_connector.get_last_error(),
+            )
+            return None
+
         return [
             d for d in deals
             if int(d.get("position_id") or 0) == int(ticket)
         ]
 
     def _find_first_entry_deal(self, ticket: int) -> Optional[Dict]:
-        for deal in self._deals_for_ticket(ticket):
+        deals = self._deals_for_ticket(ticket)
+        if deals is None:
+            logger.error(
+                "Deal-history query failed while looking up first "
+                "entry deal for ticket %s", ticket,
+            )
+            return None
+        for deal in deals:
             if deal.get("entry") == "IN":
                 return deal
         return None
@@ -997,6 +1113,12 @@ class TradeManager:
             return True
 
         deals = self._deals_for_ticket(ticket)
+        if deals is None:
+            logger.error(
+                "Cannot reconstruct ClosedTrade for ticket %s: MT5 "
+                "deal-history query failed.", ticket,
+            )
+            return False
         if not deals:
             logger.warning(
                 "Cannot reconstruct ClosedTrade for ticket %s: no deals "
