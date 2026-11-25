@@ -151,28 +151,61 @@ class TradingController:
         resume is blocked regardless of the reported state.
         """
         with self._lock:
-            # 1. Kill switch: write + read-back verification.
+            # 1. Kill switch: RiskManager does write + read-back and
+            #    returns an explicit result. No silent failure.
             kill_written = False
             kill_verified = False
             kill_error = None
 
             try:
-                risk_manager.set_kill_switch(
+                ks_result = risk_manager.set_kill_switch(
                     True, f"Emergency stop: {reason}"
                 )
-                kill_written = True
-            except Exception as exc:
-                kill_error = f"kill switch write failed: {exc}"
-                logger.exception(
-                    "Emergency stop: could not set kill switch."
-                )
 
-            try:
-                kill_verified = bool(risk_manager.is_kill_switch_active())
+                if ks_result is None:
+                    # Defensive: legacy contract, or a mock without a
+                    # return value. A non-raising call means the write
+                    # path did not throw; confirm via read-back.
+                    kill_written = True
+                    try:
+                        kill_verified = bool(
+                            risk_manager.is_kill_switch_active()
+                        )
+                    except Exception:
+                        kill_verified = False
+                    if not kill_verified:
+                        kill_error = (
+                            "kill switch returned no result and "
+                            "read-back failed"
+                        )
+                else:
+                    ok_attr = getattr(ks_result, "ok", None)
+                    active_attr = getattr(ks_result, "active", None)
+                    err_attr = getattr(ks_result, "error", None)
+
+                    if ok_attr is None or active_attr is None:
+                        kill_written = False
+                        kill_verified = False
+                        kill_error = (
+                            "kill switch returned unexpected type "
+                            f"{type(ks_result).__name__}"
+                        )
+                    else:
+                        kill_written = bool(ok_attr)
+                        kill_verified = bool(ok_attr and active_attr)
+                        if not ok_attr:
+                            kill_error = err_attr or (
+                                "kill switch write failed."
+                            )
+                            logger.error(
+                                "Emergency stop: kill switch write "
+                                "failed: %s", kill_error,
+                            )
             except Exception as exc:
-                kill_verified = False
-                if kill_error is None:
-                    kill_error = f"kill switch read failed: {exc}"
+                kill_error = f"kill switch write raised: {exc}"
+                logger.exception(
+                    "Emergency stop: kill switch write raised."
+                )
 
             # 2. Pause agent (may be None).
             paused = False
@@ -275,13 +308,25 @@ class TradingController:
     def set_kill_switch(
         self, active: bool, reason: str = "operator"
     ) -> Dict[str, Any]:
-        """Manual kill switch control. Deactivation requires explicit flag."""
-        try:
-            risk_manager.set_kill_switch(active, reason)
-        except Exception:
-            logger.exception("Could not set kill switch.")
-            return {"ok": False, "reason": "Kill switch write failed."}
-        return {"ok": True, "active": active}
+        """Manual kill-switch control.
+
+        Never reports ok=True unless RiskManager's read-back
+        confirmed the state. On any failure returns ok=False with
+        the confirmed/previous state and an error message.
+        """
+        result = risk_manager.set_kill_switch(active, reason)
+        if not result.ok:
+            logger.error(
+                "Kill switch change FAILED | requested=%s | active=%s "
+                "| error=%s",
+                active, result.active, result.error,
+            )
+            return {
+                "ok": False,
+                "active": result.active,
+                "error": result.error or "Kill switch write failed.",
+            }
+        return {"ok": True, "active": result.active}
 
     # ---------------- Position operations ----------------
 

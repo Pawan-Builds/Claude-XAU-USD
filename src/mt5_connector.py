@@ -986,6 +986,108 @@ class MT5Connector:
 
         return None
 
+    def _assert_live_opening_authorized(self) -> Optional[str]:
+        """Independent LIVE authorization check at the submission
+        boundary.
+
+        Returns None if authorized. Returns a blocking reason otherwise.
+        Only called for opening actions (TRADE_ACTION_DEAL / PENDING
+        with no `position` key). Closing and risk-reducing actions
+        bypass this method entirely.
+
+        DEMO mode returns None immediately — DEMO opening safety is
+        enforced separately by _trading_precheck (demo_only / mode
+        match / account identity).
+        """
+        mode = str(config.trading.mode).upper()
+        if mode != "LIVE":
+            return None
+
+        # 1. LIVE_TRADING_ENABLED must be explicitly on.
+        if not getattr(config, "live_trading_enabled", False):
+            return "LIVE_TRADING_ENABLED is not true."
+
+        # 2. LIVE_TRADING_CONFIRMATION must be explicitly set.
+        confirmation = getattr(config, "live_trading_confirmation", None)
+        if confirmation is None or not str(confirmation).strip():
+            return "LIVE_TRADING_CONFIRMATION is not set."
+
+        # 3. LIVE_ALLOWED_ACCOUNT must contain the connected login.
+        allowed = getattr(config, "live_allowed_account", None)
+        if allowed is None:
+            return "LIVE_ALLOWED_ACCOUNT is not configured."
+        if isinstance(allowed, (list, tuple, set)):
+            allowed_set = {int(a) for a in allowed if a is not None}
+        elif isinstance(allowed, str):
+            allowed_set = set()
+            for part in allowed.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    allowed_set.add(int(part))
+                except ValueError:
+                    return (
+                        f"LIVE_ALLOWED_ACCOUNT contains non-integer "
+                        f"entry {part!r}."
+                    )
+        else:
+            try:
+                allowed_set = {int(allowed)}
+            except (TypeError, ValueError):
+                return "LIVE_ALLOWED_ACCOUNT has invalid type."
+
+        account = self._account_info
+        if account is None:
+            return "Account information unavailable at submission boundary."
+
+        if int(account.login) not in allowed_set:
+            return (
+                f"Account {account.login} is not in "
+                "LIVE_ALLOWED_ACCOUNT."
+            )
+
+        # 4. Connected server must match the configured LIVE server.
+        if str(account.server) != str(self.mt5_config.server):
+            return (
+                f"Connected server {account.server!r} does not match "
+                f"configured LIVE server {self.mt5_config.server!r}."
+            )
+
+        # 5. DEMO-only must never be bypassed.
+        if getattr(config.safety, "demo_only", False):
+            return (
+                "DEMO-only safety is enabled; LIVE opening is "
+                "blocked regardless of other settings."
+            )
+
+        # 6. Kill switch must be readable and inactive.
+        try:
+            from src.risk_manager import risk_manager as _rm
+            ks_state = _rm.get_kill_switch_state_strict()
+        except Exception as exc:
+            logger.exception(
+                "Kill-switch state unreadable at LIVE boundary."
+            )
+            return f"Kill-switch state unreadable: {exc}"
+        if ks_state is None:
+            return "Kill-switch state unreadable (fail-closed)."
+        if ks_state is True:
+            return "Kill switch is ACTIVE."
+
+        # 7. No unresolved reconciliation blocking new entries.
+        try:
+            from src.order_executor import order_executor as _oe
+            if _oe.has_unresolved_reconciliation():
+                return "Unresolved order reconciliation in progress."
+        except Exception as exc:
+            logger.exception(
+                "Reconciliation state unreadable at LIVE boundary."
+            )
+            return f"Reconciliation state unreadable: {exc}"
+
+        return None
+
     def _get_raw_symbol_info(self, symbol: Optional[str] = None):
         symbol = symbol or self._symbol_name
 
@@ -1104,28 +1206,32 @@ class MT5Connector:
         action = payload.get("action")
         symbol = payload.get("symbol") or self._symbol_name
 
-        # FIX C-03-a: LIVE opening blocked at the submission boundary.
-        # Close (`position` set) and non-open actions stay allowed.
-        if (
-            str(config.trading.mode).upper() == "LIVE"
-            and not config.live_trading_enabled
-            and action in (
+        # FIX C-03: full LIVE opening authorization at the submission
+        # boundary. Independently verifies every required condition —
+        # LIVE_ALLOWED_ACCOUNT, LIVE_TRADING_CONFIRMATION,
+        # live_trading_enabled, server, account, demo-only, kill
+        # switch, unresolved reconciliation. Closing (payload has
+        # `position`) and non-opening actions bypass this check, so
+        # emergency risk reduction always works.
+        is_opening_action = (
+            action in (
                 mt5.TRADE_ACTION_DEAL,
                 mt5.TRADE_ACTION_PENDING,
             )
             and not payload.get("position")
-        ):
-            logger.critical(
-                "LIVE opening blocked at boundary: "
-                "LIVE_TRADING_ENABLED is not true."
-            )
-            return OrderResult(
-                success=False,
-                error_message=(
-                    "LIVE opening blocked at boundary: "
-                    "LIVE_TRADING_ENABLED is not true."
-                ),
-            )
+        )
+        if is_opening_action:
+            live_block = self._assert_live_opening_authorized()
+            if live_block:
+                logger.critical(
+                    "LIVE opening blocked at boundary: %s", live_block,
+                )
+                return OrderResult(
+                    success=False,
+                    error_message=(
+                        f"LIVE opening blocked at boundary: {live_block}"
+                    ),
+                )
 
         # FIX C-03 residual: an opening action requires a valid, single-use
         # token issued by EntryGate.check(). This closes the design gap

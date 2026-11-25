@@ -11,6 +11,22 @@ from src.logger import get_logger
 
 logger = get_logger(__name__)
 
+@dataclass(frozen=True)
+class KillSwitchResult:
+    """Result of a kill-switch persistence attempt.
+
+    ``ok``     — True only if write AND read-back both agree with
+                 the requested state.
+    ``active`` — the state confirmed by read-back. On failure, this
+                 is either the previous state or the read-back value
+                 if it disagreed with the request.
+    ``error``  — human-readable failure reason when ``ok`` is False.
+    """
+    ok: bool
+    active: bool
+    error: Optional[str] = None
+
+
 
 @dataclass
 class PositionSizeResult:
@@ -44,22 +60,87 @@ class RiskManager:
     # Kill Switch
     # ------------------------------------------------------------------
 
-    def set_kill_switch(self, active: bool, reason: str = ""):
-        """Persistently enable or disable the kill switch in the DB."""
+    def set_kill_switch(
+        self, active: bool, reason: str = ""
+    ) -> KillSwitchResult:
+        """Persistently enable or disable the kill switch, with
+        explicit success/failure result AND read-back verification.
+
+        Returns:
+            KillSwitchResult(ok=True, active=<confirmed>)
+                only when the write succeeded AND read-back matches
+                the requested state.
+            KillSwitchResult(ok=False, active=<current>, error=...)
+                on write failure, read-back failure, or mismatch.
+
+        Never swallows DB errors silently — the caller (the
+        dashboard/API) must see ok=False and report the failure.
+        """
         try:
             with db_manager.get_session() as session:
-                setting = session.query(AppSettings).filter_by(key="kill_switch").first()
+                setting = (
+                    session.query(AppSettings)
+                    .filter_by(key="kill_switch")
+                    .first()
+                )
                 if not setting:
-                    setting = AppSettings(key="kill_switch", value="false")
+                    setting = AppSettings(
+                        key="kill_switch", value="false"
+                    )
                     session.add(setting)
                 setting.value = "true" if active else "false"
-                
-                if reason:
-                    logger.critical("KILL SWITCH state changed to %s. Reason: %s", active, reason)
-                else:
-                    logger.info("KILL SWITCH state changed to %s.", active)
-        except Exception:
-            logger.exception("Failed to set kill switch")
+        except Exception as exc:
+            logger.exception("Failed to set kill switch.")
+            # Report the state that is actually readable, if any.
+            try:
+                current = self.get_kill_switch_state_strict()
+            except Exception:
+                current = None
+            # Fail-closed if unreadable.
+            return KillSwitchResult(
+                ok=False,
+                active=(
+                    current
+                    if current is not None
+                    else (True if active else False)
+                ),
+                error=f"DB write failed: {exc}",
+            )
+
+        # Read-back verification.
+        verified = self.get_kill_switch_state_strict()
+        if verified is None:
+            logger.critical(
+                "Kill-switch read-back unavailable after write."
+            )
+            return KillSwitchResult(
+                ok=False,
+                active=not active,  # conservative: do not claim new state
+                error="Read-back unavailable after write.",
+            )
+        if verified != active:
+            logger.critical(
+                "Kill-switch read-back mismatch: requested=%s "
+                "actual=%s", active, verified,
+            )
+            return KillSwitchResult(
+                ok=False,
+                active=verified,
+                error=(
+                    f"Read-back mismatch: requested {active}, "
+                    f"got {verified}."
+                ),
+            )
+
+        if reason:
+            logger.critical(
+                "KILL SWITCH state changed to %s. Reason: %s",
+                active, reason,
+            )
+        else:
+            logger.info("KILL SWITCH state changed to %s.", active)
+
+        return KillSwitchResult(ok=True, active=verified)
 
     def is_kill_switch_active(self) -> bool:
         """Check if the persistent kill switch is active."""
@@ -70,6 +151,35 @@ class RiskManager:
             logger.exception("Failed to read kill switch state; failing closed.")
             return True  # Fail safe: if DB is broken, assume active
 
+    def get_kill_switch_state_strict(self) -> Optional[bool]:
+        """Return True / False if readable, None if unreadable.
+
+        This is the strict form: it distinguishes "state is
+        definitively inactive" from "state could not be verified".
+        Used by the LIVE opening boundary, which must fail closed
+        when the state is unknown.
+
+        Malformed values (None, '', non-"false"-like garbage) are
+        treated as *active* (fail closed) — never as inactive.
+        """
+        try:
+            setting = db_manager.query_one(
+                AppSettings, key="kill_switch"
+            )
+            if setting is None:
+                # No row → new install → inactive by design.
+                return False
+            value = str(setting.value).strip().lower()
+            if value == "false":
+                return False
+            # "true", "1", "", None, garbage → treat as active.
+            return True
+        except Exception:
+            logger.exception(
+                "Strict kill-switch read failed; returning None."
+            )
+            return None
+        
     # ------------------------------------------------------------------
     # Position sizing
     # ------------------------------------------------------------------

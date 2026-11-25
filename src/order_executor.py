@@ -55,6 +55,13 @@ from src.logger import get_logger
 
 logger = get_logger(__name__)
 
+class DuplicateOrderRequest(Exception):
+    """Raised when the DB partial-unique index rejects an insert.
+
+    Signals that another active OrderRequest already exists for the
+    same (fingerprint, environment). The caller must not submit.
+    """
+
 
 def _to_utc(dt: Optional[datetime]) -> Optional[datetime]:
     """Normalize a datetime to aware UTC; SQLite strips tzinfo on read."""
@@ -294,21 +301,30 @@ class OrderExecutor:
 
         signal.lot_size = position_size.lot_size
 
-        # --- 1e. Duplicate prevention ---
+        # --- 1e. Fast pre-check (fail-closed) + generate fingerprint ---
+        # The partial UNIQUE index on (fingerprint, environment) at
+        # INSERT time (see 1g) is the correctness gate. This pre-check
+        # is a cheap early exit that ALSO fails closed on DB error, so
+        # a database outage produces a clear "duplicate / fail-closed"
+        # result rather than a generic signal-persist failure.
         fingerprint = self._generate_fingerprint(signal)
         signal.fingerprint = fingerprint
 
         if self._is_duplicate(fingerprint):
             logger.warning(
-                "Duplicate signal rejected: fingerprint %s", fingerprint
+                "Duplicate signal rejected: fingerprint %s "
+                "(or DB unavailable; failing closed)", fingerprint,
             )
             return ExecutionResult(
                 success=False,
                 validation=validation,
-                error="Duplicate signal already active or recently executed.",
+                error=(
+                    "Duplicate signal already active or recently "
+                    "executed."
+                ),
             )
 
-        # --- 1f. Persist signal and order request BEFORE submission ---
+        # --- 1f. Persist signal ---
         try:
             signal_id = self._save_signal(
                 signal, position_size, validation
@@ -322,12 +338,32 @@ class OrderExecutor:
                 error=f"Could not save signal. Order was not submitted: {exc}",
             )
 
+        # --- 1g. Atomic INSERT for the order request ---
+        # The partial UNIQUE index on (fingerprint, environment) WHERE
+        # status IN ('placed','pending','sent','filled_unconfirmed',
+        # 'uncertain','submission_error') is the single source of
+        # truth. Two concurrent processes submitting the same signal
+        # will both reach this point, but only one INSERT succeeds.
         try:
             order_request = self._prepare_order_request(
                 signal, position_size, market_entry=market_entry
             )
             request_id = self._save_order_request(
                 signal_id, order_request
+            )
+        except DuplicateOrderRequest as dup:
+            logger.warning(
+                "Duplicate signal blocked by DB: %s", dup
+            )
+            return ExecutionResult(
+                success=False,
+                signal_id=signal_id,
+                position_size=position_size,
+                validation=validation,
+                error=(
+                    "Duplicate signal already active for this "
+                    "fingerprint; submission refused."
+                ),
             )
         except Exception as exc:
             logger.exception("Could not prepare or persist order request.")
@@ -420,22 +456,41 @@ class OrderExecutor:
             )
 
         # --- 1h. Record broker response ---
-        try:
-            self._update_order_request(
-                request_id, order_result, market_entry=market_entry
-            )
-        except Exception:
-            logger.exception(
-                "Could not update order-request record after MT5 response."
-            )
-
-        # FIX C-02: ambiguous broker outcome is not a rejection.
+        #
+        # C-02: if the outcome is uncertain we must NOT first call
+        # _update_order_request() — that function writes "rejected"
+        # when success=False, and the subsequent uncertain-write may
+        # fail, leaving a request that looks retry-eligible. Instead,
+        # write "uncertain" directly as the one and only state.
         if getattr(order_result, "uncertain", False):
-            self._mark_request_uncertain(
-                request_id,
-                order_result.error_message
-                or "Broker response ambiguous",
-            )
+            try:
+                self._mark_request_uncertain(
+                    request_id,
+                    order_result.error_message
+                    or "Broker response ambiguous",
+                )
+            except Exception:
+                logger.exception(
+                    "CRITICAL: could not persist uncertain state for "
+                    "request %s. This fingerprint must be treated as "
+                    "permanently blocked until reconciled.",
+                    request_id,
+                )
+                # Fail closed: the caller MUST NOT treat this as
+                # retryable. The active-fingerprint row still blocks
+                # any subsequent insert attempt.
+                return ExecutionResult(
+                    success=False,
+                    signal_id=signal_id,
+                    order_result=order_result,
+                    position_size=position_size,
+                    validation=validation,
+                    error=(
+                        "Broker outcome uncertain AND could not persist "
+                        "uncertainty. Manual intervention required."
+                    ),
+                    uncertain=True,
+                )
             return ExecutionResult(
                 success=False,
                 signal_id=signal_id,
@@ -447,6 +502,16 @@ class OrderExecutor:
                     or "Broker response ambiguous"
                 ),
                 uncertain=True,
+            )
+
+        # Definitive outcome (success, or a clear non-uncertain reject).
+        try:
+            self._update_order_request(
+                request_id, order_result, market_entry=market_entry
+            )
+        except Exception:
+            logger.exception(
+                "Could not update order-request record after MT5 response."
             )
 
         if not order_result.success:
@@ -698,6 +763,32 @@ class OrderExecutor:
     # ==================================================================
     # 3. Pending-order reconciliation
     # ==================================================================
+
+    def has_unresolved_reconciliation(self) -> bool:
+        """True if any active request is in 'uncertain' status.
+
+        Used by the LIVE opening boundary (C-03) to block new entries
+        while the outcome of a previous submission is unresolved.
+
+        Fails closed: returns True on DB error so a database outage
+        blocks new LIVE openings instead of allowing them through.
+        """
+        try:
+            with db_manager.get_session() as session:
+                exists = (
+                    session.query(OrderRequest)
+                    .filter(
+                        OrderRequest.environment == self.ENVIRONMENT,
+                        OrderRequest.status == "uncertain",
+                    )
+                    .first()
+                )
+                return exists is not None
+        except Exception:
+            logger.exception(
+                "Reconciliation state read failed; failing closed."
+            )
+            return True
 
     def reconcile_pending_orders(self) -> None:
         """Align MT5 pending-order state with the database, plus recover
@@ -1988,6 +2079,13 @@ class OrderExecutor:
     def _save_order_request(
         self, signal_id: int, request: Dict[str, Any]
     ) -> int:
+        """Atomically INSERT the OrderRequest.
+
+        Raises ``DuplicateOrderRequest`` when the partial UNIQUE index
+        ``uq_order_requests_active_fp`` rejects the insert — another
+        process has an active request for this fingerprint. Any other
+        DB failure propagates so the caller fails closed.
+        """
         db_request = OrderRequest(
             signal_id=signal_id,
             magic_number=self.magic_number,
@@ -2000,14 +2098,21 @@ class OrderExecutor:
             comment=request.get("comment"),
             request_data=request,
             environment=self.ENVIRONMENT,
+            status="pending",
             fingerprint=request.get("fingerprint"),
         )
-        saved_id = db_manager.add(db_request)
-        if not saved_id or int(saved_id) <= 0:
+
+        ok, row_id = db_manager.insert_order_request_atomic(db_request)
+        if not ok:
+            raise DuplicateOrderRequest(
+                f"Active OrderRequest already exists for fingerprint "
+                f"{request.get('fingerprint')} (existing id={row_id})."
+            )
+        if row_id is None or int(row_id) <= 0:
             raise RuntimeError(
                 "Database did not return an order-request ID."
             )
-        return int(saved_id)
+        return int(row_id)
 
     def _update_order_request(
         self,
@@ -2077,26 +2182,37 @@ class OrderExecutor:
     def _mark_request_uncertain(
         self, request_id: int, message: str
     ) -> None:
-        """Record that the broker's response was lost or ambiguous.
+        """Atomically transition a request to 'uncertain'.
 
-        This state blocks fingerprint duplicates and must be reconciled
-        against broker state; it is never equivalent to `rejected`.
+        Single UPDATE, single transaction. Raises on any failure so
+        the caller can fail closed — this is NOT a best-effort write.
+        The request must never go through 'rejected' as an
+        intermediate state, because 'rejected' is terminal and would
+        release the fingerprint.
+
+        Raises:
+            RuntimeError if the row is missing or in an unexpected
+            state (prevents silent corruption).
+            Any SQLAlchemy error propagates.
         """
-        try:
-            with db_manager.get_session() as session:
-                request = (
-                    session.query(OrderRequest)
-                    .filter(OrderRequest.id == request_id)
-                    .first()
-                )
-                if request is not None:
-                    request.status = "uncertain"
-                    request.error_message = message
-        except Exception:
-            logger.exception(
-                "Could not record uncertain status for request %s.",
-                request_id,
+        with db_manager.get_session() as session:
+            request = (
+                session.query(OrderRequest)
+                .filter(OrderRequest.id == request_id)
+                .first()
             )
+            if request is None:
+                raise RuntimeError(
+                    f"Cannot mark uncertain: OrderRequest "
+                    f"{request_id} not found."
+                )
+            if request.status not in ("pending", "sent"):
+                raise RuntimeError(
+                    f"Refusing uncertain transition for request "
+                    f"{request_id} from status {request.status!r}."
+                )
+            request.status = "uncertain"
+            request.error_message = message
 
     def _save_executed_order(
         self,

@@ -501,9 +501,20 @@ async def run_backtest(request: BacktestRequest):
         swap_enabled=request.swap_enabled,
         data_source="mt5",
     )
-    saved_config = db_manager.add(bt_config)
-    asyncio.create_task(run_backtest_async(saved_config))
-    return {"config_id": saved_config.id, "status": "started"}
+
+    try:
+        config_id = db_manager.add(bt_config)
+    except Exception as exc:
+        logger.exception("Could not persist backtest config.")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not save backtest config: {exc}",
+        )
+
+    # Phase 4A: pass the integer ID (not the object) and let
+    # run_backtest_async resolve the config itself.
+    asyncio.create_task(run_backtest_async(config_id))
+    return {"config_id": config_id, "status": "started"}
 
 
 @app.post("/api/trade", dependencies=[Depends(require_auth)])

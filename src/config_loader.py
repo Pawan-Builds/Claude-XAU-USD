@@ -440,6 +440,9 @@ class Config:
             self._raw_config.get("live", {}).get("allowed_account"),
             0
         )
+    live_trading_confirmation: str = os.getenv(
+        "LIVE_TRADING_CONFIRMATION", ""
+    )
 
     def validate_mode_configuration(self, mode: Optional[str] = None):
         """Validate the selected account configuration before MT5 startup."""

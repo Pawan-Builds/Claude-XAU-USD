@@ -10,7 +10,7 @@ from sqlalchemy import (
     inspect, text
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 from sqlalchemy.dialects.sqlite import JSON
 
 from src.config_loader import config
@@ -542,6 +542,81 @@ class DatabaseManager:
                         "Could not create order_requests_mt5_ticket "
                         "index (non-fatal)"
                     )
+                                # ----------------------------------------------------------
+            # FIX C-02: database-enforced atomic duplicate prevention.
+            #
+            # ix_order_requests_fp is a plain index, so two processes
+            # can both pass the SELECT-based duplicate check and both
+            # insert. This partial UNIQUE index moves the decision into
+            # the INSERT itself: the second INSERT fails.
+            #
+            # Only "active" statuses are covered. Terminal statuses
+            # (filled, filled_closed, unresolved_closed, rejected,
+            # cancelled, superseded) are excluded from the WHERE clause,
+            # so a genuinely new signal can reuse a fingerprint after
+            # the previous attempt has definitively terminated.
+            # ----------------------------------------------------------
+            if "order_requests" in table_names:
+                active_statuses_sql = (
+                    "'placed','pending','sent','filled_unconfirmed',"
+                    "'uncertain','submission_error'"
+                )
+                try:
+                    # Pre-check for pre-existing duplicates. If any
+                    # exist, mark all but the newest active row per
+                    # (fingerprint, environment) as 'superseded'.
+                    # NOTHING IS DELETED — only the status field of
+                    # the losing rows is changed.
+                    dup_rows = connection.execute(text(f"""
+                        SELECT id FROM order_requests
+                         WHERE fingerprint IS NOT NULL
+                           AND status IN ({active_statuses_sql})
+                           AND id NOT IN (
+                               SELECT MAX(id) FROM order_requests
+                                WHERE fingerprint IS NOT NULL
+                                  AND status IN ({active_statuses_sql})
+                                GROUP BY fingerprint, environment
+                           )
+                    """)).fetchall()
+
+                    if dup_rows:
+                        ids = [int(r[0]) for r in dup_rows]
+                        placeholders = ",".join(
+                            f":id{i}" for i in range(len(ids))
+                        )
+                        params = {f"id{i}": v for i, v in enumerate(ids)}
+                        connection.execute(
+                            text(
+                                "UPDATE order_requests "
+                                "SET status='superseded' "
+                                f"WHERE id IN ({placeholders})"
+                            ),
+                            params,
+                        )
+                        logger.warning(
+                            "C-02 migration: marked %d pre-existing "
+                            "active duplicate(s) as 'superseded' "
+                            "before creating the unique partial index.",
+                            len(ids),
+                        )
+
+                    connection.exec_driver_sql(f"""
+                        CREATE UNIQUE INDEX IF NOT EXISTS
+                            uq_order_requests_active_fp
+                        ON order_requests (fingerprint, environment)
+                        WHERE fingerprint IS NOT NULL
+                          AND status IN ({active_statuses_sql})
+                    """)
+                    logger.info(
+                        "C-02: uq_order_requests_active_fp created."
+                    )
+                except Exception:
+                    logger.exception(
+                        "CRITICAL: uq_order_requests_active_fp could "
+                        "not be created. Duplicate order submission is "
+                        "NOT database-protected. Resolve duplicate rows "
+                        "manually and restart."
+                    )
 
             # 5. H-06 §6.8: ClosedTrade composite uniqueness.
             #
@@ -646,6 +721,42 @@ class DatabaseManager:
             obj_ids = [obj.id for obj in objects]
 
         return obj_ids
+
+    def insert_order_request_atomic(self, obj: "OrderRequest"):
+        """Atomic INSERT for OrderRequest with fingerprint dedupe.
+
+        Returns ``(True, new_row_id)`` on success.
+        Returns ``(False, existing_row_id_or_None)`` when the partial
+        unique index rejects the insert (an active request already
+        exists for the same fingerprint + environment). The caller
+        MUST treat this as a duplicate and MUST NOT submit to the
+        broker.
+
+        Any other SQLAlchemy error propagates — the caller must fail
+        closed rather than assume success.
+        """
+        try:
+            with self.get_session() as session:
+                session.add(obj)
+                session.flush()
+                row_id = obj.id
+            return True, row_id
+        except IntegrityError as exc:
+            msg = str(getattr(exc, "orig", exc)).lower()
+            if "unique constraint" in msg and "fingerprint" in msg:
+                logger.warning(
+                    "Duplicate active OrderRequest rejected by DB: "
+                    "fingerprint=%s env=%s",
+                    getattr(obj, "fingerprint", "?"),
+                    getattr(obj, "environment", "?"),
+                )
+                existing = self.query_one(
+                    OrderRequest,
+                    fingerprint=getattr(obj, "fingerprint", None),
+                    environment=getattr(obj, "environment", None),
+                )
+                return False, (existing.id if existing is not None else None)
+            raise
 
     def get(self, model: type, id: int) -> Optional[Base]:
         """Get a record and return it detached from the session."""

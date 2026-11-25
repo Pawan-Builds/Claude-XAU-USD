@@ -176,7 +176,7 @@ class BacktestEngine:
                 self.current_state.current_time = current_time
                 self.progress = (i - lookback) / (total_candles - lookback) * 100
 
-                self._check_exits(current_candle, current_time)
+                self._check_exits(current_candle, current_time, config)
                 self._update_equity(current_candle)
 
                 if i % 5 == 0 and len(self.current_state.open_positions) < self.trading_config.max_positions:
@@ -187,7 +187,7 @@ class BacktestEngine:
                 if i > 0 and current_time.date() != df.index[i-1].date():
                     self.current_state.daily_pl = 0.0
 
-            self._close_all_positions(df.iloc[-1], df.index[-1])
+            self._close_all_positions(df.iloc[-1], df.index[-1], config)
             self.report = self._generate_report(config)
             self.status = BacktestStatus.COMPLETED
             self.progress = 100.0
@@ -203,20 +203,28 @@ class BacktestEngine:
     def _update_equity(self, current_candle: pd.Series):
         spread = 0.20
         bid = current_candle["close"] - (spread / 2)
-        
+        ask = current_candle["close"] + (spread / 2)
+
         floating_pl = 0.0
         for pos in self.current_state.open_positions:
             if pos.direction == "BUY":
+                # BUY is marked and closed at bid.
                 pl_pips = (bid - pos.entry_price) / self.pip_value
             else:
-                pl_pips = (pos.entry_price - bid) / self.pip_value
+                # Phase 4A: SELL is marked and closed at ask, not bid.
+                pl_pips = (pos.entry_price - ask) / self.pip_value
 
-            tick_value = 10.0 
+            tick_value = 10.0
             floating_pl += pl_pips * tick_value * pos.volume
 
         self.current_state.equity = self.current_state.balance + floating_pl
 
-    def _check_exits(self, current_candle: pd.Series, current_time: datetime):
+    def _check_exits(
+        self,
+        current_candle: pd.Series,
+        current_time: datetime,
+        config: BacktestConfig,
+    ):
         high = current_candle["high"]
         low = current_candle["low"]
         
@@ -269,7 +277,10 @@ class BacktestEngine:
 
                 gross = profit_pips * 10.0 * pos.volume
                 spread_cost = 10.0 * pos.volume
-                commission = config.backtesting.commission_per_lot * pos.volume
+                # Phase 4A: use the per-backtest commission, not the
+                # global config. Otherwise two backtests with different
+                # commission_per_lot produce identical results.
+                commission = float(config.commission_per_lot) * pos.volume
                 net = gross - commission - spread_cost
 
                 pos.gross_profit = gross
@@ -285,10 +296,23 @@ class BacktestEngine:
 
         self.current_state.open_positions = remaining
 
-    def _check_signals(self, df_m5: pd.DataFrame, current_index: int, smc_engine: SMCEngine, config: BacktestConfig):
+    def _check_signals(
+        self,
+        df_m5: pd.DataFrame,
+        current_index: int,
+        smc_engine: SMCEngine,
+        config: BacktestConfig,
+    ):
+        """Run SMC analysis on a sliced view of the data, then execute.
+
+        The mock functions replace market_data's candle/ATR accessors
+        for the duration of one analysis call. Restoration is guarded
+        with try/finally and defensive ``is not None`` checks so that
+        an exception during analysis cannot leave market_data in a
+        mocked state (Phase 4A: fix duplicate body + restore leak).
+        """
         current_time = df_m5.index[current_index]
-        
-        # Use getattr to safely capture original methods, even if they don't exist
+
         orig_get_candles = getattr(market_data, "get_candles", None)
         orig_get_closed = getattr(market_data, "get_closed_candles", None)
         orig_latest = getattr(market_data, "get_latest_candle", None)
@@ -296,103 +320,64 @@ class BacktestEngine:
 
         def mock_get_candles(tf: str, count: int):
             df = self.candles.get(tf)
-            if df is None: return []
+            if df is None:
+                return []
             sliced = df.loc[:current_time].tail(count)
-            return [Candle(timestamp=r.name, open=r["open"], high=r["high"], low=r["low"], close=r["close"], volume=r["tick_volume"]) for _, r in sliced.iterrows()]
+            return [
+                Candle(
+                    timestamp=r.name,
+                    open=r["open"], high=r["high"],
+                    low=r["low"], close=r["close"],
+                    volume=r["tick_volume"],
+                )
+                for _, r in sliced.iterrows()
+            ]
 
         def mock_get_closed_candles(tf: str, count: int):
             df = self.candles.get(tf)
-            if df is None: return []
-            sliced = df.loc[:current_time]
-            if len(sliced) > 1:
-                sliced = sliced.iloc[:-1].tail(count)
-            else:
+            if df is None:
                 return []
-            return [Candle(timestamp=r.name, open=r["open"], high=r["high"], low=r["low"], close=r["close"], volume=r["tick_volume"]) for _, r in sliced.iterrows()]
-            
+            sliced = df.loc[:current_time]
+            if len(sliced) <= 1:
+                return []
+            sliced = sliced.iloc[:-1].tail(count)
+            return [
+                Candle(
+                    timestamp=r.name,
+                    open=r["open"], high=r["high"],
+                    low=r["low"], close=r["close"],
+                    volume=r["tick_volume"],
+                )
+                for _, r in sliced.iterrows()
+            ]
+
         def mock_get_latest(tf: str):
             df = self.candles.get(tf)
-            if df is None: return None
+            if df is None:
+                return None
             sliced = df.loc[:current_time]
-            if sliced.empty: return None
+            if sliced.empty:
+                return None
             r = sliced.iloc[-1]
-            return Candle(timestamp=sliced.index[-1], open=r["open"], high=r["high"], low=r["low"], close=r["close"], volume=r["tick_volume"])
+            return Candle(
+                timestamp=sliced.index[-1],
+                open=r["open"], high=r["high"],
+                low=r["low"], close=r["close"],
+                volume=r["tick_volume"],
+            )
 
         def mock_calculate_atr(tf: str, period: int = 14):
             df = self.candles.get(tf)
-            if df is None: return 0.0
+            if df is None:
+                return 0.0
             sliced = df.loc[:current_time]
             if len(sliced) > 1:
                 sliced = sliced.iloc[:-1]
             else:
                 return 0.0
-            if len(sliced) < period + 1: return 0.0
-            
-            high = sliced["high"].values
-            low = sliced["low"].values
-            close = sliced["close"].values
-            tr1 = high[1:] - low[1:]
-            tr2 = np.abs(high[1:] - close[:-1])
-            tr3 = np.abs(low[1:] - close[:-1])
-            true_range = np.maximum(np.maximum(tr1, tr2), tr3)
-            return float(np.mean(true_range[-period:]))
-
-        # Apply mocks
-        market_data.get_candles = mock_get_candles
-        market_data.get_closed_candles = mock_get_closed_candles
-        market_data.get_latest_candle = mock_get_latest
-        market_data.calculate_atr = mock_calculate_atr
-
-        try:
-            signals = smc_engine.analyze_all_strategies()
-            
-            for sig in signals:
-                current_candle = df_m5.iloc[current_index]
-                # Ensure the entry is within the current candle's range (simulating waiting for price)
-                if current_candle["low"] <= sig.entry_price <= current_candle["high"]:
-                    self._execute_signal(sig, current_candle, df_m5.index[current_index], config)
-                        
-        finally:
-            # Restore originals safely
-            if orig_get_candles: market_data.get_candles = orig_get_candles
-            if orig_get_closed: market_data.get_closed_candles = orig_get_closed
-            if orig_latest: market_data.get_latest_candle = orig_latest
-            if orig_calculate_atr: market_data.calculate_atr = orig_calculate_atr
-
-        def mock_get_candles(tf: str, count: int):
-            df = self.candles.get(tf)
-            if df is None: return []
-            sliced = df.loc[:current_time].tail(count)
-            return [Candle(timestamp=r.name, open=r["open"], high=r["high"], low=r["low"], close=r["close"], volume=r["tick_volume"]) for _, r in sliced.iterrows()]
-
-        def mock_get_closed_candles(tf: str, count: int):
-            df = self.candles.get(tf)
-            if df is None: return []
-            sliced = df.loc[:current_time]
-            if len(sliced) > 1:
-                sliced = sliced.iloc[:-1].tail(count)
-            else:
-                return []
-            return [Candle(timestamp=r.name, open=r["open"], high=r["high"], low=r["low"], close=r["close"], volume=r["tick_volume"]) for _, r in sliced.iterrows()]
-            
-        def mock_get_latest(tf: str):
-            df = self.candles.get(tf)
-            if df is None: return None
-            sliced = df.loc[:current_time]
-            if sliced.empty: return None
-            r = sliced.iloc[-1]
-            return Candle(timestamp=sliced.index[-1], open=r["open"], high=r["high"], low=r["low"], close=r["close"], volume=r["tick_volume"])
-
-        def mock_calculate_atr(tf: str, period: int = 14):
-            df = self.candles.get(tf)
-            if df is None: return 0.0
-            sliced = df.loc[:current_time]
-            if len(sliced) > 1:
-                sliced = sliced.iloc[:-1]
-            else:
+            if len(sliced) < period + 1:
                 return 0.0
-            if len(sliced) < period + 1: return 0.0
-            
+
             high = sliced["high"].values
             low = sliced["low"].values
             close = sliced["close"].values
@@ -409,19 +394,32 @@ class BacktestEngine:
 
         try:
             signals = smc_engine.analyze_all_strategies()
-            
             for sig in signals:
                 current_candle = df_m5.iloc[current_index]
                 if current_candle["low"] <= sig.entry_price <= current_candle["high"]:
-                    self._execute_signal(sig, current_candle, df_m5.index[current_index], config)
-                        
+                    self._execute_signal(
+                        sig, current_candle, df_m5.index[current_index],
+                        config,
+                    )
         finally:
-            market_data.get_candles = orig_get_candles
-            market_data.get_closed_candles = orig_get_closed
-            market_data.get_latest_candle = orig_latest
-            market_data.calculate_atr = orig_calculate_atr
+            if orig_get_candles is not None:
+                market_data.get_candles = orig_get_candles
+            if orig_get_closed is not None:
+                market_data.get_closed_candles = orig_get_closed
+            if orig_latest is not None:
+                market_data.get_latest_candle = orig_latest
+            if orig_calculate_atr is not None:
+                market_data.calculate_atr = orig_calculate_atr
 
     def _execute_signal(self, sig: TradeSignal, current_candle: pd.Series, current_time: datetime, config: BacktestConfig):
+        max_pos = int(self.trading_config.max_positions)
+        if len(self.current_state.open_positions) >= max_pos:
+            logger.debug(
+                "Backtest: skipping signal %s %s; max_positions=%d "
+                "already reached.",
+                sig.direction.value, sig.strategy.value, max_pos,
+            )
+            return
         equity = self.current_state.equity
         risk_amount = equity * (config.risk_percent / 100)
 
@@ -454,7 +452,12 @@ class BacktestEngine:
         self._ticket_counter += 1
         self.current_state.open_positions.append(pos)
 
-    def _close_all_positions(self, last_candle: pd.Series, last_time: datetime):
+    def _close_all_positions(
+        self,
+        last_candle: pd.Series,
+        last_time: datetime,
+        config: BacktestConfig,
+    ):
         spread = 0.20
         bid = last_candle["close"] - (spread / 2)
         ask = last_candle["close"] + (spread / 2)
@@ -471,7 +474,7 @@ class BacktestEngine:
 
             gross = profit_pips * 10.0 * pos.volume
             spread_cost = 10.0 * pos.volume
-            commission = config.backtesting.commission_per_lot * pos.volume
+            commission = float(config.commission_per_lot) * pos.volume
             net = gross - commission - spread_cost
 
             pos.gross_profit = gross
@@ -628,6 +631,53 @@ class BacktestEngine:
         return self.status
 
 
-def run_backtest_async(config: BacktestConfig) -> BacktestReport:
-    engine = BacktestEngine()
-    return engine.run_backtest(config)
+async def run_backtest_async(config_id: int) -> BacktestReport:
+    """Run a backtest asynchronously.
+
+    Phase 4A: previously this was a sync function returning a report,
+    but the dashboard passed it to ``asyncio.create_task`` (which needs
+    a coroutine), and passed the integer config ID returned by
+    ``db_manager.add`` where a BacktestConfig object was expected —
+    both caused the route to fail at dispatch.
+
+    Now: accepts the integer config_id, fetches the config inside a
+    worker thread, runs the synchronous engine, and returns the
+    completed report. Threading keeps the FastAPI event loop responsive
+    during multi-minute backtests. Exceptions in the worker propagate
+    to the awaiting coroutine via ``set_exception``.
+    """
+    import asyncio
+    import threading
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future = loop.create_future()
+
+    def _worker() -> None:
+        try:
+            bt_config = db_manager.get(BacktestConfig, int(config_id))
+            if bt_config is None:
+                raise ValueError(
+                    f"BacktestConfig id {config_id} not found."
+                )
+            engine = BacktestEngine(config_id=int(config_id))
+            # `BacktestConfig` has no `symbol` column; use the live
+            # configured symbol (bot is single-symbol by design).
+            ok = engine.load_data(
+                config.trading.symbol,
+                bt_config.timeframes,
+                bt_config.start_date,
+                bt_config.end_date,
+            )
+            if not ok:
+                raise RuntimeError(
+                    "Backtest data load failed (MT5 unavailable or "
+                    "insufficient history for the requested range)."
+                )
+            report = engine.run_backtest(bt_config)
+            loop.call_soon_threadsafe(future.set_result, report)
+        except Exception as exc:
+            logger.exception("Backtest worker thread failed.")
+            loop.call_soon_threadsafe(future.set_exception, exc)
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return await future
