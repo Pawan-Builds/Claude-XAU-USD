@@ -1,8 +1,19 @@
 """SMC strategy engine.
 
-Detects multi-timeframe SMC setups and creates validated trade candidates.
-Actual entry execution and waiting for price to reach an entry zone belong
-to the order-execution layer.
+Detects multi-timeframe SMC setups and creates validated trade
+candidates. Actual entry execution and waiting for price to reach
+an entry zone belong to the order-execution layer.
+
+M-06 HTF alignment semantics:
+- `analyze_all_strategies` computes `h4_bias` (value of
+  `config.timeframes.bias_tf`, default h4) and `h1_bias` (value of
+  `config.timeframes.structure_tf`, default h1). The historical
+  parameter names are retained (D23) for compatibility, but they
+  now refer to whichever timeframes the config selects.
+- A per-strategy gate (`_passes_alignment`) enforces the
+  `config.smc.strategy_alignment.<strategy>.require_h1` rule.
+  Structural strategies require H4+H1 alignment; momentum
+  strategies require H4 only.
 """
 
 from datetime import datetime, timezone
@@ -72,12 +83,130 @@ class TradeSignal:
 
 class SMCEngine:
     """Multi-timeframe SMC setup detection engine."""
+    # M-06: strategies that default to requiring H1 alignment.
+    _DEFAULT_STRATEGIES_REQUIRING_H1 = frozenset({
+        "bos_order_block",
+        "choch_order_block",
+        "liquidity_sweep_choch",
+    })
 
     def __init__(self):
         self.strategies = list(config.smc.strategies)
         self.min_risk_reward = float(config.trading.min_risk_reward)
         self.point_value = 0.01
         self._refresh_displacement_config()
+        # M-06: per-strategy require_h1 flags.
+        self.strategy_alignment = self._load_strategy_alignment()
+
+    def _load_strategy_alignment(self) -> Dict[str, bool]:
+        """M-06: load per-strategy require_h1 flags.
+
+        All known strategies are included with their D20 defaults,
+        then overridden by config.smc.strategy_alignment.<name>.
+        require_h1 where present. Missing/invalid entries keep the
+        default.
+        """
+        all_strategies = [
+            "liquidity_sweep_fvg",
+            "liquidity_sweep_choch",
+            "bos_order_block",
+            "choch_order_block",
+            "displacement_fvg",
+            "liquidity_sweep_ob_fvg",
+        ]
+        defaults = {
+            name: (name in self._DEFAULT_STRATEGIES_REQUIRING_H1)
+            for name in all_strategies
+        }
+        result = dict(defaults)
+
+        try:
+            section = getattr(
+                config.smc, "strategy_alignment", None
+            )
+        except Exception:
+            logger.exception(
+                "Could not read smc.strategy_alignment; using "
+                "defaults."
+            )
+            return result
+
+        if section is None:
+            return result
+
+        for name, default_val in defaults.items():
+            try:
+                entry = self._read_alignment_entry(section, name)
+                if entry is None:
+                    continue
+                result[name] = self._read_require_h1(
+                    entry, default_val
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to read alignment for %s; using "
+                    "default.", name,
+                )
+
+        return result
+
+    @staticmethod
+    def _read_alignment_entry(section, name):
+        """Return the per-strategy alignment entry, dict or attribute."""
+        if isinstance(section, dict):
+            return section.get(name)
+        return getattr(section, name, None)
+
+    @staticmethod
+    def _read_require_h1(entry, default: bool) -> bool:
+        """Return require_h1 from an entry; fall back on invalid."""
+        if entry is None:
+            return default
+        if isinstance(entry, dict):
+            value = entry.get("require_h1", default)
+        else:
+            value = getattr(entry, "require_h1", default)
+        if isinstance(value, bool):
+            return value
+        try:
+            return bool(value)
+        except Exception:
+            return default
+
+    def _passes_alignment(
+        self,
+        strategy: StrategyType,
+        bias_tf_bias: str,
+        structure_tf_bias: str,
+    ) -> bool:
+        """M-06: per-strategy HTF alignment gate.
+
+        `bias_tf_bias`        = value of config.timeframes.bias_tf
+                                (default h4).
+        `structure_tf_bias`   = value of config.timeframes.structure_tf
+                                (default h1).
+        Per D23, the parameter names used in this file's callers
+        remain `h4_bias` / `h1_bias`; here we document the actual
+        semantics.
+
+        H4/bias_tf must be bullish or bearish (enforced upstream by
+        `analyze_all_strategies`). If the strategy requires H1
+        alignment, the structure-TF bias must also be bullish or
+        bearish and must match the bias-TF bias.
+        """
+        require_h1 = self.strategy_alignment.get(
+            strategy.value, False
+        )
+        if not require_h1:
+            return True
+
+        if structure_tf_bias not in ("bullish", "bearish"):
+            return False
+
+        if bias_tf_bias != structure_tf_bias:
+            return False
+
+        return True
 
     def _refresh_displacement_config(self) -> None:
         """Load M-02 displacement parameters from config.smc.
@@ -143,6 +272,20 @@ class SMCEngine:
             except Exception:
                 pass
         return 0.01
+
+    def _get_bias_tf(self) -> str:
+        """M-06: return configured bias timeframe (default h4)."""
+        try:
+            return market_structure.get_bias_timeframe()
+        except Exception:
+            return "h4"
+
+    def _get_structure_tf(self) -> str:
+        """M-06: return configured structure timeframe (default h1)."""
+        try:
+            return market_structure.get_structure_timeframe()
+        except Exception:
+            return "h1"
 
     def _get_point_value(self) -> float:
         symbol_info = mt5_connector.get_symbol_info()
@@ -226,6 +369,15 @@ class SMCEngine:
         h1_bias: str,
     ) -> Optional[TradeSignal]:
 
+        # M-06: enforce per-strategy HTF alignment before dispatch.
+        if not self._passes_alignment(strategy, h4_bias, h1_bias):
+            logger.debug(
+                "M-06 alignment gate blocked %s "
+                "(bias_tf=%s structure_tf=%s).",
+                strategy.value, h4_bias, h1_bias,
+            )
+            return None
+
         checks = {
             StrategyType.LIQUIDITY_SWEEP_FVG: self._check_liquidity_sweep_fvg,
             StrategyType.LIQUIDITY_SWEEP_CHOCH: self._check_liquidity_sweep_choch,
@@ -237,7 +389,6 @@ class SMCEngine:
 
         checker = checks.get(strategy)
         return checker(h4_bias, h1_bias) if checker else None
-
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -409,11 +560,10 @@ class SMCEngine:
             },
             entry_tf=entry_tf,
             setup_tf=setup_tf,
-            structure_tf="h1",
-            bias_tf="h4",
+            structure_tf=self._get_structure_tf(),
+            bias_tf=self._get_bias_tf(),
             setup_state=setup_state or {},
         )
-
     # ------------------------------------------------------------------
     # Strategy 1: Liquidity sweep + FVG
     # ------------------------------------------------------------------
@@ -1200,6 +1350,18 @@ class SMCEngine:
                 False,
                 f"H4 bias is {h4_bias!r}; plan requires {required_h4!r}.",
             )
+
+        # M-06: recheck structure-TF alignment for strategies that
+        # require it. Pre-M-06 plans for these strategies now fail
+        # here if alignment has been lost, which is the intended
+        # fail-closed behaviour of D20(c).
+        if self.strategy_alignment.get(strategy, False):
+            if h1_bias != required_h4:
+                return (
+                    False,
+                    f"Structure-TF alignment lost: {h1_bias!r} "
+                    f"(required {required_h4!r}).",
+                )
 
         if direction == "BUY" and sl >= entry:
             return False, "SL is no longer below entry."

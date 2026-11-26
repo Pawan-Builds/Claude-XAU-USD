@@ -61,12 +61,6 @@ class EntryGate:
     def set_shutdown_getter(self, getter: Callable[[], bool]) -> None:
         self._is_shutdown_getter = getter
 
-    def set_paused_getter(self, getter: Callable[[], bool]) -> None:
-        self._is_paused_getter = getter
-
-    def set_shutdown_getter(self, getter: Callable[[], bool]) -> None:
-        self._is_shutdown_getter = getter
-
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -232,13 +226,65 @@ class EntryGate:
             return fail("weekend", "Weekend check failed.")
         step("weekend")
 
-        # 8. Spread
+        # 8a. Market-data reliability (M-10): fresh tick plus fresh
+        # closed candles for every required timeframe. Fail-closed:
+        # a stale cache blocks new entries rather than letting the
+        # strategy act on stale data. Position management and
+        # emergency paths do not call the gate, so this cannot block
+        # them.
         try:
-            if market_data.is_high_spread():
-                return fail("spread", "Spread exceeds configured maximum.")
+            data_ok, data_reason = market_data.is_market_data_reliable()
         except Exception:
-            logger.exception("Spread check raised.")
-            return fail("spread", "Spread check failed.")
+            logger.exception("Market-data reliability check raised.")
+            return fail(
+                "market_data",
+                "Market-data reliability check failed.",
+            )
+        if not data_ok:
+            return fail(
+                "market_data",
+                f"Market data unreliable: {data_reason}",
+            )
+        step("market_data")
+
+        # 8b. Spread (M-10): missing, zero, unavailable, stale, or
+        # above-max spread must fail closed. get_spread_status() is
+        # the M-05 disambiguator — is_high_spread() collapses all
+        # three failure modes into "high", which hides the root cause
+        # from the operator and permits a genuine-zero spread to
+        # pass. New entries require a strictly-positive, verified,
+        # within-max spread; anything else is refused.
+        try:
+            spread_pips, spread_status = market_data.get_spread_status()
+        except Exception:
+            logger.exception("Spread status lookup raised.")
+            return fail(
+                "spread",
+                "Spread data unavailable (lookup error).",
+            )
+
+        if spread_status != "ok":
+            if spread_status == "stale":
+                return fail("spread", "Spread data is stale.")
+            return fail("spread", "Spread data unavailable.")
+
+        if spread_pips is None:
+            return fail("spread", "Spread value missing.")
+
+        if spread_pips <= 0.0:
+            return fail(
+                "spread",
+                f"Spread is {spread_pips:.2f} pips (zero or "
+                "negative; no verifiable market quote).",
+            )
+
+        max_spread = float(config.trade_management.max_spread_pips)
+        if spread_pips > max_spread:
+            return fail(
+                "spread",
+                f"Spread {spread_pips:.2f} pips exceeds maximum "
+                f"{max_spread:.2f} pips.",
+            )
         step("spread")
 
         # 9. News filter (fails closed when enabled and data unavailable)

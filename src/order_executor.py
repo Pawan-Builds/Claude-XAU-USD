@@ -63,6 +63,29 @@ class DuplicateOrderRequest(Exception):
     """
 
 
+# M-14: every OrderRequest status whose broker execution outcome is
+# not yet definitively established. Any row in these states MUST block
+# new LIVE openings until reconciliation confirms the outcome. Excludes
+# "placed" (a known live pending order is not an unresolved submission)
+# and all terminal statuses (rejected / rejected_notfound / cancelled /
+# expired / filled / filled_closed).
+_UNRESOLVED_STATUSES = (
+    "uncertain",
+    "submission_error",
+    "sent",
+    "pending",
+    "filled_unconfirmed",
+    "unresolved_closed",
+)
+
+# Every reconciler (_reconcile_uncertain_and_stuck_requests,
+# _reconcile_market_entries, _reconcile_unresolved_closed) applies the
+# same 7-day age limit. Once a row ages out of reconciliation scope,
+# it must also stop blocking new openings — the operator has had a
+# week to intervene.
+_RECONCILE_AGE_LIMIT = timedelta(days=7)
+
+
 def _to_utc(dt: Optional[datetime]) -> Optional[datetime]:
     """Normalize a datetime to aware UTC; SQLite strips tzinfo on read."""
     if dt is None:
@@ -238,14 +261,17 @@ class OrderExecutor:
         # expect to pay. Never widen risk to compensate for slippage;
         # if the expected price is unavailable, refuse.
         if market_entry:
-            tick = mt5_connector.get_tick()
+            # M-12: sizing MUST use a freshness-checked quote, not
+            # the raw get_tick(). A stale quote silently widens the
+            # real risk far beyond the configured budget.
+            tick = mt5_connector.get_fresh_tick()
             if not tick:
                 return ExecutionResult(
                     success=False,
                     validation=validation,
                     error=(
-                        "Could not retrieve executable quote for "
-                        "size calculation."
+                        "Could not retrieve FRESH executable quote "
+                        "for size calculation."
                     ),
                 )
             try:
@@ -426,6 +452,40 @@ class OrderExecutor:
                 error="LIVE submission blocked at boundary.",
             )
 
+        # --- 1f.6 M-12: revalidate risk immediately before submission ---
+        # The sizing quote (§1d) and the actual submission price (§1g)
+        # are read at different instants. For market entries, an
+        # adverse price move widens the SL-distance-from-entry and
+        # therefore the real risk above what risk_manager budgeted.
+        # Fail closed if the fresh quote has diverged by more than
+        # max_slippage_pips. Pending orders fix their entry price at
+        # signal time, so this guard applies only to market entries.
+        if market_entry:
+            adverse_reason = self._revalidate_pre_submission_quote(
+                expected_entry, signal.direction.value
+            )
+            if adverse_reason is not None:
+                logger.warning(
+                    "ORDER BLOCKED BY PRE-SUBMISSION QUOTE GUARD | %s | "
+                    "%s %s",
+                    adverse_reason,
+                    getattr(signal, "symbol", "?"),
+                    getattr(
+                        getattr(signal, "direction", None),
+                        "value",
+                        "?",
+                    ),
+                )
+                self._mark_request_status(request_id, "rejected")
+                return ExecutionResult(
+                    success=False,
+                    signal_id=signal_id,
+                    position_size=position_size,
+                    validation=validation,
+                    error=adverse_reason,
+                )
+
+
         # --- 1g. Submit ---
         # C-03: pass the gate token through. The connector enforces the
         # token at its submission boundary on opening actions. If the
@@ -435,8 +495,14 @@ class OrderExecutor:
         # the fingerprint check and requires reconciliation.
         gate_token = getattr(final_gate, "token", None)
         try:
+            # M-14: pass the current request_id to the connector so
+            # its boundary reconciliation check can exclude this
+            # request (it is legitimately in 'pending' at this
+            # instant). All other unresolved requests still block.
             order_result = mt5_connector.send_order(
-                order_request, gate_token=gate_token,
+                order_request,
+                gate_token=gate_token,
+                request_id=request_id,
             )
         except Exception as exc:
             # The broker may have accepted the order before the exception.
@@ -583,6 +649,85 @@ class OrderExecutor:
             f"{signal.tp_price:.5f}",
         ]
         return hashlib.sha256("|".join(parts).encode()).hexdigest()
+
+    def _revalidate_pre_submission_quote(
+        self,
+        expected_entry: float,
+        direction: str,
+    ) -> Optional[str]:
+        """M-12: revalidate the fresh quote immediately before submit.
+
+        Sizing uses one quote; the connector submits with a later one.
+        If the price moved adversely (BUY: ask rose; SELL: bid fell)
+        by more than `trade_management.max_slippage_pips`, the
+        realised loss to the fixed SL exceeds the budgeted risk by an
+        unbounded margin. Fail closed in that case.
+
+        Returns None when the submission may proceed, or a
+        rejection reason string.
+        """
+        try:
+            expected_entry = float(expected_entry)
+        except (TypeError, ValueError):
+            return "Expected entry price is invalid for pre-submit check."
+
+        if not (expected_entry > 0):
+            return "Expected entry price is invalid for pre-submit check."
+
+        tick = mt5_connector.get_fresh_tick()
+        if tick is None:
+            return (
+                "Fresh quote unavailable immediately before submission."
+            )
+
+        try:
+            cur_bid = float(tick.get("bid") or 0)
+            cur_ask = float(tick.get("ask") or 0)
+        except (TypeError, ValueError):
+            return "Fresh quote is invalid immediately before submission."
+
+        if cur_bid <= 0 or cur_ask <= 0:
+            return "Fresh quote is invalid immediately before submission."
+
+        sym_info = mt5_connector.get_symbol_info()
+        pip_size = (
+            MT5Connector.pip_size_for(sym_info)
+            if sym_info is not None
+            else 0.0
+        )
+        if not isinstance(pip_size, (int, float)) or pip_size <= 0:
+            return "Cannot determine pip size for slippage guard."
+
+        try:
+            max_slip_pips = float(
+                config.trade_management.max_slippage_pips
+            )
+        except (TypeError, ValueError, AttributeError):
+            max_slip_pips = 0.0
+        if not (max_slip_pips > 0):
+            return "Invalid max_slippage_pips configuration."
+
+        max_adverse = max_slip_pips * pip_size
+
+        d = str(direction).upper()
+        if d == "BUY":
+            adverse_move = cur_ask - expected_entry
+        elif d == "SELL":
+            adverse_move = expected_entry - cur_bid
+        else:
+            return (
+                f"Unsupported direction for slippage guard: "
+                f"{direction!r}"
+            )
+
+        if adverse_move > max_adverse:
+            return (
+                f"Quote moved adversely by {adverse_move:.5f} "
+                f"(> {max_adverse:.5f}) between sizing and "
+                f"submission."
+            )
+
+        return None
 
     def _is_duplicate(self, fingerprint: str) -> bool:
         if not fingerprint:
@@ -764,31 +909,54 @@ class OrderExecutor:
     # 3. Pending-order reconciliation
     # ==================================================================
 
-    def has_unresolved_reconciliation(self) -> bool:
-        """True if any active request is in 'uncertain' status.
+    def has_unresolved_reconciliation(
+        self,
+        exclude_request_id: Optional[int] = None,
+    ) -> bool:
+        """True if any prior request has an unresolved execution outcome.
 
-        Used by the LIVE opening boundary (C-03) to block new entries
-        while the outcome of a previous submission is unresolved.
+        M-14: expanded from the previous single-status check
+        ('uncertain') to cover every status whose broker outcome is
+        not yet definitively established:
+        uncertain, submission_error, sent, pending,
+        filled_unconfirmed, unresolved_closed.
+
+        ``exclude_request_id`` is the request currently being
+        submitted. At the moment the LIVE boundary calls this, that
+        request is itself at 'pending' — excluding it prevents self-
+        block. Prior unresolved requests are still detected.
+
+        Uses the same 7-day age limit as the reconcilers. A row that
+        has aged out of reconciliation scope no longer blocks new
+        openings (the operator has had a week to intervene, and the
+        reconcilers have stopped processing it).
 
         Fails closed: returns True on DB error so a database outage
         blocks new LIVE openings instead of allowing them through.
         """
+        age_limit = datetime.utcnow() - _RECONCILE_AGE_LIMIT
         try:
             with db_manager.get_session() as session:
-                exists = (
-                    session.query(OrderRequest)
-                    .filter(
-                        OrderRequest.environment == self.ENVIRONMENT,
-                        OrderRequest.status == "uncertain",
-                    )
-                    .first()
+                query = session.query(OrderRequest).filter(
+                    OrderRequest.environment == self.ENVIRONMENT,
+                    OrderRequest.status.in_(_UNRESOLVED_STATUSES),
+                    OrderRequest.timestamp >= age_limit,
                 )
-                return exists is not None
+                if exclude_request_id is not None:
+                    try:
+                        excluded = int(exclude_request_id)
+                    except (TypeError, ValueError):
+                        excluded = None
+                    if excluded is not None:
+                        query = query.filter(
+                            OrderRequest.id != excluded
+                        )
+                return query.first() is not None
         except Exception:
             logger.exception(
                 "Reconciliation state read failed; failing closed."
             )
-            return True
+            return True   
 
     def reconcile_pending_orders(self) -> None:
         """Align MT5 pending-order state with the database, plus recover
@@ -1949,12 +2117,23 @@ class OrderExecutor:
         if direction not in ("BUY", "SELL"):
             raise ValueError(f"Unsupported trade direction: {direction}")
 
-        symbol_info = mt5.symbol_info(symbol)
-        tick = mt5.symbol_info_tick(symbol)
+        # M-12: unify on the connector's cached symbol spec and
+        # freshness-checked quote — the SAME source used for sizing.
+        # Mixing raw mt5.symbol_info[_tick]() with connector data can
+        # silently disagree (test doubles, cache churn, reconnect).
+        symbol_info = mt5_connector.get_symbol_info()
+        tick = mt5_connector.get_fresh_tick()
 
         if symbol_info is None or tick is None:
             raise RuntimeError(
-                f"Could not obtain broker symbol info or quote for {symbol}."
+                f"Could not obtain FRESH broker symbol info/quote "
+                f"for {symbol}."
+            )
+
+        if symbol_info.name != symbol:
+            raise RuntimeError(
+                f"Broker symbol {symbol_info.name!r} does not match "
+                f"request symbol {symbol!r}."
             )
 
         point = float(symbol_info.point)
@@ -1962,19 +2141,24 @@ class OrderExecutor:
         if point <= 0:
             raise RuntimeError(f"Invalid point size for {symbol}.")
 
+        try:
+            tick_bid = float(tick.get("bid") or 0)
+            tick_ask = float(tick.get("ask") or 0)
+        except (TypeError, ValueError):
+            tick_bid = 0.0
+            tick_ask = 0.0
+        if tick_bid <= 0 or tick_ask <= 0:
+            raise RuntimeError(
+                f"Fresh broker quote for {symbol} has invalid bid/ask."
+            )
+
         entry = round(float(signal.entry_price), digits)
         sl = round(float(signal.sl_price), digits)
         tp = round(float(signal.tp_price), digits)
 
-        symbol_info_dc = mt5_connector.get_symbol_info()
-        if symbol_info_dc is None:
-            raise RuntimeError(
-                f"Could not obtain broker symbol info for {symbol}."
-            )
-
         # Call the class static method, not the instance — the instance
         # is often patched in tests and would return a MagicMock.
-        pip_size = MT5Connector.pip_size_for(symbol_info_dc)
+        pip_size = MT5Connector.pip_size_for(symbol_info)
         if not isinstance(pip_size, (int, float)) or pip_size <= 0:
             raise RuntimeError(f"Broker pip size for {symbol} is invalid.")
 
@@ -2005,19 +2189,17 @@ class OrderExecutor:
 
         if direction == "BUY":
             order_type = mt5.ORDER_TYPE_BUY_LIMIT
-            current_price = float(tick.ask)
-            if entry >= current_price:
+            if entry >= tick_ask:
                 raise RuntimeError(
                     f"BUY_LIMIT entry {entry} is at/above current ask "
-                    f"{current_price}; setup invalidated before placement."
+                    f"{tick_ask}; setup invalidated before placement."
                 )
         else:
             order_type = mt5.ORDER_TYPE_SELL_LIMIT
-            current_price = float(tick.bid)
-            if entry <= current_price:
+            if entry <= tick_bid:
                 raise RuntimeError(
                     f"SELL_LIMIT entry {entry} is at/below current bid "
-                    f"{current_price}; setup invalidated before placement."
+                    f"{tick_bid}; setup invalidated before placement."
                 )
 
         return {

@@ -1,6 +1,7 @@
 """MT5 Connector for XM MetaTrader 5 integration."""
 
 import os
+import math
 import time
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone
@@ -10,7 +11,7 @@ from enum import Enum
 
 import MetaTrader5 as mt5
 
-from src.config_loader import config
+from src.config_loader import config, LIVE_CONFIRMATION_PHRASE
 from src.logger import get_logger
 
 logger = get_logger(__name__)
@@ -651,6 +652,102 @@ class MT5Connector:
             "spread": tick.ask - tick.bid,
         }
 
+    # ---------------------------------------------------------
+    # M-05: Tick freshness (fail-closed entry support)
+    # ---------------------------------------------------------
+
+    def _get_max_tick_age_seconds(self) -> float:
+        """Read config.data.max_tick_age_seconds; safe default 60s."""
+        try:
+            value = getattr(config.data, "max_tick_age_seconds", 60)
+        except Exception:
+            return 60.0
+
+        if isinstance(value, bool):
+            return 60.0
+
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return 60.0
+
+        if not math.isfinite(value) or value <= 0:
+            return 60.0
+
+        return value
+
+    def _tick_age_seconds(
+        self, tick: Optional[Dict[str, Any]]
+    ) -> Optional[float]:
+        """Return tick age in seconds, or None if tick/time unavailable."""
+        if tick is None:
+            return None
+        tick_time = tick.get("time")
+        if tick_time is None:
+            return None
+        try:
+            age = (
+                datetime.now(timezone.utc) - tick_time
+            ).total_seconds()
+        except (TypeError, ValueError, AttributeError):
+            return None
+        if not math.isfinite(age):
+            return None
+        return age
+
+    def is_tick_fresh(
+        self, max_age_seconds: Optional[float] = None
+    ) -> bool:
+        """Return True only when the most recent tick is within the
+        configured age window.
+
+        Fail-closed:
+        - No tick available -> False
+        - Tick time missing or non-numeric -> False
+        - Age exceeds threshold -> False
+
+        Clock skew where the broker timestamp is slightly in the
+        future is tolerated (negative age <= threshold counts as
+        fresh); a wildly-future timestamp returns False.
+        """
+        if max_age_seconds is None:
+            max_age_seconds = self._get_max_tick_age_seconds()
+
+        tick = self.get_tick()
+        age = self._tick_age_seconds(tick)
+
+        if age is None:
+            return False
+
+        if age > max_age_seconds:
+            return False
+
+        if age < -max_age_seconds:
+            return False
+
+        return True
+
+    def get_fresh_tick(
+        self, max_age_seconds: Optional[float] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Return the current tick only if fresh; otherwise None.
+
+        Callers that require reliability (entry gate, execution
+        pre-checks) MUST use this method, not get_tick().
+        """
+        if not self.is_tick_fresh(max_age_seconds=max_age_seconds):
+            return None
+        return self.get_tick()
+
+    def get_tick_raw(self) -> Optional[Dict[str, Any]]:
+        """Return the current tick without any freshness check.
+
+        Alias for get_tick() provided so call sites that
+        intentionally bypass freshness (audit logging, dashboards)
+        declare their intent explicitly.
+        """
+        return self.get_tick()
+
     @staticmethod
     def _timeframe_map():
         return {
@@ -1184,7 +1281,10 @@ class MT5Connector:
 
         return None
 
-    def _assert_live_opening_authorized(self) -> Optional[str]:
+    def _assert_live_opening_authorized(
+        self,
+        request_id: Optional[int] = None,
+    ) -> Optional[str]:
         """Independent LIVE authorization check at the submission
         boundary.
 
@@ -1205,10 +1305,18 @@ class MT5Connector:
         if not getattr(config, "live_trading_enabled", False):
             return "LIVE_TRADING_ENABLED is not true."
 
-        # 2. LIVE_TRADING_CONFIRMATION must be explicitly set.
+        # 2. LIVE_TRADING_CONFIRMATION must EXACTLY match the expected
+        #    phrase. M-13: non-empty is not sufficient. The startup
+        #    check requires an exact match; the submission boundary
+        #    must repeat that exact-match check, otherwise any
+        #    non-empty string satisfies the boundary while failing
+        #    startup — a bypass.
         confirmation = getattr(config, "live_trading_confirmation", None)
-        if confirmation is None or not str(confirmation).strip():
-            return "LIVE_TRADING_CONFIRMATION is not set."
+        if (
+            confirmation is None
+            or str(confirmation).strip() != LIVE_CONFIRMATION_PHRASE
+        ):
+            return "LIVE_TRADING_CONFIRMATION is missing or incorrect."
 
         # 3. LIVE_ALLOWED_ACCOUNT must contain the connected login.
         allowed = getattr(config, "live_allowed_account", None)
@@ -1274,9 +1382,15 @@ class MT5Connector:
             return "Kill switch is ACTIVE."
 
         # 7. No unresolved reconciliation blocking new entries.
+        # M-14: expanded status coverage — every non-terminal
+        # submission outcome that has not yet been definitively
+        # reconciled blocks new LIVE openings. The current request is
+        # excluded so its own 'pending' state does not self-block.
         try:
             from src.order_executor import order_executor as _oe
-            if _oe.has_unresolved_reconciliation():
+            if _oe.has_unresolved_reconciliation(
+                exclude_request_id=request_id
+            ):
                 return "Unresolved order reconciliation in progress."
         except Exception as exc:
             logger.exception(
@@ -1422,7 +1536,10 @@ class MT5Connector:
         return position, None
 
     def _send_order_request(
-        self, request: Dict, gate_token: Optional[str] = None,
+        self,
+        request: Dict,
+        gate_token: Optional[str] = None,
+        request_id: Optional[int] = None,
     ) -> OrderResult:
         """Send an MT5 request with safety checks and consistent results."""
 
@@ -1467,7 +1584,9 @@ class MT5Connector:
                     ),
                 )
 
-            live_block = self._assert_live_opening_authorized()
+            live_block = self._assert_live_opening_authorized(
+                request_id=request_id
+            )
             if live_block:
                 logger.critical(
                     "LIVE opening blocked at boundary: %s", live_block,
@@ -1525,20 +1644,41 @@ class MT5Connector:
             payload["comment"] = "SMC_BOT"
 
         if action == mt5.TRADE_ACTION_DEAL:
-            tick = mt5.symbol_info_tick(symbol)
+            # M-12: enforce quote freshness at the actual submission
+            # boundary. A stale tick here would silently price the
+            # order at an unverifiable level; fail closed instead.
+            tick = self.get_fresh_tick()
 
-            if tick is None or tick.bid <= 0 or tick.ask <= 0:
+            if tick is None:
                 return OrderResult(
                     success=False,
-                    error_message="No valid market quote available",
+                    error_message=(
+                        "No FRESH market quote available at submission "
+                        "boundary; refusing to submit."
+                    ),
+                )
+
+            try:
+                tick_bid = float(tick.get("bid") or 0)
+                tick_ask = float(tick.get("ask") or 0)
+            except (TypeError, ValueError):
+                tick_bid = 0.0
+                tick_ask = 0.0
+
+            if tick_bid <= 0 or tick_ask <= 0:
+                return OrderResult(
+                    success=False,
+                    error_message=(
+                        "Fresh market quote has invalid bid/ask."
+                    ),
                 )
 
             order_type = payload.get("type")
 
             if order_type == mt5.ORDER_TYPE_BUY:
-                payload["price"] = tick.ask
+                payload["price"] = tick_ask
             elif order_type == mt5.ORDER_TYPE_SELL:
-                payload["price"] = tick.bid
+                payload["price"] = tick_bid
             else:
                 return OrderResult(
                     success=False,
@@ -1657,14 +1797,25 @@ class MT5Connector:
         self,
         request: Dict,
         gate_token: Optional[str] = None,
+        request_id: Optional[int] = None,
     ) -> OrderResult:
-        """Send a market, pending, or supported trade-management request."""
+        """Send a market, pending, or supported trade-management request.
+
+        M-14: ``request_id`` is forwarded so the LIVE boundary check
+        can exclude the current request from the unresolved-status
+        block. Callers that do not supply it still get the full
+        boundary check — they simply cannot self-exclude.
+        """
         if not isinstance(request, dict):
             return OrderResult(
                 success=False,
                 error_message="Order request must be a dictionary",
             )
-        return self._send_order_request(request, gate_token=gate_token)
+        return self._send_order_request(
+            request,
+            gate_token=gate_token,
+            request_id=request_id,
+        )
 
     def modify_position(
         self,

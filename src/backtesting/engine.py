@@ -1,6 +1,27 @@
-"""Genuine backtesting engine for SMC strategies using real MT5 data."""
+"""Genuine backtesting engine for SMC strategies using real MT5 data.
+
+M-04 execution-cost model (see `assumptions_applied` at runtime):
+- Spread: config.backtesting.spread_pips, converted to price via
+  broker pip_size, applied as half-spread on each side of every fill.
+- Slippage: config.backtesting.slippage_pips, applied adversely on
+  entry and on stop-loss exits. Take-profit exits are assumed to be
+  limit fills with no slippage.
+- Tick economics: broker tick_size / tick_value from MT5 symbol info.
+  P&L = price_delta * (tick_value / tick_size) * volume.
+- Volume: risk-based, rounded DOWN to broker volume_step. Below
+  volume_min -> trade skipped (fail-closed). Above volume_max ->
+  capped at volume_max.
+- Commission: config.backtesting.commission_per_lot, per side if
+  commission_per_side, else once at close.
+- Swap: applied at close only, as configured swap_long/short *
+  volume * integer_days_held (usd_per_lot_per_day model).
+
+Candle prices are treated as MID prices (bid = mid - half_spread,
+ask = mid + half_spread). This matches the pre-existing convention.
+"""
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, List, Optional, Tuple
+from decimal import Decimal, ROUND_DOWN
+from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
 from enum import Enum
 import pandas as pd
@@ -8,7 +29,7 @@ import numpy as np
 
 from src.config_loader import config
 from src.database_manager import db_manager, BacktestConfig, BacktestReport, BacktestTrade
-from src.mt5_connector import mt5_connector
+from src.mt5_connector import mt5_connector, MT5Connector
 from src.market_data import market_data, Candle
 from src.indicators import (
     analyze_market_structure, detect_fvgs, detect_order_blocks,
@@ -72,7 +93,7 @@ class BacktestEngine:
         self.backtest_config = config.backtesting
         self.trading_config = config.trading
         self.risk_config = config.risk
-        
+
         self.candles: Dict[str, pd.DataFrame] = {}
         self.current_state: Optional[BacktestState] = None
         self.status = BacktestStatus.PENDING
@@ -80,14 +101,289 @@ class BacktestEngine:
         self.report: Optional[BacktestReport] = None
         self.trades: List[BacktestTrade] = []
         self._ticket_counter = 1000000
-        
+
+        # M-04: broker-aware economics; populated at run_backtest start.
+        # None here means "not yet loaded"; methods guard defensively.
+        self._broker_spec: Optional[Dict[str, Any]] = None
+        self._cost_config: Optional[Dict[str, Any]] = None
+
+        # M-04: what the backtest actually modelled. Read via
+        # get_assumptions_applied() after run_backtest completes.
+        self.assumptions_applied: Dict[str, Any] = {}
+
+        # Legacy fields retained for compatibility. Updated from broker
+        # spec at run_backtest start; pre-M-04 fallbacks used only
+        # before run_backtest loads spec (methods guard against this).
         self.point_value = 0.01
-        self.pip_value = 0.1  # 10 points
+        self.pip_value = 0.1
+
+    # ------------------------------------------------------------------
+    # M-04: broker spec and cost configuration
+    # ------------------------------------------------------------------
+
+    def _load_broker_spec(self) -> Optional[Dict[str, Any]]:
+        """Load and validate broker symbol spec. None = fail closed."""
+        try:
+            info = mt5_connector.get_symbol_info()
+        except Exception:
+            logger.exception(
+                "Broker spec lookup raised; backtest cannot proceed."
+            )
+            return None
+
+        if info is None:
+            logger.error(
+                "Broker symbol spec unavailable; refusing to run "
+                "backtest with hardcoded fallback economics."
+            )
+            return None
+
+        try:
+            tick_size = float(info.tick_size)
+            tick_value = float(info.tick_value)
+            contract_size = float(info.contract_size)
+            volume_min = float(info.volume_min)
+            volume_max = float(info.volume_max)
+            volume_step = float(info.volume_step)
+            point = float(info.point)
+            swap_long = float(info.swap_long)
+            swap_short = float(info.swap_short)
+            pip_size = float(MT5Connector.pip_size_for(info))
+        except (TypeError, ValueError, AttributeError) as exc:
+            logger.error(
+                "Broker spec has non-numeric fields: %s", exc
+            )
+            return None
+
+        if tick_size <= 0 or tick_value <= 0 or contract_size <= 0:
+            logger.error(
+                "Broker spec invalid: tick_size=%s tick_value=%s "
+                "contract_size=%s", tick_size, tick_value, contract_size,
+            )
+            return None
+
+        if volume_min <= 0 or volume_step <= 0 or volume_max < volume_min:
+            logger.error(
+                "Broker spec invalid: volume_min=%s volume_step=%s "
+                "volume_max=%s", volume_min, volume_step, volume_max,
+            )
+            return None
+
+        if pip_size <= 0 or point <= 0:
+            logger.error(
+                "Broker spec invalid: pip_size=%s point=%s",
+                pip_size, point,
+            )
+            return None
+
+        return {
+            "tick_size": tick_size,
+            "tick_value": tick_value,
+            "contract_size": contract_size,
+            "volume_min": volume_min,
+            "volume_max": volume_max,
+            "volume_step": volume_step,
+            "point": point,
+            "pip_size": pip_size,
+            "swap_long": swap_long,
+            "swap_short": swap_short,
+        }
+
+    def _load_cost_config(self, bt_config: BacktestConfig) -> Dict[str, Any]:
+        """Read cost params from the per-backtest DB row, falling back
+        to config.backtesting defaults from yaml."""
+        def _pick(name: str, default: Any, numeric: bool = True) -> Any:
+            value = getattr(bt_config, name, None)
+            if value is None:
+                value = getattr(self.backtest_config, name, default)
+            if numeric:
+                return self._coerce_non_negative(value, default)
+            return value if value is not None else default
+
+        commission_per_side_raw = getattr(
+            bt_config, "commission_per_side", None
+        )
+        if commission_per_side_raw is None:
+            commission_per_side_raw = getattr(
+                self.backtest_config, "commission_per_side", True
+            )
+
+        swap_enabled_raw = getattr(bt_config, "swap_enabled", None)
+        if swap_enabled_raw is None:
+            swap_enabled_raw = getattr(
+                self.backtest_config, "swap_enabled", True
+            )
+
+        swap_unit_raw = getattr(bt_config, "swap_unit", None)
+        if swap_unit_raw is None:
+            swap_unit_raw = getattr(
+                self.backtest_config, "swap_unit", "usd_per_lot_per_day"
+            )
+        swap_unit = str(swap_unit_raw).strip().lower()
+        if swap_unit not in ("none", "usd_per_lot_per_day"):
+            logger.warning(
+                "Unknown swap_unit=%r; falling back to "
+                "'usd_per_lot_per_day'.", swap_unit_raw,
+            )
+            swap_unit = "usd_per_lot_per_day"
+
+        return {
+            "spread_pips": _pick("spread_pips", 2.0),
+            "slippage_pips": _pick("slippage_pips", 1.0),
+            "commission_per_lot": _pick("commission_per_lot", 7.0),
+            "commission_per_side": bool(commission_per_side_raw),
+            "swap_enabled": bool(swap_enabled_raw),
+            "swap_unit": swap_unit,
+        }
+
+    @staticmethod
+    def _coerce_non_negative(value: Any, default: float) -> float:
+        """Return finite non-negative float, else default."""
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        if not np.isfinite(result) or result < 0:
+            return float(default)
+        return result
+
+    # ------------------------------------------------------------------
+    # M-04: P&L, volume, entry/exit costs, swap
+    # ------------------------------------------------------------------
+
+    def _pl_per_lot_per_price(self) -> float:
+        """USD P&L per 1.0 lot per 1.0 price unit, from broker spec."""
+        spec = self._broker_spec
+        return spec["tick_value"] / spec["tick_size"]
+
+    def _calculate_gross_pl(
+        self,
+        direction: str,
+        entry_price: float,
+        exit_price: float,
+        volume: float,
+    ) -> float:
+        """Gross P&L using broker tick economics."""
+        delta = (
+            exit_price - entry_price
+            if direction == "BUY"
+            else entry_price - exit_price
+        )
+        return delta * self._pl_per_lot_per_price() * volume
+
+    def _calculate_volume(
+        self, risk_amount: float, sl_distance: float
+    ) -> Optional[float]:
+        """Risk-based volume, floor-rounded to broker volume_step.
+
+        Returns None when the risk budget cannot afford volume_min
+        (fail closed). Caps at volume_max when raw_volume would exceed
+        the broker limit.
+        """
+        spec = self._broker_spec
+        if spec is None:
+            return None
+
+        if sl_distance <= 0 or risk_amount <= 0:
+            return None
+
+        pl_per_lot_at_sl = sl_distance * self._pl_per_lot_per_price()
+        if pl_per_lot_at_sl <= 0:
+            return None
+
+        raw_volume = risk_amount / pl_per_lot_at_sl
+
+        try:
+            raw_dec = Decimal(str(raw_volume))
+            min_dec = Decimal(str(spec["volume_min"]))
+            max_dec = Decimal(str(spec["volume_max"]))
+            step_dec = Decimal(str(spec["volume_step"]))
+        except Exception:
+            return None
+
+        if raw_dec < min_dec:
+            # Risk budget cannot cover minimum lot -> skip trade.
+            return None
+
+        if raw_dec > max_dec:
+            return float(max_dec)
+
+        steps = ((raw_dec - min_dec) / step_dec).to_integral_value(
+            rounding=ROUND_DOWN
+        )
+        volume = min_dec + steps * step_dec
+
+        if volume < min_dec or volume > max_dec:
+            return None
+
+        return float(volume)
+
+    def _apply_entry_costs(self, side: str, signal_price: float) -> float:
+        """Adverse entry fill: half-spread + slippage."""
+        spec = self._broker_spec
+        cost = self._cost_config
+        pip_size = spec["pip_size"]
+
+        half_spread = cost["spread_pips"] * pip_size / 2.0
+        slippage = cost["slippage_pips"] * pip_size
+
+        if side == "BUY":
+            return signal_price + half_spread + slippage
+        return signal_price - half_spread - slippage
+
+    def _apply_exit_costs(
+        self, side: str, exit_price: float, is_limit: bool
+    ) -> float:
+        """Adverse exit fill. Limit exits (TP) get no slippage."""
+        spec = self._broker_spec
+        cost = self._cost_config
+        pip_size = spec["pip_size"]
+
+        slippage = 0.0 if is_limit else cost["slippage_pips"] * pip_size
+
+        if side == "BUY":
+            return exit_price - slippage
+        return exit_price + slippage
+
+    def _apply_swap(
+        self,
+        direction: str,
+        volume: float,
+        entry_time: datetime,
+        close_time: datetime,
+    ) -> float:
+        """Swap P&L (USD). Zero when disabled or model unsupported."""
+        cost = self._cost_config
+        spec = self._broker_spec
+
+        if not cost["swap_enabled"] or cost["swap_unit"] == "none":
+            return 0.0
+
+        if entry_time is None or close_time is None:
+            return 0.0
+
+        days_held = max(0, (close_time - entry_time).days)
+        if days_held <= 0:
+            return 0.0
+
+        rate = (
+            spec["swap_long"]
+            if direction == "BUY"
+            else spec["swap_short"]
+        )
+        return float(rate) * volume * days_held
+
+    # ------------------------------------------------------------------
+    # Data loading
+    # ------------------------------------------------------------------
 
     def load_data(self, symbol: str, timeframes: List[str],
                   start_date: datetime, end_date: datetime) -> bool:
         """Load genuine historical data from MT5 and resample."""
-        logger.info(f"Loading historical data for {symbol} from {start_date} to {end_date}")
+        logger.info(
+            "Loading historical data for %s from %s to %s",
+            symbol, start_date, end_date,
+        )
 
         if not mt5_connector.is_connected():
             if not mt5_connector.initialize():
@@ -102,24 +398,24 @@ class BacktestEngine:
 
         df = pd.DataFrame(rates)
         df.set_index("time", inplace=True)
-        
+
         if df.index.tz is None:
             df.index = df.index.tz_localize('UTC')
-            
-        logger.info(f"Loaded {len(df)} base M5 candles.")
+
+        logger.info("Loaded %d base M5 candles.", len(df))
 
         resample_rules = {
             "m5": "5min",
             "m15": "15min",
             "h1": "1h",
-            "h4": "4h"
+            "h4": "4h",
         }
 
         for tf in timeframes:
             rule = resample_rules.get(tf)
             if not rule:
                 continue
-            
+
             if tf == "m5":
                 self.candles[tf] = df.copy()
             else:
@@ -131,16 +427,61 @@ class BacktestEngine:
                     "tick_volume": "sum"
                 }).dropna()
                 self.candles[tf] = resampled
-            
-            logger.info(f"Resampled {tf}: {len(self.candles[tf])} candles.")
+
+            logger.info("Resampled %s: %d candles.", tf, len(self.candles[tf]))
 
         return True
+
+    # ------------------------------------------------------------------
+    # Backtest loop
+    # ------------------------------------------------------------------
 
     def run_backtest(self, config: BacktestConfig) -> BacktestReport:
         self.status = BacktestStatus.RUNNING
         self.progress = 0.0
 
-        logger.info(f"Starting backtest: {config.name}")
+        # M-04: load broker spec BEFORE anything else. Fail closed if
+        # unavailable -- never fall back to hardcoded economics.
+        self._broker_spec = self._load_broker_spec()
+        if self._broker_spec is None:
+            logger.error(
+                "Backtest aborted: broker symbol spec unavailable. "
+                "M-04 refuses to model costs with hardcoded fallbacks."
+            )
+            self.status = BacktestStatus.FAILED
+            return self._create_failed_report(config)
+
+        # Reflect broker pip/point onto legacy fields for compatibility.
+        self.pip_value = self._broker_spec["pip_size"]
+        self.point_value = self._broker_spec["point"]
+
+        self._cost_config = self._load_cost_config(config)
+
+        self.assumptions_applied = {
+            "spread_model": "half_per_side",
+            "spread_pips": self._cost_config["spread_pips"],
+            "slippage_model": "entry_and_sl_exit",
+            "slippage_pips": self._cost_config["slippage_pips"],
+            "commission_per_lot": self._cost_config["commission_per_lot"],
+            "commission_per_side": self._cost_config["commission_per_side"],
+            "volume_rounding": "floor_to_step",
+            "volume_below_min": "skip_trade",
+            "volume_above_max": "cap_at_max",
+            "swap_model": (
+                self._cost_config["swap_unit"]
+                if self._cost_config["swap_enabled"]
+                else "none"
+            ),
+            "candle_basis": "mid",
+            "pip_size": self.pip_value,
+            "point": self.point_value,
+            "tick_size": self._broker_spec["tick_size"],
+            "tick_value": self._broker_spec["tick_value"],
+            "contract_size": self._broker_spec["contract_size"],
+        }
+        logger.info("Backtest assumptions: %s", self.assumptions_applied)
+
+        logger.info("Starting backtest: %s", config.name)
 
         try:
             self.current_state = BacktestState(
@@ -171,7 +512,7 @@ class BacktestEngine:
             for i in range(lookback, total_candles):
                 current_time = df.index[i]
                 current_candle = df.iloc[i]
-                
+
                 self.current_state.current_index = i
                 self.current_state.current_time = current_time
                 self.progress = (i - lookback) / (total_candles - lookback) * 100
@@ -192,30 +533,42 @@ class BacktestEngine:
             self.status = BacktestStatus.COMPLETED
             self.progress = 100.0
 
-            logger.info(f"Backtest completed: {self.report.net_profit:.2f} profit, {self.report.total_trades} trades")
+            logger.info(
+                "Backtest completed: %.2f profit, %d trades",
+                self.report.net_profit, self.report.total_trades,
+            )
             return self.report
 
         except Exception as e:
-            logger.exception(f"Backtest failed: {e}")
+            logger.exception("Backtest failed: %s", e)
             self.status = BacktestStatus.FAILED
             return self._create_failed_report(config)
 
+    # ------------------------------------------------------------------
+    # Equity, exits, entries
+    # ------------------------------------------------------------------
+
     def _update_equity(self, current_candle: pd.Series):
-        spread = 0.20
-        bid = current_candle["close"] - (spread / 2)
-        ask = current_candle["close"] + (spread / 2)
+        spec = self._broker_spec
+        cost = self._cost_config
+        if spec is None or cost is None:
+            return
+
+        pip_size = spec["pip_size"]
+        half_spread = cost["spread_pips"] * pip_size / 2.0
+        pl_per_lot = self._pl_per_lot_per_price()
+
+        mid = float(current_candle["close"])
+        bid = mid - half_spread
+        ask = mid + half_spread
 
         floating_pl = 0.0
         for pos in self.current_state.open_positions:
             if pos.direction == "BUY":
-                # BUY is marked and closed at bid.
-                pl_pips = (bid - pos.entry_price) / self.pip_value
+                delta = bid - pos.entry_price
             else:
-                # Phase 4A: SELL is marked and closed at ask, not bid.
-                pl_pips = (pos.entry_price - ask) / self.pip_value
-
-            tick_value = 10.0
-            floating_pl += pl_pips * tick_value * pos.volume
+                delta = pos.entry_price - ask
+            floating_pl += delta * pl_per_lot * pos.volume
 
         self.current_state.equity = self.current_state.balance + floating_pl
 
@@ -225,74 +578,98 @@ class BacktestEngine:
         current_time: datetime,
         config: BacktestConfig,
     ):
-        high = current_candle["high"]
-        low = current_candle["low"]
-        
-        spread = 0.20
-        ask_high = high + (spread / 2)
-        ask_low = low + (spread / 2)
-        bid_high = high - (spread / 2)
-        bid_low = low - (spread / 2)
+        spec = self._broker_spec
+        cost = self._cost_config
+        if spec is None or cost is None:
+            return
+
+        pip_size = spec["pip_size"]
+        half_spread = cost["spread_pips"] * pip_size / 2.0
+        pl_per_lot = self._pl_per_lot_per_price()
+
+        high = float(current_candle["high"])
+        low = float(current_candle["low"])
+
+        # Candle treated as mid; derive bid/ask quotes from mid.
+        bid_high = high - half_spread
+        bid_low = low - half_spread
+        ask_high = high + half_spread
+        ask_low = low + half_spread
+
+        commission_multiplier = (
+            2.0 if cost["commission_per_side"] else 1.0
+        )
 
         remaining = []
         for pos in self.current_state.open_positions:
-            closed = False
+            exit_fill: Optional[float] = None
+            exit_reason = ""
 
             if pos.direction == "BUY":
                 if bid_low <= pos.sl:
-                    pos.close_price = pos.sl
-                    pos.close_time = current_time
-                    pos.close_reason = "SL"
-                    pos.realized_r = -1.0
-                    closed = True
+                    exit_fill = self._apply_exit_costs(
+                        "BUY", pos.sl, is_limit=False,
+                    )
+                    exit_reason = "SL"
                 elif bid_high >= pos.tp:
-                    pos.close_price = pos.tp
-                    pos.close_time = current_time
-                    pos.close_reason = "TP"
-                    risk = pos.entry_price - pos.sl
-                    reward = pos.tp - pos.entry_price
-                    pos.realized_r = reward / risk if risk > 0 else 0
-                    closed = True
+                    exit_fill = self._apply_exit_costs(
+                        "BUY", pos.tp, is_limit=True,
+                    )
+                    exit_reason = "TP"
             else:
                 if ask_high >= pos.sl:
-                    pos.close_price = pos.sl
-                    pos.close_time = current_time
-                    pos.close_reason = "SL"
-                    pos.realized_r = -1.0
-                    closed = True
+                    exit_fill = self._apply_exit_costs(
+                        "SELL", pos.sl, is_limit=False,
+                    )
+                    exit_reason = "SL"
                 elif ask_low <= pos.tp:
-                    pos.close_price = pos.tp
-                    pos.close_time = current_time
-                    pos.close_reason = "TP"
-                    risk = pos.sl - pos.entry_price
-                    reward = pos.entry_price - pos.tp
-                    pos.realized_r = reward / risk if risk > 0 else 0
-                    closed = True
+                    exit_fill = self._apply_exit_costs(
+                        "SELL", pos.tp, is_limit=True,
+                    )
+                    exit_reason = "TP"
 
-            if closed:
-                if pos.direction == "BUY":
-                    profit_pips = (pos.close_price - pos.entry_price) / self.pip_value
-                else:
-                    profit_pips = (pos.entry_price - pos.close_price) / self.pip_value
-
-                gross = profit_pips * 10.0 * pos.volume
-                spread_cost = 10.0 * pos.volume
-                # Phase 4A: use the per-backtest commission, not the
-                # global config. Otherwise two backtests with different
-                # commission_per_lot produce identical results.
-                commission = float(config.commission_per_lot) * pos.volume
-                net = gross - commission - spread_cost
-
-                pos.gross_profit = gross
-                pos.net_profit = net
-                pos.spread_cost = spread_cost
-
-                self.current_state.balance += net
-                self.current_state.daily_pl += net
-                self.current_state.closed_trades.append(self._position_to_trade(pos))
-                self.trades.append(self._position_to_trade(pos))
-            else:
+            if exit_fill is None:
                 remaining.append(pos)
+                continue
+
+            pos.close_price = exit_fill
+            pos.close_time = current_time
+            pos.close_reason = exit_reason
+
+            gross = self._calculate_gross_pl(
+                pos.direction, pos.entry_price, exit_fill, pos.volume
+            )
+
+            risk = abs(pos.entry_price - pos.sl)
+            if risk > 0 and exit_fill != pos.entry_price:
+                reward = abs(exit_fill - pos.entry_price)
+                sign = 1.0 if gross >= 0 else -1.0
+                pos.realized_r = sign * reward / risk
+            else:
+                pos.realized_r = 0.0
+
+            commission = (
+                cost["commission_per_lot"]
+                * commission_multiplier
+                * pos.volume
+            )
+            swap = self._apply_swap(
+                pos.direction, pos.volume, pos.entry_time, current_time
+            )
+
+            net = gross - commission + swap
+
+            pos.gross_profit = gross
+            pos.net_profit = net
+            pos.spread_cost = (
+                cost["spread_pips"] * pip_size * pl_per_lot * pos.volume
+            )
+
+            self.current_state.balance += net
+            self.current_state.daily_pl += net
+            trade = self._position_to_trade(pos)
+            self.current_state.closed_trades.append(trade)
+            self.trades.append(trade)
 
         self.current_state.open_positions = remaining
 
@@ -411,7 +788,23 @@ class BacktestEngine:
             if orig_calculate_atr is not None:
                 market_data.calculate_atr = orig_calculate_atr
 
-    def _execute_signal(self, sig: TradeSignal, current_candle: pd.Series, current_time: datetime, config: BacktestConfig):
+    def _execute_signal(
+        self,
+        sig: TradeSignal,
+        current_candle: pd.Series,
+        current_time: datetime,
+        config: BacktestConfig,
+    ):
+        spec = self._broker_spec
+        cost = self._cost_config
+        if spec is None or cost is None:
+            logger.error(
+                "Cannot execute signal: broker spec/cost config not "
+                "loaded. Signal %s %s dropped.",
+                sig.direction.value, sig.strategy.value,
+            )
+            return
+
         max_pos = int(self.trading_config.max_positions)
         if len(self.current_state.open_positions) >= max_pos:
             logger.debug(
@@ -420,34 +813,52 @@ class BacktestEngine:
                 sig.direction.value, sig.strategy.value, max_pos,
             )
             return
+
         equity = self.current_state.equity
         risk_amount = equity * (config.risk_percent / 100)
 
-        if sig.direction == SignalDirection.BUY:
-            sl_distance = sig.entry_price - sig.sl_price
-        else:
-            sl_distance = sig.sl_price - sig.entry_price
+        # M-04: fill price includes spread half + slippage.
+        fill_price = self._apply_entry_costs(
+            sig.direction.value, sig.entry_price
+        )
 
-        if sl_distance <= 0: return
-        sl_pips = sl_distance / self.pip_value
-        if sl_pips <= 0: return
-            
-        tick_value = 10.0
-        volume = risk_amount / (sl_pips * tick_value)
-        volume = round(volume / 0.01) * 0.01
-        volume = max(0.01, min(50.0, volume))
+        # Actual risk distance from fill to signal SL.
+        if sig.direction == SignalDirection.BUY:
+            sl_distance = fill_price - sig.sl_price
+        else:
+            sl_distance = sig.sl_price - fill_price
+
+        if sl_distance <= 0:
+            logger.debug(
+                "Backtest: signal %s %s rejected; fill vs SL geometry "
+                "invalid (fill=%.5f sl=%.5f).",
+                sig.direction.value, sig.strategy.value,
+                fill_price, sig.sl_price,
+            )
+            return
+
+        volume = self._calculate_volume(risk_amount, sl_distance)
+        if volume is None:
+            logger.debug(
+                "Backtest: signal %s %s skipped; risk budget %.2f "
+                "cannot afford broker volume_min=%.4f at sl_distance="
+                "%.5f.",
+                sig.direction.value, sig.strategy.value,
+                risk_amount, spec["volume_min"], sl_distance,
+            )
+            return
 
         pos = BacktestPosition(
             ticket=self._ticket_counter,
             direction=sig.direction.value,
-            entry_price=sig.entry_price,
+            entry_price=fill_price,
             sl=sig.sl_price,
             tp=sig.tp_price,
             volume=volume,
             entry_time=current_time,
             entry_index=self.current_state.current_index,
             strategy=sig.strategy.value,
-            risk_percent=config.risk_percent
+            risk_percent=config.risk_percent,
         )
         self._ticket_counter += 1
         self.current_state.open_positions.append(pos)
@@ -458,32 +869,70 @@ class BacktestEngine:
         last_time: datetime,
         config: BacktestConfig,
     ):
-        spread = 0.20
-        bid = last_candle["close"] - (spread / 2)
-        ask = last_candle["close"] + (spread / 2)
+        spec = self._broker_spec
+        cost = self._cost_config
+        if spec is None or cost is None:
+            return
+
+        pip_size = spec["pip_size"]
+        half_spread = cost["spread_pips"] * pip_size / 2.0
+        pl_per_lot = self._pl_per_lot_per_price()
+
+        mid = float(last_candle["close"])
+        bid = mid - half_spread
+        ask = mid + half_spread
+
+        commission_multiplier = (
+            2.0 if cost["commission_per_side"] else 1.0
+        )
 
         for pos in self.current_state.open_positions:
-            pos.close_price = bid if pos.direction == "BUY" else ask
+            if pos.direction == "BUY":
+                exit_fill = self._apply_exit_costs(
+                    "BUY", bid, is_limit=False,
+                )
+            else:
+                exit_fill = self._apply_exit_costs(
+                    "SELL", ask, is_limit=False,
+                )
+
+            pos.close_price = exit_fill
             pos.close_time = last_time
             pos.close_reason = "END_OF_BACKTEST"
 
-            if pos.direction == "BUY":
-                profit_pips = (pos.close_price - pos.entry_price) / self.pip_value
-            else:
-                profit_pips = (pos.entry_price - pos.close_price) / self.pip_value
+            gross = self._calculate_gross_pl(
+                pos.direction, pos.entry_price, exit_fill, pos.volume
+            )
 
-            gross = profit_pips * 10.0 * pos.volume
-            spread_cost = 10.0 * pos.volume
-            commission = float(config.commission_per_lot) * pos.volume
-            net = gross - commission - spread_cost
+            risk = abs(pos.entry_price - pos.sl)
+            if risk > 0 and exit_fill != pos.entry_price:
+                reward = abs(exit_fill - pos.entry_price)
+                sign = 1.0 if gross >= 0 else -1.0
+                pos.realized_r = sign * reward / risk
+            else:
+                pos.realized_r = 0.0
+
+            commission = (
+                cost["commission_per_lot"]
+                * commission_multiplier
+                * pos.volume
+            )
+            swap = self._apply_swap(
+                pos.direction, pos.volume, pos.entry_time, last_time
+            )
+
+            net = gross - commission + swap
 
             pos.gross_profit = gross
             pos.net_profit = net
-            pos.realized_r = net / (pos.volume * abs(pos.entry_price - pos.sl) / self.pip_value * 10.0) if pos.sl != pos.entry_price else 0
+            pos.spread_cost = (
+                cost["spread_pips"] * pip_size * pl_per_lot * pos.volume
+            )
 
             self.current_state.balance += net
-            self.current_state.closed_trades.append(self._position_to_trade(pos))
-            self.trades.append(self._position_to_trade(pos))
+            trade = self._position_to_trade(pos)
+            self.current_state.closed_trades.append(trade)
+            self.trades.append(trade)
 
         self.current_state.open_positions = []
 
@@ -504,7 +953,7 @@ class BacktestEngine:
             gross_profit=pos.gross_profit,
             net_profit=pos.net_profit,
             strategy=pos.strategy,
-            exit_reason=pos.close_reason
+            exit_reason=pos.close_reason,
         )
 
     def _update_drawdown(self):
@@ -531,25 +980,45 @@ class BacktestEngine:
         gross_profit = sum(t.gross_profit for t in winners)
         gross_loss = abs(sum(t.gross_profit for t in losers))
         net_profit = sum(t.net_profit for t in trades)
-        net_return = (self.current_state.equity - config.initial_balance) / config.initial_balance * 100
+        net_return = (
+            (self.current_state.equity - config.initial_balance)
+            / config.initial_balance * 100
+        )
 
         win_rate = len(winners) / len(trades) * 100
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
-        
+        profit_factor = (
+            gross_profit / gross_loss if gross_loss > 0 else float('inf')
+        )
+
         avg_win = gross_profit / len(winners) if winners else 0
         avg_loss = gross_loss / len(losers) if losers else 0
-        expectancy = (win_rate / 100 * avg_win) - ((100 - win_rate) / 100 * avg_loss)
+        expectancy = (
+            (win_rate / 100 * avg_win)
+            - ((100 - win_rate) / 100 * avg_loss)
+        )
 
         avg_r = np.mean([t.realized_r for t in trades])
-        avg_rr = np.mean([abs(t.realized_r) for t in trades if t.realized_r != 0]) if any(t.realized_r != 0 for t in trades) else 0
+        avg_rr = (
+            np.mean([abs(t.realized_r) for t in trades if t.realized_r != 0])
+            if any(t.realized_r != 0 for t in trades) else 0
+        )
 
         returns = [t.net_profit / config.initial_balance for t in trades]
-        sharpe = np.mean(returns) / np.std(returns) * np.sqrt(252) if np.std(returns) > 0 else 0
+        sharpe = (
+            np.mean(returns) / np.std(returns) * np.sqrt(252)
+            if np.std(returns) > 0 else 0
+        )
 
         downside_returns = [r for r in returns if r < 0]
-        sortino = np.mean(returns) / np.std(downside_returns) * np.sqrt(252) if downside_returns and np.std(downside_returns) > 0 else 0
+        sortino = (
+            np.mean(returns) / np.std(downside_returns) * np.sqrt(252)
+            if downside_returns and np.std(downside_returns) > 0 else 0
+        )
 
-        recovery = net_profit / self.current_state.max_drawdown if self.current_state.max_drawdown > 0 else 0
+        recovery = (
+            net_profit / self.current_state.max_drawdown
+            if self.current_state.max_drawdown > 0 else 0
+        )
 
         max_consec_wins = max_consec_losses = 0
         current_streak = 0
@@ -561,7 +1030,9 @@ class BacktestEngine:
             else:
                 if current_streak <= 0: current_streak -= 1
                 else: current_streak = -1
-                max_consec_losses = max(max_consec_losses, abs(current_streak))
+                max_consec_losses = max(
+                    max_consec_losses, abs(current_streak)
+                )
 
         long_trades = [t for t in trades if t.direction == "BUY"]
         short_trades = [t for t in trades if t.direction == "SELL"]
@@ -593,14 +1064,23 @@ class BacktestEngine:
             recovery_factor=recovery,
             largest_win=max(t.net_profit for t in trades),
             largest_loss=min(t.net_profit for t in trades),
-            avg_holding_hours=np.mean([(t.exit_time - t.entry_time).total_seconds() / 3600 for t in trades]),
+            avg_holding_hours=np.mean([
+                (t.exit_time - t.entry_time).total_seconds() / 3600
+                for t in trades
+            ]),
             max_consecutive_wins=max_consec_wins,
             max_consecutive_losses=max_consec_losses,
             long_trades=len(long_trades),
-            long_win_rate=len(long_wins) / len(long_trades) * 100 if long_trades else 0,
+            long_win_rate=(
+                len(long_wins) / len(long_trades) * 100
+                if long_trades else 0
+            ),
             long_profit=sum(t.net_profit for t in long_trades),
             short_trades=len(short_trades),
-            short_win_rate=len(short_wins) / len(short_trades) * 100 if short_trades else 0,
+            short_win_rate=(
+                len(short_wins) / len(short_trades) * 100
+                if short_trades else 0
+            ),
             short_profit=sum(t.net_profit for t in short_trades),
             environment="backtest"
         )
@@ -630,22 +1110,13 @@ class BacktestEngine:
     def get_status(self) -> BacktestStatus:
         return self.status
 
+    def get_assumptions_applied(self) -> Dict[str, Any]:
+        """M-04: return a copy of the execution assumptions modelled."""
+        return dict(self.assumptions_applied)
+
 
 async def run_backtest_async(config_id: int) -> BacktestReport:
-    """Run a backtest asynchronously.
-
-    Phase 4A: previously this was a sync function returning a report,
-    but the dashboard passed it to ``asyncio.create_task`` (which needs
-    a coroutine), and passed the integer config ID returned by
-    ``db_manager.add`` where a BacktestConfig object was expected —
-    both caused the route to fail at dispatch.
-
-    Now: accepts the integer config_id, fetches the config inside a
-    worker thread, runs the synchronous engine, and returns the
-    completed report. Threading keeps the FastAPI event loop responsive
-    during multi-minute backtests. Exceptions in the worker propagate
-    to the awaiting coroutine via ``set_exception``.
-    """
+    """Run a backtest asynchronously."""
     import asyncio
     import threading
 
@@ -660,8 +1131,6 @@ async def run_backtest_async(config_id: int) -> BacktestReport:
                     f"BacktestConfig id {config_id} not found."
                 )
             engine = BacktestEngine(config_id=int(config_id))
-            # `BacktestConfig` has no `symbol` column; use the live
-            # configured symbol (bot is single-symbol by design).
             ok = engine.load_data(
                 config.trading.symbol,
                 bt_config.timeframes,

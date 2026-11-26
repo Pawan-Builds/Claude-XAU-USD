@@ -1,17 +1,18 @@
 """Main trading agent - DEMO and LIVE orchestration with account safeguards."""
 
 import asyncio
+import json
 import os
 import signal
 import time
 import psutil
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import src.logger as logger_module
 
-from src.config_loader import config
+from src.config_loader import config, LIVE_CONFIRMATION_PHRASE
 from src.logger import setup_logging, get_logger
 from src.database_manager import db_manager, AccountSnapshot, TradePlan
 from src.mt5_connector import mt5_connector, mt5
@@ -33,8 +34,8 @@ logger = get_logger(__name__)
 class TradingAgent:
     """Trading orchestrator with explicit DEMO/LIVE safeguards."""
 
-    LIVE_CONFIRMATION = "I_ACCEPT_LIVE_TRADING_RISK"
-
+    LIVE_CONFIRMATION = LIVE_CONFIRMATION_PHRASE
+    
     def __init__(self):
         self._running = False
         self._paused = True
@@ -73,6 +74,226 @@ class TradingAgent:
             is_paused_getter=lambda: self._paused,
             is_shutdown_getter=lambda: self._shutdown_requested,
         )
+
+
+    # =========================================================
+    # M-08: SINGLE-INSTANCE LOCK (atomic, stale-aware)
+    # =========================================================
+
+    def _current_process_start_time(self) -> float:
+        """Return this process's create time (epoch seconds), or 0.0."""
+        try:
+            return float(psutil.Process(os.getpid()).create_time())
+        except Exception:
+            return 0.0
+
+    def _read_lock_payload(self) -> Optional[Dict[str, Any]]:
+        """Parse the lock file contents. Returns None if unreadable.
+
+        Accepts both the M-08 JSON payload (a dict with ``pid`` and
+        ``start_time``) and the pre-M-08 legacy format (a bare
+        integer PID written by the old code). Note that a bare
+        integer is *valid JSON*, so ``json.loads("12345")`` returns
+        the int ``12345``, not a ``JSONDecodeError``. The fallback
+        therefore must fire whenever the parsed value is not a dict,
+        not only on a parse error — otherwise a live legacy lock
+        would be misread as corrupt and silently reclaimed, which
+        is exactly the failure mode M-08 exists to prevent.
+        """
+        try:
+            raw = self._lock_file.read_text(encoding="utf-8").strip()
+        except Exception:
+            return None
+        if not raw:
+            return None
+
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            data = None
+
+        if isinstance(data, dict):
+            return data
+
+        # Either the parse failed (data is None) or it succeeded but
+        # yielded a non-dict (typically a bare int). Try the legacy
+        # single-PID interpretation.
+        try:
+            return {"pid": int(raw), "start_time": 0.0}
+        except (TypeError, ValueError):
+            return None
+
+    def _is_lock_holder_alive(self) -> bool:
+        """True if the lock is held by a live process we must respect.
+
+        Uses (pid, start_time) so an unrelated process that has
+        recycled the recorded PID is not mistaken for a live holder.
+
+        Conservative on ambiguity: an unreadable / empty file is
+        re-read after a short grace period, because a live peer's
+        write-after-create window is only two syscalls wide. If the
+        file is still unreadable after the grace, it is treated as
+        stale — which is exactly the crash / torn-write scenario the
+        lock exists to recover from.
+        """
+        data = self._read_lock_payload()
+        if data is None:
+            time.sleep(0.5)
+            data = self._read_lock_payload()
+        if data is None:
+            return False
+        try:
+            pid = int(data.get("pid", 0))
+        except (TypeError, ValueError):
+            return False
+        if pid <= 0:
+            return False
+        if not psutil.pid_exists(pid):
+            return False
+        expected_start = float(data.get("start_time", 0.0) or 0.0)
+        if expected_start <= 0:
+            # Legacy lock with no start_time; PID is alive.
+            return True
+        try:
+            actual_start = psutil.Process(pid).create_time()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return False
+        except Exception:
+            # Cannot verify; treat as alive (conservative).
+            return True
+        return abs(actual_start - expected_start) < 1.0
+
+    def _reclaim_stale_lock(self) -> bool:
+        """Atomically rename the stale lock aside, then delete it.
+
+        os.replace is the claim: only one process can win the rename
+        of a given source path. Losers see FileNotFoundError and
+        proceed to the atomic create attempt, where the winner's
+        fresh lock will correctly block them.
+        """
+        stale_path = self._lock_file.with_name(
+            self._lock_file.name + f".stale.{os.getpid()}"
+        )
+        try:
+            os.replace(str(self._lock_file), str(stale_path))
+        except FileNotFoundError:
+            return True
+        except Exception:
+            logger.exception(
+                "Could not rename stale lock %s aside.",
+                self._lock_file,
+            )
+            return False
+        try:
+            stale_path.unlink()
+        except Exception:
+            logger.warning(
+                "Could not delete stale-lock backup %s; leaving it "
+                "for manual cleanup.", stale_path,
+            )
+        return True
+
+    def _acquire_instance_lock(self) -> bool:
+        """M-08: acquire the single-instance lock atomically.
+
+        Uses O_CREAT|O_EXCL (atomic on NTFS and POSIX) so two
+        processes started in the same instant cannot both believe
+        they hold the lock. The payload (pid, start_time) lets a
+        later run distinguish a live holder from a stale lock
+        (crash without cleanup, or PID reuse).
+        """
+        try:
+            fd = os.open(
+                str(self._lock_file),
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            )
+        except FileExistsError:
+            if self._is_lock_holder_alive():
+                logger.critical(
+                    "ABORTING: another bot instance is already "
+                    "running (lock file %s).", self._lock_file,
+                )
+                return False
+            if not self._reclaim_stale_lock():
+                logger.critical(
+                    "ABORTING: could not reclaim stale lock file %s.",
+                    self._lock_file,
+                )
+                return False
+            try:
+                fd = os.open(
+                    str(self._lock_file),
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                )
+            except FileExistsError:
+                logger.critical(
+                    "ABORTING: lost race to acquire lock after "
+                    "reclaiming stale lock %s.", self._lock_file,
+                )
+                return False
+            except Exception:
+                logger.exception(
+                    "ABORTING: could not create lock file %s.",
+                    self._lock_file,
+                )
+                return False
+        except Exception:
+            logger.exception(
+                "ABORTING: could not create lock file %s.",
+                self._lock_file,
+            )
+            return False
+
+        try:
+            payload = json.dumps({
+                "pid": os.getpid(),
+                "start_time": self._current_process_start_time(),
+            }).encode("utf-8")
+            os.write(fd, payload)
+            try:
+                os.fsync(fd)
+            except OSError:
+                pass
+        finally:
+            os.close(fd)
+
+        self._lock_acquired = True
+        logger.info(
+            "Single-instance lock acquired (PID %s, file %s).",
+            os.getpid(), self._lock_file,
+        )
+        return True
+
+    def _release_instance_lock(self) -> None:
+        """Release the lock only if this process still owns it.
+
+        Never removes a lock file written by a different PID — that
+        would allow a second instance to start concurrently.
+        """
+        if not getattr(self, "_lock_acquired", False):
+            return
+        self._lock_acquired = False
+        if not self._lock_file.exists():
+            return
+        payload = self._read_lock_payload()
+        try:
+            owner_pid = int(payload.get("pid", 0)) if payload else 0
+        except (TypeError, ValueError):
+            owner_pid = 0
+        if owner_pid != os.getpid():
+            logger.warning(
+                "Lock file %s is not owned by this process "
+                "(owner PID %s, current PID %s); not removing.",
+                self._lock_file, owner_pid, os.getpid(),
+            )
+            return
+        try:
+            self._lock_file.unlink()
+            logger.info("Single-instance lock released.")
+        except Exception:
+            logger.exception(
+                "Could not remove lock file %s.", self._lock_file,
+            )
 
     # =========================================================
     # MODE AND ACCOUNT VERIFICATION
@@ -262,18 +483,10 @@ class TradingAgent:
 
     async def start(self):
         # --- MILESTONE 11: SINGLE-INSTANCE LOCK ---
-        if self._lock_file.exists():
-            try:
-                pid = int(self._lock_file.read_text().strip())
-                # Check if the process is actually still running
-                if psutil.pid_exists(pid):
-                    logger.critical(f"ABORTING: Another bot instance is already running (PID: {pid}).")
-                    return False
-            except Exception:
-                pass  # If the file is corrupt or psutil fails, overwrite it
-                
-        self._lock_file.write_text(str(os.getpid()))
-        self._lock_acquired = True
+        # --- M-08: SINGLE-INSTANCE LOCK (atomic) ---
+        if not self._acquire_instance_lock():
+            return False
+        # ------------------------------------------
         # ------------------------------------------
 
         logger.info("=" * 65)
@@ -1053,17 +1266,30 @@ class TradingAgent:
 
         result = trading_controller.close_all_for_weekend()
 
-        if not result.get("query_ok", False):
+        if not result.get("query_ok", True):
             logger.error(
-                "Weekend close could not verify position query; "
+                "Weekend close could not verify broker state; "
                 "will retry next cycle. Details: %s", result,
             )
             return  # Do NOT mark as done — retry next loop.
 
-        if result.get("failed", 0) > 0:
+        # M-09: retry if any position or pending order is unverified.
+        if result.get("failed", 0) > 0 or result.get("cancel_failed", 0) > 0:
             logger.error(
-                "Weekend close partially failed: closed=%d failed=%d. "
-                "Will retry next cycle.", result["closed"], result["failed"],
+                "Weekend close partially failed: closed=%d failed=%d "
+                "cancelled=%d cancel_failed=%d. Will retry next cycle.",
+                result.get("closed", 0), result.get("failed", 0),
+                result.get("cancelled", 0), result.get("cancel_failed", 0),
+            )
+            return  # Do NOT mark — retry next loop.
+
+        pending_left = result.get("pending_remaining", 0)
+        positions_left = result.get("positions_remaining", 0)
+        if pending_left > 0 or positions_left > 0:
+            logger.error(
+                "Weekend close verification failed: %d pending order(s) "
+                "and %d position(s) still open. Will retry next cycle.",
+                pending_left, positions_left,
             )
             return  # Do NOT mark — retry next loop.
 
@@ -1277,9 +1503,12 @@ class TradingAgent:
                 logger.exception("Market data shutdown failed.")
             self._market_data_started = False
 
-        # F-07: configurable pending-order shutdown policy.
+        # M-09: configurable pending-order shutdown policy. Default is
+        # now "cancel" (was "keep"): orphan pending orders with no bot
+        # running are a safety hazard. The post-cancel verification
+        # below is the fail-closed gate.
         policy = str(
-            getattr(config.trading, "pending_orders_on_shutdown", "keep")
+            getattr(config.trading, "pending_orders_on_shutdown", "cancel")
         ).lower()
         if policy == "cancel" and self._mt5_started:
             try:
@@ -1289,7 +1518,7 @@ class TradingAgent:
                 if not getattr(cancelled, "query_ok", True):
                     logger.error(
                         "Shutdown cancel: pending-order query failed; "
-                        "could not confirm cancellation."
+                        "cannot confirm cancellation."
                     )
                 else:
                     failed = getattr(cancelled, "failed", 0)
@@ -1305,9 +1534,61 @@ class TradingAgent:
                             "Shutdown policy: cancelled %d bot-owned "
                             "pending order(s).", total,
                         )
+
+                # M-09: fail-closed verification via fresh broker query.
+                remaining = mt5_connector.get_orders()
+                if remaining is None:
+                    logger.critical(
+                        "SHUTDOWN PENDING VERIFICATION FAILED: order "
+                        "query returned None; cannot confirm that all "
+                        "bot-owned pending orders were cancelled."
+                    )
+                    if self._telegram_ready:
+                        try:
+                            asyncio.create_task(telegram_bot.notify(
+                                "Shutdown Pending Verification",
+                                "Order query failed; cannot confirm "
+                                "all bot-owned pending orders were "
+                                "cancelled.",
+                                "\U0001F6A8",
+                            ))
+                        except Exception:
+                            logger.exception(
+                                "Shutdown verification alert failed."
+                            )
+                elif len(remaining) > 0:
+                    remaining_tickets = [
+                        int(o["ticket"]) for o in remaining
+                    ]
+                    logger.critical(
+                        "SHUTDOWN PENDING VERIFICATION FAILED: %d "
+                        "bot-owned pending order(s) remain live. "
+                        "Tickets: %s. These orders are now orphaned "
+                        "with no bot to manage them.",
+                        len(remaining), remaining_tickets,
+                    )
+                    if self._telegram_ready:
+                        try:
+                            asyncio.create_task(telegram_bot.notify(
+                                "Shutdown Pending Verification",
+                                f"{len(remaining)} bot-owned pending "
+                                f"order(s) still live after cancel: "
+                                f"{remaining_tickets}",
+                                "\U0001F6A8",
+                            ))
+                        except Exception:
+                            logger.exception(
+                                "Shutdown verification alert failed."
+                            )
+                else:
+                    logger.info(
+                        "Shutdown pending verification: 0 bot-owned "
+                        "pending orders remain."
+                    )
             except Exception:
                 logger.exception(
-                    "Failed to cancel bot-owned pending orders at shutdown."
+                    "Failed to cancel or verify bot-owned pending "
+                    "orders at shutdown."
                 )
 
         if self._mt5_started:
@@ -1333,12 +1614,8 @@ class TradingAgent:
 
         self._telegram_ready = False
         
-        # MILESTONE 11: Release the lock
-        if getattr(self, '_lock_acquired', False) and self._lock_file.exists():
-            try:
-                self._lock_file.unlink()
-            except Exception:
-                pass
+        # M-08: release the lock only if this process owns it.
+        self._release_instance_lock()
                 
         logger.info("Trading agent shutdown complete.")
 

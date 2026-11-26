@@ -17,6 +17,7 @@ from src.indicators import (
 )
 from src.market_data import market_data
 from src.mt5_connector import mt5_connector, MT5Connector
+from src.config_loader import config
 from src.logger import get_logger
 
 logger = get_logger(__name__)
@@ -40,8 +41,29 @@ class FVGAnalyzer:
         self.timeframes = ["h4", "h1", "m15", "m5"]
         self.fvg_cache: Dict[str, FVGState] = {}
 
-        self.min_size_pips = 5.0
+        self.min_size_pips = self._read_min_size_pips()
 
+    @staticmethod
+    def _read_min_size_pips() -> float:
+        """M-11: read smc.fvg_min_size_pips from config.
+
+        Missing, non-numeric, non-finite, or negative values fall
+        back to 5.0 (the pre-M-11 hardcoded default).
+        """
+        try:
+            value = getattr(config.smc, "fvg_min_size_pips", 5.0)
+        except Exception:
+            return 5.0
+
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return 5.0
+
+        if not np.isfinite(value) or value < 0:
+            return 5.0
+
+        return value
     @property
     def point_value(self) -> float:
         """Broker-aware pip size (price per pip). See module docstring.

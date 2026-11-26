@@ -19,11 +19,10 @@ trading:
   max_drawdown_percent: 10.0
   max_consecutive_losses: 5
   max_holding_hours: 48
-  entry_order_type: "limit"     # "limit" (planned) or "market" (reactive)
+  entry_mode: "planned"
   pending_expiry_hours: 4       # cancel unfilled limit orders after N hours
   max_pending_orders: 5  
-  pending_orders_on_shutdown: "keep" 
-
+  pending_orders_on_shutdown: "cancel"
 # DEMO account
 demo:
   mt5_login: ${DEMO_MT5_LOGIN}
@@ -49,6 +48,16 @@ timeframes:
   structure_tf: "h1"
   setup_tf: "m15"
   entry_tf: "m5"
+# M-05: market-data reliability.
+# New entries are blocked when the latest tick is older than
+# max_tick_age_seconds, or when any required timeframe's most
+# recent closed candle's close-time is more than
+# max_candle_age_bars × timeframe in the past.
+# See MarketDataEngine.is_market_data_reliable() and
+# MT5Connector.is_tick_fresh().
+data:
+  max_tick_age_seconds: 60
+  max_candle_age_bars: 2
 
 smc:
   strategies:
@@ -67,6 +76,37 @@ smc:
   displacement_atr_multiplier: 1.5      # supersedes the legacy ratio threshold
   displacement_min_body_pips: 5 
   equal_high_low_tolerance: 2
+  # M-03: trailing closed-candle window within which BOS/CHoCH events
+  # are classified as the current structural state. Older events remain
+  # visible via last_bos_index / last_choch_index but no longer drive
+  # is_bos_* / is_choch_*. Default 10 matches the pre-M-03 hardcoded
+  # behavior.
+  structure_event_lookback: 10
+  # M-06: per-strategy higher-timeframe alignment.
+  # When require_h1 is true, a strategy fires only if the structure
+  # timeframe bias (config.timeframes.structure_tf, default h1) is
+  # non-neutral AND matches the bias timeframe (config.timeframes.
+  # bias_tf, default h4). When false, only bias_tf alignment is
+  # required.
+  #
+  # Defaults: structural strategies (BOS / CHoCH-based) require
+  # H4+H1 alignment; momentum strategies (sweep+FVG, displacement,
+  # compound sweep+OB+FVG) require H4 only. This corrects the
+  # pre-M-06 inconsistency where `bos_order_block` required H1 but
+  # its sibling `choch_order_block` did not.
+  strategy_alignment:
+    liquidity_sweep_fvg:
+      require_h1: false
+    displacement_fvg:
+      require_h1: false
+    liquidity_sweep_ob_fvg:
+      require_h1: false
+    bos_order_block:
+      require_h1: true
+    choch_order_block:
+      require_h1: true
+    liquidity_sweep_choch:
+      require_h1: true
 
 liquidity:
   # M-01: minimum distance price must pierce BEYOND a liquidity level
@@ -148,6 +188,13 @@ backtesting:
   commission_per_lot: 7.0
   swap_enabled: true
   data_source: "mt5"
+  # M-04: charge commission_per_lot once per side (entry + exit) instead of
+  # a single round-trip charge. Standard ECN convention.
+  commission_per_side: true
+  # M-04: swap modelling unit. "usd_per_lot_per_day" applies broker
+  # swap_long/swap_short as account-currency per lot per held day.
+  # "none" disables swap modelling regardless of swap_enabled.
+  swap_unit: "usd_per_lot_per_day"
 
 dashboard:
   host: ${DASHBOARD_HOST}

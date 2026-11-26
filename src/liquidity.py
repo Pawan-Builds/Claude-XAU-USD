@@ -45,8 +45,44 @@ class LiquidityAnalyzer:
         self.timeframes = ["h4", "h1", "m15", "m5"]
         self.liquidity_cache: Dict[str, LiquidityState] = {}
 
-        self.lookback = 100
-        self.tolerance_pips = 2.0
+        self.lookback = self._read_positive_int(
+            "liquidity_lookback", default=100
+        )
+        self.tolerance_pips = self._read_non_negative_float(
+            "equal_high_low_tolerance", default=2.0
+        )
+
+    @staticmethod
+    def _read_positive_int(key: str, default: int) -> int:
+        """M-11: read a positive int from config.smc."""
+        try:
+            value = getattr(config.smc, key, default)
+        except Exception:
+            return default
+        if isinstance(value, bool):
+            return default
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return default
+        if value < 1:
+            return default
+        return value
+
+    @staticmethod
+    def _read_non_negative_float(key: str, default: float) -> float:
+        """M-11: read a non-negative float from config.smc."""
+        try:
+            value = getattr(config.smc, key, default)
+        except Exception:
+            return default
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not np.isfinite(value) or value < 0:
+            return default
+        return value
 
     @property
     def point_value(self) -> float:

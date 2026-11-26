@@ -568,35 +568,135 @@ class TradingController:
         }
 
     def close_all_for_weekend(self) -> Dict[str, Any]:
-        """Close bot-owned positions ahead of the weekend.
+        """Close bot-owned positions AND cancel bot-owned pending orders.
 
-        Distinct from ``close_all`` in its reason, so the ClosedTrade
-        rows can be distinguished from manual closes. Idempotency is
-        enforced by the caller (main.py) via a persisted weekend marker;
-        this method itself will close whatever is currently open.
+        M-09: previously this method only closed positions. Pending
+        limit orders were left live over the weekend, where they could
+        fill while no bot was running to manage them.
+
+        Sequence mirrors ``emergency_stop``: cancel pending FIRST,
+        then close positions, then verify both via fresh broker
+        queries. The caller (``main._handle_weekend_close``) still
+        owns the idempotency marker; this method is the worker that
+        must be correct.
+
+        Return keys (extends the pre-M-09 contract):
+          ok:                 all verifiable operations succeeded
+          closed:             positions closed
+          failed:             positions that failed to close
+          cancelled:          pending orders cancelled
+          cancel_failed:      pending orders that failed to cancel
+          pending_remaining:  post-close pending count (-1 on query fail)
+          positions_remaining:post-close position count (-1 on query fail)
+          query_ok:           pre & post queries all succeeded
+          error:              joined diagnostics
         """
-        try:
-            result = order_executor.close_all_positions("WEEKEND")
-        except Exception as exc:
-            logger.exception("close_all_for_weekend raised.")
-            return {
-                "ok": False,
-                "closed": 0,
-                "failed": 0,
-                "query_ok": False,
-                "error": f"close_all_for_weekend raised: {exc}",
-            }
-
-        return {
-            "ok": result.query_ok and result.failed == 0,
-            "closed": result.closed,
-            "failed": result.failed,
-            "query_ok": result.query_ok,
-            "error": (
-                None if result.query_ok
-                else "Position query failed; cannot confirm all closed."
-            ),
+        result: Dict[str, Any] = {
+            "ok": False,
+            "closed": 0,
+            "failed": 0,
+            "cancelled": 0,
+            "cancel_failed": 0,
+            "pending_remaining": 0,
+            "positions_remaining": 0,
+            "query_ok": True,
+            "error": None,
         }
+        errors: list = []
+
+        # 1. Cancel bot-owned pending orders FIRST (mirrors emergency).
+        try:
+            cancel_res = order_executor.cancel_all_pending("WEEKEND")
+            result["cancelled"] = int(
+                getattr(cancel_res, "succeeded", 0)
+            )
+            result["cancel_failed"] = int(
+                getattr(cancel_res, "failed", 0)
+            )
+            if not bool(getattr(cancel_res, "query_ok", True)):
+                errors.append(
+                    "cancel_all_pending reported query_ok=False"
+                )
+                result["query_ok"] = False
+        except Exception as exc:
+            logger.exception(
+                "close_all_for_weekend: cancel_all_pending raised."
+            )
+            errors.append(f"cancel_all_pending raised: {exc}")
+            result["query_ok"] = False
+
+        # 2. Close bot-owned positions.
+        try:
+            close_result = order_executor.close_all_positions("WEEKEND")
+            result["closed"] = close_result.closed
+            result["failed"] = close_result.failed
+            if not close_result.query_ok:
+                errors.append(
+                    "close_all_positions reported query_ok=False"
+                )
+                result["query_ok"] = False
+        except Exception as exc:
+            logger.exception(
+                "close_all_for_weekend: close_all_positions raised."
+            )
+            errors.append(f"close_all_positions raised: {exc}")
+            result["query_ok"] = False
+
+        # 3. Post-attempt verification via fresh broker queries.
+        try:
+            orders = mt5_connector.get_orders()
+            if orders is None:
+                errors.append("post-close order query returned None")
+                result["query_ok"] = False
+                result["pending_remaining"] = -1
+            else:
+                result["pending_remaining"] = len(orders)
+        except Exception as exc:
+            logger.exception(
+                "close_all_for_weekend: post-close order query raised."
+            )
+            errors.append(f"order query raised: {exc}")
+            result["query_ok"] = False
+            result["pending_remaining"] = -1
+
+        try:
+            positions = mt5_connector.get_positions()
+            if positions is None:
+                errors.append("post-close position query returned None")
+                result["query_ok"] = False
+                result["positions_remaining"] = -1
+            else:
+                result["positions_remaining"] = len(positions)
+        except Exception as exc:
+            logger.exception(
+                "close_all_for_weekend: post-close position query raised."
+            )
+            errors.append(f"position query raised: {exc}")
+            result["query_ok"] = False
+            result["positions_remaining"] = -1
+
+        result["ok"] = (
+            result["query_ok"]
+            and result["failed"] == 0
+            and result["cancel_failed"] == 0
+            and result["pending_remaining"] == 0
+            and result["positions_remaining"] == 0
+        )
+        if errors:
+            result["error"] = "; ".join(errors)
+
+        logger.critical(
+            "Weekend close | ok=%s | closed=%d failed=%d | "
+            "cancelled=%d cancel_failed=%d | pending_remaining=%d "
+            "positions_remaining=%d | query_ok=%s | error=%s",
+            result["ok"],
+            result["closed"], result["failed"],
+            result["cancelled"], result["cancel_failed"],
+            result["pending_remaining"], result["positions_remaining"],
+            result["query_ok"], result["error"],
+        )
+
+        return result
 
     # ---------------- Entry ----------------
 

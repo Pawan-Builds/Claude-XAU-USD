@@ -18,6 +18,7 @@ from src.indicators import (
 )
 from src.market_data import market_data
 from src.mt5_connector import mt5_connector, MT5Connector
+from src.config_loader import config
 from src.logger import get_logger
 
 logger = get_logger(__name__)
@@ -41,8 +42,44 @@ class OrderBlockAnalyzer:
         self.timeframes = ["h4", "h1", "m15", "m5"]
         self.ob_cache: Dict[str, OBState] = {}
 
-        self.lookback = 20
-        self.displacement_threshold = 1.5
+        self.lookback = self._read_positive_int(
+            "ob_lookback", default=20
+        )
+        self.displacement_threshold = self._read_positive_float(
+            "displacement_threshold", default=1.5
+        )
+
+    @staticmethod
+    def _read_positive_int(key: str, default: int) -> int:
+        """M-11: read a positive int from config.smc."""
+        try:
+            value = getattr(config.smc, key, default)
+        except Exception:
+            return default
+        if isinstance(value, bool):
+            return default
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return default
+        if value < 1:
+            return default
+        return value
+
+    @staticmethod
+    def _read_positive_float(key: str, default: float) -> float:
+        """M-11: read a strictly positive float from config.smc."""
+        try:
+            value = getattr(config.smc, key, default)
+        except Exception:
+            return default
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not np.isfinite(value) or value <= 0:
+            return default
+        return value
 
     @property
     def point_value(self) -> float:

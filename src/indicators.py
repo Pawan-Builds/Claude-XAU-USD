@@ -201,9 +201,30 @@ def analyze_market_structure(
     lows: np.ndarray,
     closes: np.ndarray,
     lookback: int = 50,
-    swing_lookback: int = 5
+    swing_lookback: int = 5,
+    event_lookback: int = 10,
 ) -> MarketStructure:
-    """Analyze confirmed swing structure and recent BOS/CHoCH events."""
+    """Analyze confirmed swing structure and recent BOS/CHoCH events.
+
+    M-03: BOS and CHoCH are mutually exclusive as the *current*
+    structural state. Both events are still detected and their most
+    recent index and direction are preserved (so callers that need
+    historical context can still inspect them), but only the more
+    recent event's *_detected flag remains True. The `is_bos_*` and
+    `is_choch_*` helpers therefore reflect the current state, not the
+    historical presence of either event.
+
+    event_lookback: how many trailing closed candles to inspect for
+    BOS/CHoCH events. Must be >= 1. Events older than this window are
+    not classified as current state (last_*_index remains None if
+    nothing fired inside the window). Default 10 matches the pre-M-03
+    behavior.
+
+    Close-based structural-break confirmation is preserved: a break
+    requires `close > level` (bullish) or `close < level` (bearish).
+    An exact close at the level is not a break — no price buffer is
+    introduced.
+    """
     high_array = _as_float_array(highs, "highs")
     low_array = _as_float_array(lows, "lows")
     close_array = _as_float_array(closes, "closes")
@@ -213,9 +234,14 @@ def analyze_market_structure(
 
     lookback = _validate_lookback(lookback)
     swing_lookback = _validate_lookback(swing_lookback)
+    event_lookback = _validate_lookback(
+        event_lookback, "event_lookback"
+    )
 
     if len(close_array) == 0:
-        raise ValueError("Market structure cannot be calculated from empty data")
+        raise ValueError(
+            "Market structure cannot be calculated from empty data"
+        )
 
     if np.any(high_array < low_array):
         raise ValueError("A candle has a high below its low")
@@ -244,8 +270,7 @@ def analyze_market_structure(
         )
 
     # Trend = direction of the LAST TWO swing pivots on each side.
-    # This is more robust than counting older pivots because the most
-    # recent two are the ones the market is currently respecting.
+    # D9: this classifier is intentionally unchanged in M-03.
     def _last_direction(swings: List[SwingPoint]) -> int:
         if len(swings) < 2:
             return 0
@@ -284,7 +309,8 @@ def analyze_market_structure(
     latest_swing_high = recent_highs[-1]
     latest_swing_low = recent_lows[-1]
 
-    check_start = max(0, len(close_array) - 10)
+    # M-03: configurable event window (was hardcoded 10).
+    check_start = max(0, len(close_array) - event_lookback)
 
     if trend == "bullish":
         for i in range(check_start, len(close_array)):
@@ -316,17 +342,31 @@ def analyze_market_structure(
                 last_choch_index = i
                 last_choch_direction = "bullish"
 
+    # M-03: resolve the mutually-exclusive current-state reading.
+    # Both flags being True implies both indices are non-None.
+    # Preserve both indices and directions (historical reference),
+    # but keep only the more recent event's *_detected flag set.
+    if bos_detected and choch_detected:
+        if last_bos_index > last_choch_index:
+            choch_detected = False
+        else:
+            bos_detected = False
+
     structure_levels: Dict[str, float] = {}
 
     if recent_highs:
         structure_levels["recent_high"] = float(recent_highs[-1].price)
         if len(recent_highs) >= 2:
-            structure_levels["previous_high"] = float(recent_highs[-2].price)
+            structure_levels["previous_high"] = float(
+                recent_highs[-2].price
+            )
 
     if recent_lows:
         structure_levels["recent_low"] = float(recent_lows[-1].price)
         if len(recent_lows) >= 2:
-            structure_levels["previous_low"] = float(recent_lows[-2].price)
+            structure_levels["previous_low"] = float(
+                recent_lows[-2].price
+            )
 
     return MarketStructure(
         trend=trend,
@@ -340,7 +380,6 @@ def analyze_market_structure(
         swing_lows=recent_lows,
         structure_levels=structure_levels,
     )
-
 
 # ---------------------------------------------------------------------------
 # Fair Value Gaps

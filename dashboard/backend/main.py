@@ -6,8 +6,10 @@ token. Every state-changing call routes through trading_controller.
 
 import asyncio
 import hmac
+import json
+import math
 from datetime import datetime, timezone
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 from contextlib import asynccontextmanager
 
 from fastapi import (
@@ -35,7 +37,7 @@ from src.trading_controller import trading_controller
 from src.dashboard_auth import require_auth, check_websocket_allowed
 from src.database_manager import (
     db_manager, ClosedTrade, AccountSnapshot, OpenPosition,
-    BacktestReport, BacktestConfig, TradePlan,
+    BacktestReport, BacktestConfig, TradePlan, AppSettings,
 )
 from src.backtesting.engine import run_backtest_async
 from src.backtesting.reports import (
@@ -139,18 +141,162 @@ class BacktestRequest(BaseModel):
 
 
 class RiskConfigRequest(BaseModel):
-    risk_percent: float = None
-    max_positions: int = None
-    max_daily_loss: float = None
-    max_drawdown: float = None
-    compound_enabled: bool = None
+    risk_percent: Optional[float] = None
+    max_positions: Optional[int] = None
+    max_daily_loss: Optional[float] = None
+    max_drawdown: Optional[float] = None
+    compound_enabled: Optional[bool] = None
+    # M-15: weakening a limit requires explicit confirmation.
+    confirm: str = ""
 
 
 class KillSwitchRequest(BaseModel):
     active: bool
     confirm: str = ""
 
+_RISK_OVERRIDES_KEY_PREFIX = "risk_config_overrides_"
 
+
+def _risk_overrides_key(env: str) -> str:
+    return f"{_RISK_OVERRIDES_KEY_PREFIX}{env}"
+
+
+def _read_risk_overrides(env: str) -> Dict[str, Any]:
+    """M-15: read persisted risk overrides for the given environment."""
+    try:
+        row = db_manager.query_one(
+            AppSettings, key=_risk_overrides_key(env)
+        )
+        if row is None or not row.value:
+            return {}
+        parsed = json.loads(row.value)
+        if not isinstance(parsed, dict):
+            return {}
+        return parsed
+    except Exception:
+        logger.exception("Could not read risk config overrides.")
+        return {}
+
+
+def _write_risk_overrides(env: str, data: Dict[str, Any]) -> None:
+    """M-15: persist overrides. Raises on failure so caller fails closed."""
+    payload = json.dumps(data)
+    with db_manager.get_session() as session:
+        row = (
+            session.query(AppSettings)
+            .filter_by(key=_risk_overrides_key(env))
+            .first()
+        )
+        if row is None:
+            session.add(AppSettings(
+                key=_risk_overrides_key(env), value=payload,
+            ))
+        else:
+            row.value = payload
+
+
+def _validate_risk_request(
+    request: "RiskConfigRequest",
+    current: Dict[str, Any],
+) -> Tuple[Dict[str, Any], bool, List[str]]:
+    """M-15: strict validation. Returns (changes, weakening, errors)."""
+    changes: Dict[str, Any] = {}
+    errors: List[str] = []
+    weakening = False
+
+    if request.risk_percent is not None:
+        try:
+            val = float(request.risk_percent)
+        except (TypeError, ValueError):
+            errors.append("risk_percent must be a finite number.")
+            val = None
+        if val is not None:
+            if not math.isfinite(val):
+                errors.append("risk_percent must be finite.")
+            elif val <= 0:
+                errors.append("risk_percent must be > 0.")
+            else:
+                cap = float(current.get("max_risk_percent") or 0.0)
+                cur = float(current.get("default_risk_percent") or 0.0)
+                if cap > 0 and val > cap:
+                    errors.append(
+                        f"risk_percent {val} exceeds configured cap "
+                        f"{cap}. Edit config/settings.yaml to raise the cap."
+                    )
+                else:
+                    changes["default_risk_percent"] = val
+                    if cur > 0 and val > cur:
+                        weakening = True
+
+    if request.max_positions is not None:
+        try:
+            val = int(request.max_positions)
+        except (TypeError, ValueError):
+            errors.append("max_positions must be an integer.")
+            val = None
+        if val is not None:
+            if val < 1:
+                errors.append("max_positions must be >= 1.")
+            elif val > 100:
+                errors.append("max_positions cannot exceed 100.")
+            else:
+                cur = int(current.get("max_open_positions") or 0)
+                changes["max_open_positions"] = val
+                if cur > 0 and val > cur:
+                    weakening = True
+
+    if request.max_daily_loss is not None:
+        try:
+            val = float(request.max_daily_loss)
+        except (TypeError, ValueError):
+            errors.append("max_daily_loss must be a finite number.")
+            val = None
+        if val is not None:
+            if not math.isfinite(val):
+                errors.append("max_daily_loss must be finite.")
+            elif val <= 0:
+                errors.append("max_daily_loss must be > 0.")
+            elif val > 100:
+                errors.append("max_daily_loss cannot exceed 100%.")
+            else:
+                cur = float(current.get("daily_loss_limit_percent") or 0.0)
+                changes["daily_loss_limit_percent"] = val
+                if cur > 0 and val > cur:
+                    weakening = True
+
+    if request.max_drawdown is not None:
+        try:
+            val = float(request.max_drawdown)
+        except (TypeError, ValueError):
+            errors.append("max_drawdown must be a finite number.")
+            val = None
+        if val is not None:
+            if not math.isfinite(val):
+                errors.append("max_drawdown must be finite.")
+            elif val <= 0:
+                errors.append("max_drawdown must be > 0.")
+            elif val > 100:
+                errors.append("max_drawdown cannot exceed 100%.")
+            else:
+                cur = float(
+                    current.get("max_account_drawdown_percent") or 0.0
+                )
+                changes["max_account_drawdown_percent"] = val
+                if cur > 0 and val > cur:
+                    weakening = True
+
+    if request.compound_enabled is not None:
+        if not isinstance(request.compound_enabled, bool):
+            errors.append("compound_enabled must be a boolean.")
+        else:
+            cur = bool(current.get("compound_enabled") or False)
+            changes["compound_enabled"] = request.compound_enabled
+            if cur and not request.compound_enabled:
+                # Turning compounding off means position size stops
+                # adapting to reduced equity — a safety regression.
+                weakening = True
+
+    return changes, weakening, errors
 # ---------------- Endpoints ----------------
 
 @app.get("/api/health")
@@ -641,15 +787,145 @@ async def get_risk_status():
 
 @app.post("/api/risk/config", dependencies=[Depends(require_auth)])
 async def update_risk_config(request: RiskConfigRequest):
+    """Update (tighten) risk configuration overrides.
+
+    Security model
+    --------------
+    * Authentication: enforced by the standard bearer-token
+      ``require_auth`` dependency — identical to every other
+      state-changing endpoint here.
+    * Authorization: only operators holding the dashboard token may
+      call this endpoint (same boundary as pause / resume /
+      kill-switch).
+    * Validation: every field is bounds-checked. NaN, infinities,
+      non-positive values, and values above the configured YAML cap
+      are rejected with HTTP 400 *before* any write happens.
+    * Direction: tightening is accepted directly. Weakening requires
+      ``confirm='I_UNDERSTAND'`` (mirroring the kill-switch pattern).
+    * Persistence: accepted changes are merged into ``AppSettings``
+      under ``risk_config_overrides_<env>`` (durable + auditable),
+      with read-back verification.
+    * Effect: this endpoint **does not** hot-reload the running bot.
+      ``risk_manager`` snapshots its config at construction and YAML
+      remains authoritative. Apply overrides by editing
+      ``config/settings.yaml`` and restarting.
+    """
+    env = config.trading.mode.lower()
+
+    try:
+        current_risk = config.risk
+    except Exception:
+        logger.exception("Could not read current risk config.")
+        raise HTTPException(
+            status_code=500,
+            detail="Current risk configuration is unreadable.",
+        )
+
+    current = {
+        "default_risk_percent": float(current_risk.default_risk_percent),
+        "max_risk_percent": float(current_risk.max_risk_percent),
+        "max_open_positions": int(current_risk.max_open_positions),
+        "daily_loss_limit_percent": float(
+            current_risk.daily_loss_limit_percent
+        ),
+        "max_account_drawdown_percent": float(
+            current_risk.max_account_drawdown_percent
+        ),
+        "max_total_open_risk_percent": float(
+            current_risk.max_total_open_risk_percent
+        ),
+        "emergency_drawdown_percent": float(
+            current_risk.emergency_drawdown_percent
+        ),
+        "compound_enabled": bool(current_risk.compound_enabled),
+    }
+
+    changes, weakening, errors = _validate_risk_request(
+        request, current
+    )
+
+    if errors:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Invalid risk configuration.",
+                "errors": errors,
+            },
+        )
+
+    if not changes:
+        return {
+            "success": True,
+            "message": "No changes requested.",
+            "current": current,
+        }
+
+    if weakening and request.confirm != "I_UNDERSTAND":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": (
+                    "Weakening risk limits requires confirmation. "
+                    "Set confirm='I_UNDERSTAND' to proceed. Preferred "
+                    "path: edit config/settings.yaml and restart the "
+                    "bot."
+                ),
+                "requested_changes": changes,
+                "current": current,
+            },
+        )
+
+    try:
+        existing = _read_risk_overrides(env)
+    except Exception:
+        logger.exception("Could not read existing risk overrides.")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not read existing risk overrides.",
+        )
+
+    merged = {**existing, **changes}
+
+    try:
+        _write_risk_overrides(env, merged)
+    except Exception:
+        logger.exception("Could not persist risk config overrides.")
+        raise HTTPException(
+            status_code=500,
+            detail="Risk configuration could not be persisted.",
+        )
+
+    persisted = _read_risk_overrides(env)
+    if persisted != merged:
+        logger.critical(
+            "Risk override read-back mismatch | wrote=%s read=%s",
+            merged, persisted,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Risk configuration read-back verification failed.",
+        )
+
+    logger.warning(
+        "RISK OVERRIDES UPDATED | env=%s | weakening=%s | "
+        "changes=%s | persisted=%s",
+        env, weakening, changes, persisted,
+    )
+
     return {
-        "message": "Risk config update not implemented",
-        "current": {
-            "default_risk_percent": config.risk.default_risk_percent,
-            "max_risk_percent": config.risk.max_risk_percent,
-            "max_total_open_risk_percent": (
-                config.risk.max_total_open_risk_percent
-            ),
-        },
+        "success": True,
+        "message": (
+            "Overrides persisted to AppSettings. The running bot "
+            "continues to use YAML-configured values until it is "
+            "restarted with the corresponding YAML changes applied. "
+            "This endpoint records operator intent and provides a "
+            "validated, authenticated, audit-trailed write path — "
+            "it does not hot-reload into the live process, "
+            "preserving fail-closed semantics."
+        ),
+        "previous": current,
+        "applied_changes": changes,
+        "all_overrides": persisted,
     }
 
 

@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "settings.yaml"
+LIVE_CONFIRMATION_PHRASE = "I_ACCEPT_LIVE_TRADING_RISK"
 
 
 # ---------------------------------------------------------------------
@@ -152,7 +153,7 @@ class TradingConfig:
     max_drawdown_percent: float
     max_consecutive_losses: int
     max_holding_hours: int
-    entry_order_type: str
+    entry_mode: str
     pending_expiry_hours: int
     max_pending_orders: int
     pending_orders_on_shutdown: str = "keep"
@@ -291,6 +292,7 @@ class Config:
     """Loads settings and selects one explicitly configured MT5 account."""
 
     VALID_MODES = {"DEMO", "LIVE"}
+    VALID_ENTRY_MODES = {"planned"}
 
     def __init__(self, config_path: Optional[str] = None):
         self.config_path = (
@@ -440,9 +442,20 @@ class Config:
             self._raw_config.get("live", {}).get("allowed_account"),
             0
         )
-    live_trading_confirmation: str = os.getenv(
-        "LIVE_TRADING_CONFIRMATION", ""
-    )
+
+    @property
+    def live_trading_confirmation(self) -> str:
+        """M-13: return the current LIVE confirmation string.
+
+        Must be a property, not a class attribute. The prior form
+        evaluated os.getenv(...) at module-import time — before
+        load_dotenv() runs — so a value placed only in .env read as
+        "" at the connector submission boundary even though the
+        startup check (which calls os.getenv() fresh) saw the
+        correct value. Reading fresh on every access also ensures
+        the boundary check cannot be satisfied by a stale snapshot.
+        """
+        return os.getenv("LIVE_TRADING_CONFIRMATION", "").strip()
 
     def validate_mode_configuration(self, mode: Optional[str] = None):
         """Validate the selected account configuration before MT5 startup."""
@@ -455,6 +468,7 @@ class Config:
             raise ValueError(
                 f"Unsupported trading mode: {selected_mode!r}"
             )
+        self.validate_entry_mode()
 
         if selected_mode == "LIVE":
             if not self.live_trading_enabled:
@@ -493,6 +507,30 @@ class Config:
                     "LIVE_ALLOWED_ACCOUNT."
                 )
 
+        return True
+
+    def validate_entry_mode(self) -> bool:
+        """M-07: fail closed on unsupported trading.entry_mode.
+
+        Only "planned" is implemented: the bot generates a trade plan,
+        waits for the planned entry, reconfirms the SMC setup, runs the
+        entry gate, then submits a MARKET order (TRADE_ACTION_DEAL).
+
+        "immediate" is reserved and NOT implemented. Any other value
+        (including "limit" and "market", which previously appeared in
+        the misleading entry_order_type key) raises RuntimeError before
+        MT5 connects.
+
+        Raises:
+            RuntimeError: on any value outside VALID_ENTRY_MODES.
+        """
+        mode = self.trading.entry_mode
+        if mode not in self.VALID_ENTRY_MODES:
+            raise RuntimeError(
+                f"Unsupported trading.entry_mode {mode!r}. "
+                f"Only {sorted(self.VALID_ENTRY_MODES)} is implemented. "
+                f"'immediate' is reserved and not implemented."
+            )
         return True
 
     def get_account_info_for_mode(self, mode: str) -> Dict[str, Any]:
@@ -591,8 +629,8 @@ class Config:
             max_holding_hours=_safe_int(
                 c.get("max_holding_hours"), 48
             ),
-            entry_order_type=_safe_str(
-                c.get("entry_order_type"), "limit"
+            entry_mode=_safe_str(
+                c.get("entry_mode"), "planned"
             ).lower(),
             pending_expiry_hours=_safe_int(
                 c.get("pending_expiry_hours"), 4

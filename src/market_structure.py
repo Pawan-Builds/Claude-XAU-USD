@@ -12,6 +12,7 @@ from src.indicators import (
     SwingPoint,
 )
 from src.market_data import market_data
+from src.config_loader import config
 from src.logger import get_logger
 
 logger = get_logger(__name__)
@@ -33,11 +34,104 @@ class StructureState:
 class MarketStructureAnalyzer:
     """Analyzes H4, H1, M15 and M5 market structure."""
 
+    _SUPPORTED_TIMEFRAMES = frozenset({"h4", "h1", "m15", "m5"})
+
     def __init__(self):
         self.timeframes = ["h4", "h1", "m15", "m5"]
         self.structure_cache: Dict[str, StructureState] = {}
+        # M-11: the small pivot-confirmation window (5) is an
+        # internal constant of the structure analyser; it is not
+        # intended to be operator-tunable.
         self.swing_lookback = 5
-        self.structure_lookback = 50
+        self.structure_lookback = self._read_structure_lookback()
+        self.structure_event_lookback = self._read_event_lookback()
+        # M-06: configurable bias / structure timeframes.
+        self._bias_tf = self._read_timeframe_key("bias_tf", "h4")
+        self._structure_tf = self._read_timeframe_key(
+            "structure_tf", "h1"
+        )
+
+    @staticmethod
+    def _read_structure_lookback() -> int:
+        """M-11: read the structure-analysis window from config.
+
+        The config key `smc.swing_lookback` (default 50) carries the
+        outer structure-analysis window used by
+        `analyze_market_structure(lookback=...)`. The pre-M-11
+        hardcoded value was also 50, so behaviour is unchanged when
+        the config is present. Invalid or non-positive values fall
+        back to 50.
+        """
+        try:
+            value = getattr(config.smc, "swing_lookback", 50)
+        except Exception:
+            return 50
+
+        if isinstance(value, bool):
+            return 50
+
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return 50
+
+        if value < 1:
+            return 50
+
+        return value
+
+    def _read_timeframe_key(self, key: str, default: str) -> str:
+        """M-06: read a timeframe config value safely.
+
+        Missing, empty, non-string, or unsupported values fall back
+        to `default`. Supported values are restricted to the set of
+        timeframes this analyzer actually caches (h4/h1/m15/m5); any
+        other value is rejected with a warning because the analyzer
+        would otherwise return "neutral" forever.
+        """
+        try:
+            value = getattr(config.timeframes, key, default)
+        except Exception:
+            return default
+
+        if not isinstance(value, str):
+            return default
+
+        value = value.strip().lower()
+        if value not in self._SUPPORTED_TIMEFRAMES:
+            logger.warning(
+                "Unsupported config.timeframes.%s=%r; falling back "
+                "to %r.", key, value, default,
+            )
+            return default
+
+        return value
+
+    @staticmethod
+    def _read_event_lookback() -> int:
+        """M-03: read structure event lookback from config.smc.
+
+        Missing, non-int, or out-of-range values fall back to 10
+        (the pre-M-03 hardcoded value). Zero and negative values are
+        rejected because they would produce an empty event window.
+        """
+        try:
+            value = getattr(config.smc, "structure_event_lookback", 10)
+        except Exception:
+            return 10
+
+        if isinstance(value, bool):
+            return 10
+
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return 10
+
+        if value < 1:
+            return 10
+
+        return value
 
     def analyze_all_timeframes(self) -> Dict[str, StructureState]:
         """Refresh market structure for all configured timeframes."""
@@ -121,6 +215,7 @@ class MarketStructureAnalyzer:
             closes,
             lookback=self.structure_lookback,
             swing_lookback=self.swing_lookback,
+            event_lookback=self.structure_event_lookback,
         )
 
         if structure is None:
@@ -206,16 +301,28 @@ class MarketStructureAnalyzer:
         return self.structure_cache.get(timeframe)
 
     def get_higher_tf_bias(self) -> str:
-        """Return H4 directional bias."""
+        """Return bias for the configured bias timeframe.
 
-        state = self.get_structure("h4")
+        M-06: reads `config.timeframes.bias_tf` (default "h4").
+        """
+        state = self.get_structure(self._bias_tf)
         return state.bias if state else "neutral"
 
     def get_structure_tf_bias(self) -> str:
-        """Return H1 directional bias."""
+        """Return bias for the configured structure timeframe.
 
-        state = self.get_structure("h1")
+        M-06: reads `config.timeframes.structure_tf` (default "h1").
+        """
+        state = self.get_structure(self._structure_tf)
         return state.bias if state else "neutral"
+
+    def get_bias_timeframe(self) -> str:
+        """Return the configured bias timeframe name (M-06)."""
+        return self._bias_tf
+
+    def get_structure_timeframe(self) -> str:
+        """Return the configured structure timeframe name (M-06)."""
+        return self._structure_tf
 
     def is_bos_bullish(self, timeframe: str) -> bool:
         state = self.get_structure(timeframe)

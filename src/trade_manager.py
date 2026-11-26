@@ -1247,18 +1247,11 @@ class TradeManager:
                     "Could not update ExecutedOrder %s after reconstruction.",
                     ticket,
                 )
-        # Clean up OpenPosition and tracking.
-        try:
-            with db_manager.get_session() as session:
-                session.query(OpenPosition).filter(
-                    OpenPosition.ticket == ticket,
-                    OpenPosition.environment == self.environment,
-                ).delete()
-        except Exception:
-            logger.exception(
-                "Could not delete OpenPosition row for %s", ticket,
-            )
-
+        # L-02: the OpenPosition -> ClosedTrade transition is the single
+        # authoritative closure step. Deleting the OpenPosition row and
+        # dropping in-memory tracking are performed exactly once here;
+        # duplicate blocks were removed to prevent a future edit from
+        # updating only one path.
         try:
             with db_manager.get_session() as session:
                 session.query(OpenPosition).filter(
