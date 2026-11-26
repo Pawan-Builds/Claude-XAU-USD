@@ -795,7 +795,7 @@ class Config:
                 c.get("max_slippage_pips"), 3.0
             ),
             max_spread_pips=_safe_float(
-                c.get("max_spread_pips"), 5.0
+                c.get("max_spread_pips"), 8.0
             ),
         )
 

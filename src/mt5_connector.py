@@ -107,6 +107,10 @@ class MT5Connector:
         self._last_error: Optional[str] = None
         self._reconnect_attempts = 0
         self._initialized = False
+        # Broker-server clock offset (seconds) applied to raw MT5
+        # tick timestamps before they are surfaced as UTC.
+        # None -> not yet detected (treated as 0.0).
+        self._server_utc_offset_seconds: Optional[float] = None
 
     # ---------------------------------------------------------
     # Connection
@@ -130,6 +134,7 @@ class MT5Connector:
             except Exception:
                 logger.exception("Prior MT5 shutdown raised.")
             self._initialized = False
+            self._server_utc_offset_seconds = None
 
     # Step 1: attach to the terminal WITHOUT credentials. This is the
     # pre-existing successful path when the user has already logged
@@ -260,6 +265,7 @@ class MT5Connector:
         self._account_info = None
         self._symbol_info = None
         self._symbol_name = None
+        self._server_utc_offset_seconds = None
 
         return False
 
@@ -630,6 +636,62 @@ class MT5Connector:
     # Market data
     # ---------------------------------------------------------
 
+    def _detect_server_utc_offset_seconds(
+        self, tick
+    ) -> Optional[float]:
+        """Detect broker-server clock offset (seconds) from a live tick.
+
+        MT5 stamps ``tick.time`` with the *broker server's local clock*,
+        not true UTC. XM runs on EET — UTC+2 in winter, UTC+3 in
+        summer — so a fresh tick reads 2-3 h ahead of real UTC and
+        makes every fresh tick look stale (large negative age).
+
+        Approach: sample ``tick.time - time.time()``, round to the
+        nearest 15 min (all real broker offsets are multiples of
+        that), and accept the result only when the residual is small
+        enough to attribute to tick lag rather than a fake offset.
+
+        Returns the offset in seconds on confident detection, or
+        None when the sampled tick is too lagged / ambiguous to
+        trust (caller keeps the last known good value and retries
+        on a later tick).
+        """
+        if tick is None:
+            return None
+
+        try:
+            tick_epoch = float(tick.time)
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+        if tick_epoch <= 0:
+            return None
+
+        raw_offset = tick_epoch - time.time()
+
+        # Brokers use whole- or half-hour server offsets (and DST
+        # shifts by a whole hour). Round to the nearest 15 min so a
+        # sub-second-to-second tick lag is absorbed; the residual
+        # measures how much of the raw value is tick lag.
+        rounded = round(raw_offset / 900.0) * 900.0
+        residual = raw_offset - rounded
+
+        # If the tick itself is >30 s stale we cannot separate tick
+        # lag from a real clock offset — retry on the next tick.
+        if abs(residual) > 30:
+            return None
+
+        # Plausible timezone range: UTC-12 .. UTC+14.
+        if rounded < -43200 or rounded > 50400:
+            logger.debug(
+                "Broker UTC offset out of plausible range "
+                "(%+.1f h); ignoring this sample.",
+                rounded / 3600.0,
+            )
+            return None
+
+        return rounded
+
     def get_tick(self) -> Optional[Dict[str, Any]]:
         if not self._symbol_name:
             return None
@@ -640,14 +702,37 @@ class MT5Connector:
             logger.warning("Could not retrieve latest tick: %s", mt5.last_error())
             return None
 
+        # Re-detect every call so a DST change (or a session switch)
+        # is picked up automatically. Cache only updates on a
+        # confident sample, so tick-lag noise cannot poison it.
+        detected = self._detect_server_utc_offset_seconds(tick)
+        if detected is not None:
+            if self._server_utc_offset_seconds != detected:
+                logger.info(
+                    "Broker server UTC offset detected: %+.1f h "
+                    "(tick timestamps will be normalised to true UTC).",
+                    detected / 3600.0,
+                )
+                self._server_utc_offset_seconds = detected
+
+        offset = self._server_utc_offset_seconds
+        if offset is None:
+            offset = 0.0
+
+        adjusted_epoch = int(tick.time - round(offset))
+        try:
+            adjusted_msc = int(tick.time_msc - round(offset * 1000))
+        except (TypeError, ValueError, AttributeError):
+            adjusted_msc = adjusted_epoch * 1000
+
         return {
             "symbol": self._symbol_name,
             "bid": tick.bid,
             "ask": tick.ask,
             "last": tick.last,
             "volume": tick.volume,
-            "time": datetime.fromtimestamp(tick.time, tz=timezone.utc),
-            "time_msc": tick.time_msc,
+            "time": datetime.fromtimestamp(adjusted_epoch, tz=timezone.utc),
+            "time_msc": adjusted_msc,
             "flags": tick.flags,
             "spread": tick.ask - tick.bid,
         }
@@ -1281,6 +1366,188 @@ class MT5Connector:
 
         return None
 
+    # ------------------------------------------------------------------
+    # N-H03: operation classification and safety precheck
+    # ------------------------------------------------------------------
+
+    def _classify_operation(self, payload: Dict[str, Any]) -> str:
+        """N-H03: classify a request as increase / reduce / protect /
+        unknown.
+
+        Explicit classification instead of implicit order-type
+        inference. Prevents:
+          * Same-side DEAL+position (pyramid) masquerading as close.
+          * Volume > position volume masquerading as close.
+          * Pending orders with a `position` field (ambiguous).
+
+        Returns one of: "increase" | "reduce" | "protect" | "unknown".
+        """
+        action = payload.get("action")
+        position = payload.get("position")
+
+        if action == mt5.TRADE_ACTION_DEAL:
+            if position is None:
+                return "increase"
+            # DEAL + position: must be a genuine close/partial-close.
+            side = payload.get("type")
+            pos_info = self._get_live_position_info(int(position))
+            if pos_info is not None:
+                pos_type = pos_info.get("type")
+                if pos_type == "BUY" and side == mt5.ORDER_TYPE_BUY:
+                    logger.critical(
+                        "N-H03: BUY-on-BUY via position=%s is "
+                        "exposure-increasing, not a close; refusing.",
+                        position,
+                    )
+                    return "unknown"
+                if pos_type == "SELL" and side == mt5.ORDER_TYPE_SELL:
+                    logger.critical(
+                        "N-H03: SELL-on-SELL via position=%s is "
+                        "exposure-increasing, not a close; refusing.",
+                        position,
+                    )
+                    return "unknown"
+                # Volume must not exceed the position.
+                try:
+                    req_vol = float(payload.get("volume") or 0)
+                    pos_vol = float(pos_info.get("volume") or 0)
+                except (TypeError, ValueError):
+                    req_vol = 0.0
+                    pos_vol = 0.0
+                if req_vol > 0 and pos_vol > 0 and req_vol > pos_vol + 1e-9:
+                    logger.critical(
+                        "N-H03: close volume %.4f exceeds position "
+                        "volume %.4f (ticket=%s); refusing.",
+                        req_vol, pos_vol, position,
+                    )
+                    return "unknown"
+            # If pos_info is None (query failed or position vanished),
+            # proceed as "reduce". The caller (_validate_owned_position
+            # in close_position/modify_position) already verified
+            # ticket+magic+symbol before reaching this layer, and the
+            # broker will reject an invalid close.
+            return "reduce"
+
+        if action == mt5.TRADE_ACTION_PENDING:
+            if position is not None:
+                logger.critical(
+                    "N-H03: PENDING with position=%s is ambiguous; "
+                    "refusing.", position,
+                )
+                return "unknown"
+            return "increase"
+
+        if action == mt5.TRADE_ACTION_SLTP:
+            return "protect"
+
+        if action == mt5.TRADE_ACTION_REMOVE:
+            return "reduce"
+
+        return "unknown"
+
+    def _get_live_position_info(self, ticket: int) -> Optional[Dict[str, Any]]:
+        """N-H03: ticket-specific position lookup. Returns normalized
+        dict or None on failure / not-found.
+        """
+        try:
+            positions = mt5.positions_get(ticket=int(ticket))
+        except Exception:
+            logger.exception(
+                "N-H03: position lookup raised for ticket %s.", ticket,
+            )
+            return None
+        if not positions:
+            return None
+        pos = positions[0]
+        try:
+            return {
+                "ticket": int(pos.ticket),
+                "type": (
+                    "BUY"
+                    if pos.type == mt5.POSITION_TYPE_BUY
+                    else "SELL"
+                ),
+                "volume": float(pos.volume),
+                "magic": int(pos.magic),
+                "symbol": pos.symbol,
+            }
+        except Exception:
+            logger.exception(
+                "N-H03: position normalization failed for ticket %s.",
+                ticket,
+            )
+            return None
+
+    def _safety_precheck(self) -> Optional[str]:
+        """N-H03: narrow precheck for exposure-reducing / protective ops.
+
+        Enforces ONLY identity + connectivity. Everything that exists
+        solely to authorize *new* exposure — DEMO/LIVE mode, demo_only,
+        trade_allowed, trade_expert, reconciliation, LIVE authorization,
+        gate token — is deliberately NOT checked here.
+
+        Identity is still enforced per the finding: if the destination
+        account cannot be unambiguously identified, do not send an
+        ambiguous request. Fail closed and report clearly.
+
+        Returns None on success, reason string on failure.
+        """
+        if not self._initialized:
+            return "MT5 is not initialized."
+
+        if mt5.terminal_info() is None:
+            return "MT5 terminal is not running."
+
+        if not self.update_account_info():
+            return "Could not refresh MT5 account information."
+
+        account = self._account_info
+        if account is None:
+            return "MT5 account information unavailable."
+
+        try:
+            expected_login = int(self.mt5_config.login)
+            actual_login = int(account.login)
+            expected_server = str(self.mt5_config.server)
+            actual_server = str(account.server)
+        except (TypeError, ValueError):
+            return "Account identity fields are invalid."
+
+        if actual_login != expected_login:
+            return (
+                f"Account mismatch on safety operation: connected "
+                f"login {actual_login} != configured {expected_login}."
+            )
+
+        if actual_server != expected_server:
+            return (
+                f"Server mismatch on safety operation: connected "
+                f"server {actual_server!r} != configured "
+                f"{expected_server!r}."
+            )
+
+        return None
+
+    def _warn_on_mode_mismatch_for_safety_op(self) -> None:
+        """N-H03: non-blocking warning when reducing exposure on an
+        account whose mode differs from configured.
+        """
+        account = self._account_info
+        if account is None:
+            return
+        mode = str(config.trading.mode).upper()
+        is_demo = bool(getattr(account, "is_demo", False))
+        if mode == "DEMO" and not is_demo:
+            logger.warning(
+                "N-H03: reducing exposure on REAL account while "
+                "configured DEMO — allowing safety operation.",
+            )
+        elif mode == "LIVE" and is_demo:
+            logger.warning(
+                "N-H03: reducing exposure on DEMO account while "
+                "configured LIVE — allowing safety operation.",
+            )
+
     def _assert_live_opening_authorized(
         self,
         request_id: Optional[int] = None,
@@ -1541,33 +1808,62 @@ class MT5Connector:
         gate_token: Optional[str] = None,
         request_id: Optional[int] = None,
     ) -> OrderResult:
-        """Send an MT5 request with safety checks and consistent results."""
+        """Send an MT5 request with classification-aware safety checks.
 
-        safety_error = self._trading_precheck()
-
-        if safety_error:
-            logger.error("Trading request blocked: %s", safety_error)
-            return OrderResult(success=False, error_message=safety_error)
+        N-H03: precheck is classification-aware.
+          * increase  -> `_trading_precheck()` (strict; enforces
+                          mode, demo_only, trade flags)
+          * reduce    -> `_safety_precheck()` (identity + connectivity
+                          only; protective ops must not be blocked by
+                          entry-only restrictions)
+          * protect   -> `_safety_precheck()`
+          * unknown   -> refuse
+        """
+        if not isinstance(request, dict):
+            return OrderResult(
+                success=False,
+                error_message="Order request must be a dictionary",
+            )
 
         payload = dict(request)
+        classification = self._classify_operation(payload)
+
+        if classification == "unknown":
+            logger.critical(
+                "N-H03: refusing unclassifiable request | action=%s "
+                "position=%s type=%s",
+                payload.get("action"),
+                payload.get("position"),
+                payload.get("type"),
+            )
+            return OrderResult(
+                success=False,
+                error_message=(
+                    "Request refused: operation could not be "
+                    "classified as a well-formed increase, close, "
+                    "delete, or SL/TP modification."
+                ),
+            )
+
+        if classification == "increase":
+            safety_error = self._trading_precheck()
+        else:
+            safety_error = self._safety_precheck()
+            if safety_error is None:
+                self._warn_on_mode_mismatch_for_safety_op()
+
+        if safety_error:
+            logger.error(
+                "Trading request blocked (%s): %s",
+                classification, safety_error,
+            )
+            return OrderResult(success=False, error_message=safety_error)
 
         action = payload.get("action")
         symbol = payload.get("symbol") or self._symbol_name
 
-        # FIX C-03: full LIVE opening authorization at the submission
-        # boundary. Independently verifies every required condition —
-        # LIVE_ALLOWED_ACCOUNT, LIVE_TRADING_CONFIRMATION,
-        # live_trading_enabled, server, account, demo-only, kill
-        # switch, unresolved reconciliation. Closing (payload has
-        # `position`) and non-opening actions bypass this check, so
-        # emergency risk reduction always works.
-        is_opening_action = (
-            action in (
-                mt5.TRADE_ACTION_DEAL,
-                mt5.TRADE_ACTION_PENDING,
-            )
-            and not payload.get("position")
-        )
+        # N-H03: opening actions are those classified as increase.
+        is_opening_action = (classification == "increase")
         if is_opening_action:
             # H-05: verified reconciliation is mandatory for ALL opening
             # actions (DEMO and LIVE). This is the actual submission
@@ -1856,6 +2152,26 @@ class MT5Connector:
 
         new_sl = position.sl if sl is None else round(float(sl), digits)
         new_tp = position.tp if tp is None else round(float(tp), digits)
+        # N-H03: refuse SL modifications that loosen the stop. Matches
+        # trade_manager._modify_sl; defense-in-depth against any caller
+        # bypassing that guard.
+        if sl is not None and position.sl > 0:
+            if is_buy and new_sl < position.sl:
+                return OrderResult(
+                    success=False,
+                    error_message=(
+                        "BUY stop-loss modification must not increase "
+                        "risk (new SL below current SL)."
+                    ),
+                )
+            if (not is_buy) and new_sl > position.sl:
+                return OrderResult(
+                    success=False,
+                    error_message=(
+                        "SELL stop-loss modification must not increase "
+                        "risk (new SL above current SL)."
+                    ),
+                )
 
         if is_buy:
             if new_sl > 0:
@@ -2161,6 +2477,7 @@ class MT5Connector:
         self._account_info = None
         self._symbol_info = None
         self._symbol_name = None
+        self._server_utc_offset_seconds = None
         self.state = ConnectionState.DISCONNECTED
 
         logger.info("MT5 connection closed")

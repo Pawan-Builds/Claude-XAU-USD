@@ -152,7 +152,7 @@ trade_management:
     - r: 2.0
       percent: 0.3
   max_slippage_pips: 3
-  max_spread_pips: 5
+  max_spread_pips: 8
 
 sessions:
   london:

@@ -23,6 +23,17 @@ Batch 4 corrections:
 - _prepare_order_request calls MT5Connector.pip_size_for() (class static
   method) with an isinstance guard, so the pip size stays a real float
   when the connector instance is patched by tests.
+
+N-H01 additions:
+- Candidate-order risk is now reserved atomically before submission
+  (RiskManager.try_reserve) and released on any terminal outcome.
+- Release paths: _mark_request_status (for terminal statuses),
+  _update_order_request (on definitive broker rejection),
+  _update_order_request_error (submission_error before broker), and
+  _reconcile_orphaned_reservations (crash recovery).
+- Reservation stays active during 'pending', 'sent', 'placed',
+  'filled_unconfirmed', and 'uncertain' so concurrent submissions
+  and crash-restart scenarios cannot both see the same capacity.
 """
 
 import hashlib
@@ -55,6 +66,7 @@ from src.logger import get_logger
 
 logger = get_logger(__name__)
 
+
 class DuplicateOrderRequest(Exception):
     """Raised when the DB partial-unique index rejects an insert.
 
@@ -85,6 +97,22 @@ _UNRESOLVED_STATUSES = (
 # week to intervene.
 _RECONCILE_AGE_LIMIT = timedelta(days=7)
 
+# N-H01: statuses whose presence means a risk reservation must remain
+# active. Terminal statuses (below) trigger release. "submission_error"
+# is deliberately absent from both sets — it is set only by
+# _update_order_request_error (pre-submission failure) which releases
+# directly rather than routing through _mark_request_status.
+_RESERVATION_RELEASABLE_STATUSES = frozenset({
+    "filled",
+    "filled_closed",
+    "unresolved_closed",
+    "rejected",
+    "rejected_notfound",
+    "cancelled",
+    "expired",
+    "superseded",
+})
+
 
 def _to_utc(dt: Optional[datetime]) -> Optional[datetime]:
     """Normalize a datetime to aware UTC; SQLite strips tzinfo on read."""
@@ -108,6 +136,7 @@ class ExecutionResult:
     # True when the broker's response could not be definitively
     # interpreted. Callers MUST NOT treat this as a safe retry signal.
     uncertain: bool = False
+
 
 @dataclass
 class CloseAllResult:
@@ -135,6 +164,7 @@ class CloseAllResult:
     def __len__(self) -> int:
         return len(self.results)
 
+
 @dataclass
 class CancelAllResult:
     """Result of ``cancel_all_pending``.
@@ -160,6 +190,7 @@ class CancelAllResult:
 
     def __len__(self) -> int:
         return len(self.results)
+
 
 class OrderExecutor:
     """Places limit/market orders and reconciles their fill state."""
@@ -350,6 +381,38 @@ class OrderExecutor:
                 ),
             )
 
+        # --- 1e.5 N-H01: atomically reserve candidate risk ---
+        # The sizing check in risk_manager.calculate_position_size
+        # compares existing + pending + candidate to the cap, but it
+        # does not see concurrent in-flight submissions. The atomic
+        # reservation below serialises the decision: a second caller
+        # starting from the same capacity will see the first caller's
+        # reservation and be rejected if the cap would be exceeded.
+        try:
+            reserve_ok, reserve_reason = risk_manager.try_reserve(
+                fingerprint=fingerprint,
+                environment=self.ENVIRONMENT,
+                risk_amount=float(position_size.risk_amount),
+                equity=float(position_size.equity),
+            )
+        except Exception as exc:
+            logger.exception("N-H01: try_reserve raised.")
+            reserve_ok, reserve_reason = False, f"Reservation error: {exc}"
+
+        if not reserve_ok:
+            logger.warning(
+                "N-H01: candidate risk reservation rejected: %s",
+                reserve_reason,
+            )
+            return ExecutionResult(
+                success=False,
+                position_size=position_size,
+                validation=validation,
+                error=(
+                    f"Risk reservation rejected: {reserve_reason}"
+                ),
+            )
+
         # --- 1f. Persist signal ---
         try:
             signal_id = self._save_signal(
@@ -357,6 +420,9 @@ class OrderExecutor:
             )
         except Exception as exc:
             logger.exception("Could not persist signal; order not submitted.")
+            self._release_reservation(
+                fingerprint, "signal persist failed"
+            )
             return ExecutionResult(
                 success=False,
                 position_size=position_size,
@@ -381,6 +447,9 @@ class OrderExecutor:
             logger.warning(
                 "Duplicate signal blocked by DB: %s", dup
             )
+            self._release_reservation(
+                fingerprint, "duplicate order request"
+            )
             return ExecutionResult(
                 success=False,
                 signal_id=signal_id,
@@ -393,6 +462,9 @@ class OrderExecutor:
             )
         except Exception as exc:
             logger.exception("Could not prepare or persist order request.")
+            self._release_reservation(
+                fingerprint, "order request persist failed"
+            )
             return ExecutionResult(
                 success=False,
                 signal_id=signal_id,
@@ -484,7 +556,6 @@ class OrderExecutor:
                     validation=validation,
                     error=adverse_reason,
                 )
-
 
         # --- 1g. Submit ---
         # C-03: pass the gate token through. The connector enforces the
@@ -956,11 +1027,19 @@ class OrderExecutor:
             logger.exception(
                 "Reconciliation state read failed; failing closed."
             )
-            return True   
+            return True
 
     def reconcile_pending_orders(self) -> None:
         """Align MT5 pending-order state with the database, plus recover
         any market fills whose bookkeeping did not complete."""
+        # N-H01: release stale reservations before touching broker state.
+        try:
+            self._reconcile_orphaned_reservations()
+        except Exception:
+            logger.exception(
+                "N-H01: orphan-reservation reconciliation raised."
+            )
+
         try:
             live_orders = mt5_connector.get_orders()
         except Exception:
@@ -1005,6 +1084,65 @@ class OrderExecutor:
         self._reconcile_market_entries()
         self._reconcile_uncertain_and_stuck_requests()
         self._reconcile_unresolved_closed()
+
+    # ---------- N-H01: orphan-reservation recovery ----------
+
+    def _reconcile_orphaned_reservations(self) -> None:
+        """N-H01: release reservations with no holding OrderRequest.
+
+        A reservation becomes an orphan when the process crashes
+        between reserving and persisting the OrderRequest row, or
+        when the OrderRequest moved to a terminal status via a code
+        path that bypassed _mark_request_status / _update_order_request.
+        """
+        from src.database_manager import RiskReservation as _RR
+        holding_statuses = (
+            "pending", "sent", "placed",
+            "filled_unconfirmed", "uncertain",
+        )
+        try:
+            with db_manager.get_session() as session:
+                active = (
+                    session.query(_RR)
+                    .filter(
+                        _RR.environment == self.ENVIRONMENT,
+                        _RR.status == "active",
+                    )
+                    .all()
+                )
+                if not active:
+                    return
+                active_fps = [r.fingerprint for r in active]
+                holding_rows = (
+                    session.query(OrderRequest.fingerprint)
+                    .filter(
+                        OrderRequest.environment == self.ENVIRONMENT,
+                        OrderRequest.fingerprint.in_(active_fps),
+                        OrderRequest.status.in_(holding_statuses),
+                    )
+                    .all()
+                )
+                holding_set = {
+                    row[0] for row in holding_rows if row[0]
+                }
+        except Exception:
+            logger.exception(
+                "N-H01: orphan-reservation scan failed."
+            )
+            return
+
+        for r in active:
+            if r.fingerprint not in holding_set:
+                try:
+                    self._release_reservation(
+                        r.fingerprint,
+                        "orphan (no holding order request)",
+                    )
+                except Exception:
+                    logger.exception(
+                        "N-H01: release of orphan %s raised.",
+                        r.fingerprint,
+                    )
 
     # ---------- market-entry recovery ----------
 
@@ -1384,7 +1522,30 @@ class OrderExecutor:
         )
         self._mark_request_status(req.id, "cancelled")
 
+    def _release_reservation(
+        self, fingerprint: Optional[str], reason: str
+    ) -> None:
+        """N-H01: release a candidate-risk reservation.
+
+        Best-effort: logs and swallows on failure so a reservation
+        release cannot mask the caller's primary result. Stale
+        reservations are recovered on the next reconciliation cycle
+        by _reconcile_orphaned_reservations.
+        """
+        if not fingerprint:
+            return
+        try:
+            risk_manager.release_reservation(
+                fingerprint, self.ENVIRONMENT, reason,
+            )
+        except Exception:
+            logger.exception(
+                "N-H01: release_reservation raised for %s.",
+                fingerprint,
+            )
+
     def _mark_request_status(self, request_id: int, status: str) -> None:
+        fingerprint: Optional[str] = None
         try:
             with db_manager.get_session() as session:
                 request = (
@@ -1394,11 +1555,24 @@ class OrderExecutor:
                 )
                 if request is not None:
                     request.status = status
+                    fingerprint = request.fingerprint
         except Exception:
             logger.exception(
                 "Could not update request %s status to %s.",
                 request_id,
                 status,
+            )
+            return
+
+        # N-H01: release candidate risk when the underlying order has
+        # definitively terminated. Released AFTER the status write
+        # commits so a crash between the two leaves the reservation
+        # active (fail-closed: blocks new entries rather than
+        # undercounting exposure). The next
+        # _reconcile_orphaned_reservations cycle will release it.
+        if status in _RESERVATION_RELEASABLE_STATUSES:
+            self._release_reservation(
+                fingerprint, f"status={status}"
             )
 
     def _cancel_expired_orders(self, live_orders: List[Dict]) -> None:
@@ -1466,7 +1640,7 @@ class OrderExecutor:
                 ticket, cap, len(live_orders),
             )
             self.cancel_pending_order(ticket, reason="CAP")
-   
+
     # ---------- uncertain / stuck-request recovery ----------
 
     def _reconcile_uncertain_and_stuck_requests(self) -> None:
@@ -1868,8 +2042,6 @@ class OrderExecutor:
                     continue
             return deal
         return None
-
-
 
     # ==================================================================
     # 4. Manual cancellation
@@ -2302,6 +2474,7 @@ class OrderExecutor:
         result: OrderResult,
         market_entry: bool = False,
     ) -> None:
+        rejected_fp: Optional[str] = None
         with db_manager.get_session() as session:
             request = (
                 session.query(OrderRequest)
@@ -2337,15 +2510,26 @@ class OrderExecutor:
                 request.status = (
                     "filled_unconfirmed" if market_entry else "placed"
                 )
+                # N-H01: reservation held. It is released later by
+                # _mark_request_status when the request transitions
+                # to filled/filled_closed/unresolved_closed/cancelled.
             else:
                 request.status = "rejected"
+                rejected_fp = request.fingerprint
 
             request.error_code = result.error_code
             request.error_message = result.error_message
 
+        # N-H01: release ONLY after the session commits the rejected
+        # status, so a crash between write and release leaves the
+        # reservation active (fail-closed).
+        if rejected_fp is not None:
+            self._release_reservation(rejected_fp, "broker rejection")
+
     def _update_order_request_error(
         self, request_id: int, message: str
     ) -> None:
+        fingerprint: Optional[str] = None
         try:
             with db_manager.get_session() as session:
                 request = (
@@ -2356,9 +2540,18 @@ class OrderExecutor:
                 if request is not None:
                     request.status = "submission_error"
                     request.error_message = message
+                    fingerprint = request.fingerprint
         except Exception:
             logger.exception(
                 "Could not record submission exception for %s.", request_id
+            )
+            return
+
+        # N-H01: this path fires BEFORE send_order (e.g. gate re-check
+        # raised). The broker never saw this request; release.
+        if fingerprint:
+            self._release_reservation(
+                fingerprint, "submission_error before broker"
             )
 
     def _mark_request_uncertain(

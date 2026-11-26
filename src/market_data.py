@@ -18,6 +18,7 @@ from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass
 from collections import deque
 import threading
+from contextvars import ContextVar
 
 from src.config_loader import config
 from src.mt5_connector import mt5_connector
@@ -26,6 +27,24 @@ from src.logger import get_logger
 
 logger = get_logger(__name__)
 
+# N-H04: context-local backtest data provider. Thread-local by
+# default; the live trading thread always sees None and therefore
+# reads real MT5-cached data. A backtest thread sets a provider
+# for the duration of its run only.
+_backtest_provider_ctx: ContextVar[Optional[Any]] = ContextVar(
+    "market_data_backtest_provider", default=None
+)
+
+
+def set_backtest_data_provider(provider: Any) -> Any:
+    """N-H04: install a backtest data provider for the current
+    thread/task. Returns a token for reset_backtest_data_provider."""
+    return _backtest_provider_ctx.set(provider)
+
+
+def reset_backtest_data_provider(token: Any) -> None:
+    """N-H04: restore the previous data provider."""
+    _backtest_provider_ctx.reset(token)
 
 @dataclass
 class Candle:
@@ -374,6 +393,9 @@ class MarketDataEngine:
         self, timeframe: str, count: int = 100
     ) -> List[Candle]:
         """Get cached candles for a timeframe."""
+        _bp = _backtest_provider_ctx.get()
+        if _bp is not None:
+            return _bp.get_candles(timeframe, count)
         with self._lock:
             if timeframe not in self._candle_cache:
                 return []
@@ -384,23 +406,18 @@ class MarketDataEngine:
         timeframe: str,
         count: int = 100,
     ) -> List[Candle]:
-        """Return only *closed* candles; excludes the forming candle.
-
-        FIX #22: strategies that confirm on candle close must use this
-        method, not get_candles(). The last element of the internal cache
-        is still forming and must never be treated as a confirmed signal.
-        """
+        """Return only *closed* candles; excludes the forming candle."""
+        _bp = _backtest_provider_ctx.get()
+        if _bp is not None:
+            return _bp.get_closed_candles(timeframe, count)
         if count <= 0:
             return []
-
         with self._lock:
             if timeframe not in self._candle_cache:
                 return []
             candles = list(self._candle_cache[timeframe])
-
         if len(candles) <= 1:
             return []
-
         closed = candles[:-1]
         return closed[-count:]
 

@@ -23,12 +23,18 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from src.market_structure import market_structure
-from src.liquidity import liquidity
-from src.order_blocks import order_blocks
-from src.fair_value_gaps import fair_value_gaps
-from src.premium_discount import premium_discount
+from src.smc_context import AnalyzerProxy
 from src.market_data import market_data
+
+# N-H04: proxies resolve to the current context's analyzer instance
+# (backtest) or the module-level singleton (live). No method-body
+# changes are required in this file — the proxies preserve the exact
+# attribute-access syntax the rest of this module already uses.
+market_structure = AnalyzerProxy("market_structure")
+liquidity = AnalyzerProxy("liquidity")
+order_blocks = AnalyzerProxy("order_blocks")
+fair_value_gaps = AnalyzerProxy("fair_value_gaps")
+premium_discount = AnalyzerProxy("premium_discount")
 from src.config_loader import config
 from src.mt5_connector import mt5_connector, MT5Connector
 from src.logger import get_logger

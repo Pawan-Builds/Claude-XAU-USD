@@ -1,7 +1,7 @@
 """Database models and manager using SQLAlchemy."""
 import os
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from contextlib import contextmanager
 
 from sqlalchemy import (
@@ -354,6 +354,29 @@ class AppSettings(Base):
     value = Column(Text, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+class RiskReservation(Base):
+    """N-H01: persistent reservation of candidate order risk.
+
+    One active row per (fingerprint, environment) at any moment. The
+    partial unique index `uq_risk_reservations_active_fp` enforces
+    this at the DB level. Rows transition active -> released when the
+    corresponding order definitively terminates (filled, closed,
+    rejected, cancelled, expired, orphan) or the backing request is
+    absent after a grace period.
+    """
+    __tablename__ = "risk_reservations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    fingerprint = Column(String(64), nullable=False, index=True)
+    environment = Column(String(20), nullable=False, index=True)
+    risk_amount = Column(Float, nullable=False)
+    equity_at_reservation = Column(Float, nullable=False)
+    status = Column(String(20), default="active", nullable=False, index=True)
+    created_at = Column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+    released_at = Column(DateTime, nullable=True)
+    reason = Column(Text, nullable=True)
 
 class ErrorLog(Base):
     __tablename__ = "error_logs"
@@ -691,6 +714,22 @@ class DatabaseManager:
                         "(non-fatal)."
                     )
 
+            # 6. N-H01: unique active reservation per fingerprint+env.
+            if "risk_reservations" in table_names:
+                try:
+                    connection.exec_driver_sql(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "uq_risk_reservations_active_fp "
+                        "ON risk_reservations "
+                        "(fingerprint, environment) "
+                        "WHERE status = 'active'"
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not create uq_risk_reservations_active_fp "
+                        "(non-fatal; reservations may double-count)."
+                    )
+
         if added_columns:
             logger.info(
                 "Database migration added columns: %s",
@@ -958,6 +997,101 @@ class DatabaseManager:
         if self.engine:
             self.engine.dispose()
             logger.info("Database engine disposed")
+
+    def reserve_risk_atomic(
+        self,
+        fingerprint: str,
+        environment: str,
+        risk_amount: float,
+        equity: float,
+        open_risk: float,
+        pending_risk: float,
+        cap: float,
+    ) -> Tuple[bool, Optional[str]]:
+        """N-H01: atomic risk reservation.
+
+        Uses SQLite ``BEGIN IMMEDIATE`` to acquire the write lock
+        before reading the active reservation sum. Two concurrent
+        callers cannot both pass using the same capacity: the second
+        caller sees the first caller's committed reservation.
+
+        Returns (True, None) on success, (False, reason) on reject or
+        transaction failure.
+        """
+        from datetime import datetime as _dt
+
+        conn = self.engine.raw_connection()
+        try:
+            cur = conn.cursor()
+            try:
+                cur.execute("BEGIN IMMEDIATE")
+            except Exception:
+                # Non-SQLite dialects (or old drivers): fall back to
+                # plain BEGIN. Concurrency guarantee is weaker but
+                # single-instance lock (M-08) still prevents true
+                # parallel submissions.
+                cur.execute("BEGIN")
+
+            try:
+                cur.execute(
+                    "SELECT COALESCE(SUM(risk_amount), 0) "
+                    "FROM risk_reservations "
+                    "WHERE environment = ? AND status = 'active'",
+                    (environment,),
+                )
+                row = cur.fetchone()
+                active_reserved = (
+                    float(row[0]) if row and row[0] is not None else 0.0
+                )
+
+                total = (
+                    float(open_risk)
+                    + float(pending_risk)
+                    + active_reserved
+                    + float(risk_amount)
+                )
+                if total > float(cap) + 1e-9:
+                    cur.execute("COMMIT")
+                    return False, (
+                        f"Reservation rejected: total would be "
+                        f"{total:.4f} > cap {float(cap):.4f} "
+                        f"(open={float(open_risk):.4f}, "
+                        f"pending={float(pending_risk):.4f}, "
+                        f"reserved={active_reserved:.4f}, "
+                        f"new={float(risk_amount):.4f})."
+                    )
+
+                cur.execute(
+                    "INSERT INTO risk_reservations "
+                    "(fingerprint, environment, risk_amount, "
+                    " equity_at_reservation, status, created_at) "
+                    "VALUES (?, ?, ?, ?, 'active', ?)",
+                    (
+                        fingerprint,
+                        environment,
+                        float(risk_amount),
+                        float(equity),
+                        _dt.utcnow().isoformat(sep=" "),
+                    ),
+                )
+                cur.execute("COMMIT")
+                return True, None
+            except Exception as exc:
+                try:
+                    cur.execute("ROLLBACK")
+                except Exception:
+                    pass
+                logger.exception(
+                    "N-H01: reservation transaction failed."
+                )
+                return False, (
+                    f"Reservation transaction failed: {exc}"
+                )
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 # Global database manager instance
 db_manager = DatabaseManager()

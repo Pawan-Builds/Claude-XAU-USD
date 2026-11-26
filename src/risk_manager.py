@@ -1,13 +1,17 @@
 """Risk management and broker-aware position sizing."""
 
+import math
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 from src.mt5_connector import mt5_connector, MT5Connector
 from src.config_loader import config
-from src.database_manager import db_manager, RiskCalculation, AppSettings
+from src.database_manager import (
+    db_manager, RiskCalculation, AppSettings, AccountSnapshot,
+    RiskReservation,
+)
 from src.logger import get_logger
 
 logger = get_logger(__name__)
@@ -180,7 +184,139 @@ class RiskManager:
                 "Strict kill-switch read failed; returning None."
             )
             return None
-        
+
+    # ------------------------------------------------------------------
+    # N-H01: risk reservations
+    # ------------------------------------------------------------------
+
+    def try_reserve(
+        self,
+        fingerprint: str,
+        environment: str,
+        risk_amount: float,
+        equity: float,
+    ) -> Tuple[bool, Optional[str]]:
+        """Reserve candidate-order risk atomically.
+
+        Reads broker positions and pending orders (via account-wide
+        queries), then acquires a write lock and, inside it, sums
+        active reservations. Fails closed on any query or config
+        failure.
+
+        Returns (True, None) or (False, reason).
+        """
+        if not fingerprint:
+            return False, "Missing fingerprint for reservation."
+        if environment != self.ENVIRONMENT:
+            return False, "Environment mismatch for reservation."
+        try:
+            risk_amount = float(risk_amount)
+            equity = float(equity)
+        except (TypeError, ValueError):
+            return False, "Invalid risk_amount or equity."
+        if risk_amount < 0 or equity <= 0:
+            return False, "Non-positive equity or negative risk."
+
+        try:
+            all_positions = mt5_connector.get_all_positions()
+            all_orders = mt5_connector.get_all_orders()
+        except Exception:
+            logger.exception("N-H01: broker state query raised.")
+            return False, "Broker state unavailable."
+        if all_positions is None or all_orders is None:
+            return False, "Broker state unavailable."
+
+        open_risk = self._calculate_account_open_positions_risk(
+            all_positions
+        )
+        pending_risk = self._calculate_account_pending_orders_risk(
+            all_orders
+        )
+        if open_risk is None or pending_risk is None:
+            return False, "Broker risk calculation failed."
+
+        try:
+            max_pct = float(self.risk_config.max_total_open_risk_percent)
+        except (TypeError, ValueError, AttributeError):
+            return False, "max_total_open_risk_percent config invalid."
+        if max_pct <= 0:
+            return False, "max_total_open_risk_percent must be > 0."
+
+        cap = equity * max_pct / 100.0
+
+        return db_manager.reserve_risk_atomic(
+            fingerprint=fingerprint,
+            environment=environment,
+            risk_amount=risk_amount,
+            equity=equity,
+            open_risk=open_risk,
+            pending_risk=pending_risk,
+            cap=cap,
+        )
+
+    def release_reservation(
+        self,
+        fingerprint: str,
+        environment: str,
+        reason: str,
+    ) -> bool:
+        """Release an active reservation. Idempotent."""
+        if not fingerprint:
+            return True
+        try:
+            with db_manager.get_session() as session:
+                row = (
+                    session.query(RiskReservation)
+                    .filter_by(
+                        fingerprint=fingerprint,
+                        environment=environment,
+                        status="active",
+                    )
+                    .first()
+                )
+                if row is None:
+                    return True
+                row.status = "released"
+                row.released_at = datetime.utcnow()
+                row.reason = reason
+            logger.info(
+                "N-H01: reservation released | fp=%s env=%s reason=%s",
+                fingerprint, environment, reason,
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "N-H01: failed to release reservation for %s.",
+                fingerprint,
+            )
+            return False
+
+    def get_active_reservation_risk(self) -> Optional[float]:
+        """Sum of active reservation risk for this environment.
+
+        Returns None on failure (fail closed).
+        """
+        try:
+            with db_manager.get_session() as session:
+                from sqlalchemy import func as _f
+                total = (
+                    session.query(
+                        _f.coalesce(
+                            _f.sum(RiskReservation.risk_amount), 0.0
+                        )
+                    )
+                    .filter(
+                        RiskReservation.environment == self.ENVIRONMENT,
+                        RiskReservation.status == "active",
+                    )
+                    .scalar()
+                )
+                return float(total) if total is not None else 0.0
+        except Exception:
+            logger.exception(
+                "N-H01: failed to read active reservation risk."
+            )
+            return None
     # ------------------------------------------------------------------
     # Position sizing
     # ------------------------------------------------------------------
@@ -1389,76 +1525,230 @@ class RiskManager:
         return total_loss_pct < limit
 
     def _get_peak_equity(self) -> Optional[float]:
-        """Durable high-water-mark equity.
+        """Durable high-water-mark equity (N-H02 corrected).
 
-        H-04: reads a persisted peak from AppSettings, seeds it from
-        account snapshots on first use, and updates it to a new peak
-        whenever the current equity exceeds the stored value. The peak
-        is a one-way ratchet — equity declines never lower it.
+        Resolution order:
+          1. Persisted peak row exists AND is valid -> ratchet upward
+             if current equity exceeds it; otherwise return stored peak.
+          2. Persisted peak row exists but is empty / non-float /
+             non-finite / <= 0 -> fail closed (return None). Do NOT
+             re-seed from current equity.
+          3. Persisted peak read raises -> fail closed.
+          4. No peak row, but AccountSnapshot rows exist -> seed from
+             the maximum snapshot equity, persist atomically.
+          5. No peak row, no snapshots, but ExecutedOrder / ClosedTrade
+             history exists -> fail closed. The state was cleared or
+             corrupted; do NOT trust current equity as a new baseline.
+          6. No peak row, no snapshots, no trades -> legitimate
+             first-ever initialisation. Seed from current equity,
+             persist atomically.
+          7. Any query failure short-circuits with None (fail closed).
+
+        Behaviour change vs pre-fix: the previous implementation fell
+        back to current equity whenever peak or snapshot reads failed
+        or returned nothing, silently resetting the drawdown threshold.
+        N-H02 forbids that. A database failure must never improve the
+        calculated drawdown.
         """
         key = f"peak_equity_{self.ENVIRONMENT}"
 
-        persisted: Optional[float] = None
+        # --- Step 1: read persisted peak ---
         try:
             setting = db_manager.query_one(AppSettings, key=key)
-            if setting is not None and setting.value:
-                try:
-                    candidate = float(setting.value)
-                except (TypeError, ValueError):
-                    candidate = None
-                if candidate is not None and candidate > 0:
-                    persisted = candidate
         except Exception:
-            logger.exception("Could not read persisted peak equity.")
-
-        account = mt5_connector.get_account_info()
-        current = float(account.equity) if account is not None else 0.0
-
-        if persisted is None or persisted <= 0:
-            from src.database_manager import AccountSnapshot
-            try:
-                with db_manager.get_session() as session:
-                    snapshots = session.query(AccountSnapshot).filter(
-                        AccountSnapshot.environment == self.ENVIRONMENT
-                    ).order_by(
-                        AccountSnapshot.timestamp.desc()
-                    ).limit(1000).all()
-            except Exception:
-                logger.exception(
-                    "Could not seed peak equity from snapshots."
-                )
-                snapshots = []
-
-            if snapshots:
-                seeded = max(float(s.equity) for s in snapshots)
-                if seeded > 0:
-                    persisted = seeded
-            elif current > 0:
-                persisted = current
-
-        peak = max(persisted or 0.0, current)
-        if peak <= 0:
+            logger.exception(
+                "N-H02: peak-equity read raised; failing closed."
+            )
             return None
 
-        if persisted is None or peak > persisted:
+        if setting is not None:
+            if not setting.value:
+                logger.error(
+                    "N-H02: peak-equity row exists but value is "
+                    "empty; failing closed (no re-seed from current)."
+                )
+                return None
             try:
-                with db_manager.get_session() as session:
-                    setting = (
-                        session.query(AppSettings)
-                        .filter_by(key=key).first()
-                    )
-                    if setting is None:
-                        session.add(AppSettings(
-                            key=key, value=str(peak),
-                        ))
-                    else:
-                        setting.value = str(peak)
+                persisted = float(setting.value)
+            except (TypeError, ValueError):
+                logger.error(
+                    "N-H02: peak-equity row is corrupt (%r); "
+                    "failing closed (no re-seed from current).",
+                    setting.value,
+                )
+                return None
+            if not math.isfinite(persisted) or persisted <= 0:
+                logger.error(
+                    "N-H02: peak-equity row is non-positive or "
+                    "non-finite (%s); failing closed.", persisted,
+                )
+                return None
+
+            # Valid peak. Ratchet upward if current > stored.
+            try:
+                account = mt5_connector.get_account_info()
             except Exception:
                 logger.exception(
-                    "Could not persist peak equity update."
+                    "N-H02: account info read raised; using stored "
+                    "peak %.2f.", persisted,
                 )
+                return persisted
+            if account is None:
+                logger.warning(
+                    "N-H02: account info unavailable; using stored "
+                    "peak %.2f.", persisted,
+                )
+                return persisted
+            try:
+                current = float(account.equity)
+            except (TypeError, ValueError):
+                return persisted
 
-        return peak
+            if math.isfinite(current) and current > persisted:
+                try:
+                    with db_manager.get_session() as session:
+                        row = (
+                            session.query(AppSettings)
+                            .filter_by(key=key)
+                            .first()
+                        )
+                        if row is not None:
+                            row.value = str(current)
+                except Exception:
+                    logger.exception(
+                        "N-H02: could not persist peak update; "
+                        "returning stored peak %.2f.", persisted,
+                    )
+                    return persisted
+                return current
+            return persisted
+
+        # --- Step 2: no peak row. Look for snapshot history. ---
+        try:
+            with db_manager.get_session() as session:
+                snap_row = (
+                    session.query(AccountSnapshot.equity)
+                    .filter(
+                        AccountSnapshot.environment == self.ENVIRONMENT
+                    )
+                    .order_by(AccountSnapshot.equity.desc())
+                    .limit(1)
+                    .first()
+                )
+        except Exception:
+            logger.exception(
+                "N-H02: snapshot query raised; failing closed."
+            )
+            return None
+
+        if snap_row is not None:
+            try:
+                seeded = float(snap_row[0])
+            except (TypeError, ValueError, IndexError):
+                seeded = 0.0
+            if not math.isfinite(seeded) or seeded <= 0:
+                logger.error(
+                    "N-H02: max-snapshot equity invalid (%r); "
+                    "failing closed.", snap_row,
+                )
+                return None
+            try:
+                with db_manager.get_session() as session:
+                    session.add(
+                        AppSettings(key=key, value=str(seeded))
+                    )
+            except Exception:
+                logger.exception(
+                    "N-H02: could not persist snapshot-seeded "
+                    "peak %.2f; failing closed.", seeded,
+                )
+                return None
+            logger.info(
+                "N-H02: seeded peak equity from snapshots: %.2f",
+                seeded,
+            )
+            return seeded
+
+        # --- Step 3: no snapshots. Check for trade history. ---
+        try:
+            from src.database_manager import ClosedTrade, ExecutedOrder
+            with db_manager.get_session() as session:
+                executed_count = (
+                    session.query(ExecutedOrder)
+                    .filter(
+                        ExecutedOrder.environment == self.ENVIRONMENT
+                    )
+                    .count()
+                )
+                closed_count = (
+                    session.query(ClosedTrade)
+                    .filter(
+                        ClosedTrade.environment == self.ENVIRONMENT
+                    )
+                    .count()
+                )
+        except Exception:
+            logger.exception(
+                "N-H02: trade-history count raised; failing closed."
+            )
+            return None
+
+        if executed_count > 0 or closed_count > 0:
+            logger.error(
+                "N-H02: peak row missing but trade history exists "
+                "(executed=%d closed=%d); failing closed "
+                "(no re-seed from current).",
+                executed_count, closed_count,
+            )
+            return None
+
+        # --- Step 4: legitimate first-ever initialisation. ---
+        try:
+            account = mt5_connector.get_account_info()
+        except Exception:
+            logger.exception(
+                "N-H02: first-ever account read raised; "
+                "failing closed."
+            )
+            return None
+        if account is None:
+            logger.error(
+                "N-H02: account unavailable for first-ever seed; "
+                "failing closed."
+            )
+            return None
+        try:
+            current = float(account.equity)
+        except (TypeError, ValueError):
+            logger.error(
+                "N-H02: equity invalid for first-ever seed; "
+                "failing closed."
+            )
+            return None
+        if not math.isfinite(current) or current <= 0:
+            logger.error(
+                "N-H02: equity non-positive/non-finite for first-ever "
+                "seed; failing closed."
+            )
+            return None
+
+        try:
+            with db_manager.get_session() as session:
+                session.add(
+                    AppSettings(key=key, value=str(current))
+                )
+        except Exception:
+            logger.exception(
+                "N-H02: could not persist first-ever peak; "
+                "failing closed."
+            )
+            return None
+
+        logger.info(
+            "N-H02: first-ever peak equity initialized: %.2f",
+            current,
+        )
+        return current
 
     def _check_max_drawdown(self, equity: float) -> bool:
         if equity <= 0:
@@ -1546,7 +1836,19 @@ class RiskManager:
         if pending_risk is None:
             return False
 
-        total_risk = open_risk + pending_risk
+        # N-H01: include persisted candidate-order reservations.
+        # Otherwise a reservation that has not yet materialised as a
+        # broker position or pending order would be invisible to the
+        # entry gate, and concurrent submissions could exceed the cap.
+        active_reserved = self.get_active_reservation_risk()
+        if active_reserved is None:
+            logger.error(
+                "N-H01: active reservation risk unreadable; "
+                "failing closed in _check_total_risk."
+            )
+            return False
+
+        total_risk = open_risk + pending_risk + active_reserved
 
         maximum_risk = (
             float(self.risk_config.max_total_open_risk_percent)
